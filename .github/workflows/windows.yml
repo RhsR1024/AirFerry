@@ -25,6 +25,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
   cancel-in-progress: true
 
+# Least privilege by default for every job (mirrors ci.yml / pages.yml);
+# windows-pack overrides this with the job-level contents: write it needs.
+permissions:
+  contents: read
+
 jobs:
   # ── Job 1: Rust C ABI 层（跨平台，cargo test --features cffi）─────────────
   # 验证 cffi.rs 的位域打包、句柄生命周期、端到端恢复。在任何 OS 上跑都行，
@@ -162,7 +167,7 @@ jobs:
   # ⑤ gh release upload 到 v${VER}（tag 已存在，--clobber 覆盖同名 asset）
   # 只在 workflow_dispatch + 打包后手动触发上传（避免每次 push 都发 release）。
   # 版本号从手动输入的现有 release_tag 派生，并与 checkout commit 及
-  # sender package/manifest 核对；workflow 内不保存另一份版本副本。
+  # web package/manifest 核对；workflow 内不保存另一份版本副本。
   windows-pack:
     name: Windows receiver publish + upload to release
     needs: [rust-cffi, csharp-tests, windows-build]
@@ -186,9 +191,9 @@ jobs:
             throw "Invalid release tag: $env:RELEASE_TAG"
           }
           $ver = $env:RELEASE_TAG.Substring(1)
-          $package = Get-Content apps/sender/package.json -Raw | ConvertFrom-Json
+          $package = Get-Content apps/web/package.json -Raw | ConvertFrom-Json
           if ($package.version -ne $ver -or $package.manifest.version -ne $ver) {
-            throw "Tag version $ver does not match sender package/manifest"
+            throw "Tag version $ver does not match web package/manifest"
           }
           $tagCommit = (git rev-list -n 1 $env:RELEASE_TAG).Trim()
           $headCommit = (git rev-parse HEAD).Trim()
