@@ -23,6 +23,7 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -34,6 +35,7 @@ permissions:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
@@ -57,7 +59,10 @@ jobs:
       - name: transfer-engine tests (cffi)
         run: cargo test -p transfer-engine --features cffi
 
-      - name: transfer-engine tests (jni)
+      # 注意：jni 模块在 lib.rs 中门控为 all(feature="jni", target_os="android")，
+      # 本步在 ubuntu 上只验证 feature 组合可编译（防 feature 漂移）；真正的
+      # JNI 编译与链接由 android job 的 cargo-ndk 链路覆盖。
+      - name: transfer-engine tests (jni feature parity)
         run: cargo test -p transfer-engine --features jni
 
       - name: Clippy (deny warnings)
@@ -68,6 +73,7 @@ jobs:
 
   web:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
@@ -81,8 +87,20 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
+      # cargo 工具缓存：registry/git + 已安装的 wasm-pack 二进制，
+      # 命中时 Install wasm-pack 变为 no-op（command -v 守卫）。
+      - name: Cache cargo (registry + wasm-pack binary)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+          key: web-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-wasmpack0150
+          restore-keys: web-cargo-${{ runner.os }}-
+
       - name: Install wasm-pack
-        run: cargo install wasm-pack --locked --version 0.15.0
+        run: command -v wasm-pack >/dev/null || cargo install wasm-pack --locked --version 0.15.0
 
       # FAST ZXing-C++ 是接收端唯一解码后端（zxing-wasm 回退已移除）：
       # emsdk 3.1.64 固定版，缺失/损坏产物会让构建失败而非降级。
@@ -90,6 +108,15 @@ jobs:
         uses: mymindstorm/setup-emsdk@6ab9eb1bda2574c4ddb79809fc9247783eaf9021 # v14
         with:
           version: 3.1.64
+
+      # cmake 增量缓存：zxing-c++ 的 FetchContent 下载与编译产物都在
+      # build-wasm/ 下，命中时只做增量链接（计划 B5 的 fastzxing 缓存要求）。
+      - name: Cache FAST ZXing build tree
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: core/zxing-decoder/build-wasm
+          key: fastzxing-${{ runner.os }}-emsdk3.1.64-${{ hashFiles('core/zxing-decoder/**') }}
+          restore-keys: fastzxing-${{ runner.os }}-emsdk3.1.64-
 
       - name: Build FAST ZXing-C++ WASM
         run: ./scripts/build-fastzxing.sh
@@ -102,7 +129,9 @@ jobs:
 
       - name: Web & Extension — typecheck & test
         working-directory: apps/web
-        run: npm run typecheck
+        run: |
+          npm run typecheck
+          npm test
 
       - name: Web & Extension — build all targets (web sender/receiver/standalone + 4 extension targets)
         working-directory: apps/web
@@ -111,8 +140,14 @@ jobs:
       - name: Version gate (single source of truth)
         run: node scripts/version.mjs check
 
+      # 产物门禁（计划 F4）：build:all 已产出 dist-standalone 等全部目标，
+      # 校验产物完整性 / manifest / FAST WASM 在位 / 无私钥泄漏。
+      - name: Dist gate
+        run: node scripts/verify-dist.mjs
+
   android:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
@@ -126,8 +161,21 @@ jobs:
         with:
           targets: aarch64-linux-android
 
+      # cargo 缓存：registry/git + cargo-ndk 二进制 + workspace target/
+      # （compileRustJni 在仓库根跑 cargo ndk build，target/ 命中可免全量重编）。
+      - name: Cache cargo (registry + cargo-ndk + target)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            target
+          key: android-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-ndk412
+          restore-keys: android-cargo-${{ runner.os }}-
+
       - name: Install cargo-ndk
-        run: cargo install cargo-ndk --locked
+        run: command -v cargo-ndk >/dev/null || cargo install cargo-ndk --locked --version 4.1.2
 
       - name: Gradle cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -148,6 +196,7 @@ jobs:
 
   windows:
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 

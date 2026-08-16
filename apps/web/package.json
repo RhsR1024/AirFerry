@@ -15,6 +15,7 @@
     "dev": "vite",
     "dev:receiver": "vite --config vite.receiver.config.ts",
     "typecheck": "tsc --noEmit",
+    "test": "node --test",
     "wasm": "node scripts/build-wasm.cjs",
     "build": "vite build",
     "build:receiver": "vite build --config vite.receiver.config.ts",

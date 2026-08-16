@@ -15,6 +15,7 @@ on:
     paths:
       - "apps/web/**"
       - "core/**"
+      - "scripts/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/pages.yml"
@@ -33,6 +34,7 @@ concurrency:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
@@ -98,8 +100,10 @@ jobs:
           # 接收端 → /receiver/（receiver.html 作为该子路径的 index）
           cp -r apps/web/dist-receiver/. _site/receiver/
           mv _site/receiver/receiver.html _site/receiver/index.html
-          # 发送端产物不含 QR 解码资产；确保根目录不混入接收端旧文件：
-          rm -f _site/zxing_reader.wasm
+          # 发送端不使用 QR 解码器，但 Vite 会把整个 public/（含接收端的
+          # airferry_zxing.*）拷进每个构建产物 —— 从站点根清掉，只留在 /receiver/
+          # （favicon 属发送端自身资产，保留）。
+          rm -f _site/airferry_zxing.js _site/airferry_zxing.wasm
 
       - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5.0.0
 

@@ -6,11 +6,15 @@ on:
     paths:
       - 'core/**'
       - 'apps/windows/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - '.github/workflows/windows.yml'
   pull_request:
     paths:
       - 'core/**'
       - 'apps/windows/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - '.github/workflows/windows.yml'
   workflow_dispatch:
     inputs:
@@ -37,6 +41,7 @@ jobs:
   rust-cffi:
     name: Rust C ABI (cffi)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -55,11 +60,10 @@ jobs:
           key: ${{ runner.os }}-cffi-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: ${{ runner.os }}-cffi-
 
-      - name: cargo test --features cffi (unit)
-        run: cargo test -p transfer-engine --features cffi --lib cffi
-
-      - name: cargo test --features cffi (e2e)
-        run: cargo test -p transfer-engine --features cffi --test cffi_e2e
+      - name: cargo test --features cffi
+        # tests/ 目录的 v1 集成测试已随 AF2 迁移删除；行为覆盖由
+        # core/af2/tests 边界矩阵 + cffi.rs 内联单测承接。
+        run: cargo test -p transfer-engine --features cffi
 
       - name: cargo build cdylib smoke (验证 DLL 目标可产出)
         run: cargo build -p transfer-engine --features cffi --release
@@ -70,6 +74,7 @@ jobs:
   csharp-tests:
     name: C# protocol tests
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -96,6 +101,7 @@ jobs:
     # CMake explicitly targets the VS 2022 generator; pin the matching runner
     # instead of following windows-latest to images that may omit VS 2022.
     runs-on: windows-2022
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -172,6 +178,7 @@ jobs:
     name: Windows receiver publish + upload to release
     needs: [rust-cffi, csharp-tests, windows-build]
     runs-on: windows-2022
+    timeout-minutes: 45
     # 仅在手动触发时跑（不污染 push/PR）；确保质量门（前三个 job）通过。
     if: github.event_name == 'workflow_dispatch'
     permissions:
@@ -191,9 +198,11 @@ jobs:
             throw "Invalid release tag: $env:RELEASE_TAG"
           }
           $ver = $env:RELEASE_TAG.Substring(1)
+          # 扩展 manifest 由 apps/web/scripts/build-ext.cjs 构建时从 package.json
+          # 版本生成（package.json 本身无 manifest 字段），这里只校验版本事实源。
           $package = Get-Content apps/web/package.json -Raw | ConvertFrom-Json
-          if ($package.version -ne $ver -or $package.manifest.version -ne $ver) {
-            throw "Tag version $ver does not match web package/manifest"
+          if ($package.version -ne $ver) {
+            throw "Tag version $ver does not match apps/web/package.json version $($package.version)"
           }
           $tagCommit = (git rev-list -n 1 $env:RELEASE_TAG).Trim()
           $headCommit = (git rev-parse HEAD).Trim()
