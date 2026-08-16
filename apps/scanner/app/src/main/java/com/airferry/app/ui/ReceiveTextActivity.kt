@@ -165,7 +165,7 @@ class ReceiveTextActivity : ComponentActivity() {
                     if (!crcUnknown) {
                         DetailRow(
                             "校验",
-                            if (crcOk) "✓ CRC32 校验通过" else "✗ 校验失败（数据可能损坏）",
+                            if (crcOk) "CRC32 校验通过" else "校验失败（数据可能损坏）",
                             valueColor = if (crcOk) Success else Error
                         )
                     }

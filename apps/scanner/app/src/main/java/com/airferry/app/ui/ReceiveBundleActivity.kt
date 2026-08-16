@@ -163,8 +163,8 @@ class ReceiveBundleActivity : ComponentActivity() {
                 Text(
                     text = when {
                         crcUnknown -> "整体校验：— CRC32 未知（未收到描述符）"
-                        crcOk -> "整体校验：✓ CRC32 校验通过"
-                        else -> "整体校验：✗ 校验失败（数据可能损坏）"
+                        crcOk -> "整体校验：CRC32 校验通过"
+                        else -> "整体校验：校验失败（数据可能损坏）"
                     },
                     color = when {
                         crcUnknown -> TextSecondary

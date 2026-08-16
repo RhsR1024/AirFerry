@@ -42,13 +42,23 @@ object FileNameUtil {
         // can't smuggle directory separators / traversal through; then strip
         // illegal chars and leading dots.
         val base = name.substringAfterLast('/').substringAfterLast('\\')
-        val cleaned = base
+        val stripped = base
             .replace(Regex("[/\\\\:*?\"<>|\\p{Cntrl}]"), "_")
             .trim()
-            .takeLast(200)
+        // Truncate to 200 chars, but never split a UTF-16 surrogate pair at
+        // the cut: an orphan low surrogate would land on disk / in share
+        // intents as U+FFFD (mirrors FileNameUtil.cs on Windows).
+        val cleaned = if (stripped.length > 200) {
+            var start = stripped.length - 200
+            if (Character.isLowSurrogate(stripped[start])) start += 1
+            stripped.substring(start)
+        } else {
+            stripped
+        }
+        return cleaned
             .trim()
             .trimStart('.')
-        return cleaned.ifBlank { "received_file" }
+            .ifBlank { "received_file" }
     }
 
     /**

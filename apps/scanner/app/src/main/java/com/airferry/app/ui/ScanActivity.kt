@@ -42,11 +42,9 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.airferry.app.nativelib.NativeBridge
-import com.airferry.app.scan.BundleParser
 import com.airferry.app.scan.QrDecodePool
 import com.airferry.app.scan.QrStreamAnalyzer
 import com.airferry.app.scan.ReceiverSessionManager
-import com.airferry.app.scan.TextParser
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -71,11 +69,6 @@ class ScanActivity : ComponentActivity() {
 
     /** Parallel QR decode pool (capture → queue → N workers → serialized ingest). */
     private var decodePool: QrDecodePool? = null
-
-    /** Disk-backed assembler for a descriptor-v5 large transfer (null = none in progress). */
-    private var segAssembler: com.airferry.app.scan.SegmentAssembler? = null
-    /** Optional task selected from history; unrelated roots are ignored. */
-    private var resumeRootId: String? = null
 
     /**
      * Sliding-window rate samples for the UI.
@@ -144,9 +137,6 @@ class ScanActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        resumeRootId = intent.getStringExtra("RESUME_ROOT_ID")
-            ?.lowercase()
-            ?.takeIf { id -> id.length == 32 && id.all { it in '0'..'9' || it in 'a'..'f' } }
 
         // Keep the screen on for the whole scan session. Transfers can run for
         // many minutes; without this the system timeout dims/locks the screen,
@@ -306,7 +296,7 @@ class ScanActivity : ComponentActivity() {
                 }
 
                 // Status text. A live recovery stage (assemble/CRC/save) takes
-                // precedence over the "✓ 文件恢复完成" snapshot, so the user sees
+                // precedence over the "文件恢复完成" snapshot, so the user sees
                 // the post-scan pipeline advancing instead of a frozen 100%.
                 Text(
                     text = recovery ?: state.statusText,
@@ -561,57 +551,6 @@ class ScanActivity : ComponentActivity() {
         // stays cheap; the full progress is fetched only on the throttled UI tick.
         val status = session.ingest(payload) ?: return
 
-        // Duplicate-segment fast path — evaluated on DESCRIPTOR frames only
-        // (the sender re-sends the descriptor every 17 frames, so this still
-        // fires promptly). The old implementation ran per data symbol, doing a
-        // disk-ledger read + JSON parse (+ a full ~32 MiB SHA-256 in
-        // hasStoredSegment) and an unconditional Log.w for EVERY ingested
-        // symbol. Once the descriptor confirms the segment metadata, if this
-        // segment is already stored there is no point receiving the whole
-        // (~32 MiB) segment again — skip straight to the next one. Runs here
-        // (ingest lock) so the re-scan of a completed segment is rejected on
-        // the descriptor frame itself, before the UI even shows "receiving".
-        if (!status.complete && session.isInitialized && session.isSegmented() &&
-            payload.size > 3 &&
-            (payload[3].toInt() and 0xFF and ReceiverSessionManager.FLAG_DESCRIPTOR) != 0
-        ) {
-            val idx = session.segmentIndex()
-            val cnt = session.segmentCount()
-            val lo = session.rootSessionIdLo()
-            val hi = session.rootSessionIdHi()
-            // In-memory ledger for the ongoing transfer; fall back to the
-            // durable disk ledger (e.g. after the app restarted / resume) so a
-            // re-scanned already-completed segment is still rejected.
-            val asm = segAssembler
-            val inMem = asm != null && asm.rootSessionIdLo() == lo && asm.rootSessionIdHi() == hi
-            val dup = if (inMem) asm!!.hasSegment(idx)
-                else com.airferry.app.scan.SegmentAssembler.hasStoredSegment(com.airferry.app.scan.ContentStore.root(this), lo, hi, idx)
-            if (dup) {
-                val rootHex = rootSessionIdHex(lo, hi)
-                // H2: before skipping, check whether the ledger is ALREADY
-                // complete. If the promotion into ContentStore was interrupted
-                // (asm.finish() failed on a full disk, or the process died
-                // between finish() and putFile), blindly swapping to the next
-                // segment makes the crash-recovery archive branch in
-                // handleSegmentedTransfer unreachable — the data would stay
-                // locked in .partial forever. A complete ledger must re-run the
-                // idempotent archive instead of skipping.
-                val ledgerComplete = if (inMem) asm!!.isComplete()
-                else com.airferry.app.scan.SegmentAssembler.listTasks(
-                    com.airferry.app.scan.ContentStore.root(this)
-                ).any { it.rootSessionIdHex == rootHex && it.receivedCount >= it.segmentCount }
-                if (ledgerComplete && (resumeRootId == null || resumeRootId == rootHex)) {
-                    enqueueSegmentedReArchive(if (inMem) asm else null)
-                    return
-                }
-                Log.i(TAG, "dupSeg: segIdx=$idx cnt=$cnt inMem=$inMem => skip to next segment")
-                val dupText = "第 ${idx + 1}/$cnt 段已接收过，自动跳过"
-                runOnUiThread { updateUi { it.copy(statusText = dupText) } }
-                swapReceiverForNextSegment()
-                return
-            }
-        }
-
         // UI refresh throttle: ~7 Hz is plenty for a progress bar, and keeps the
         // main thread free. Always let the final "complete" frame through.
         val now = System.currentTimeMillis()
@@ -683,9 +622,9 @@ class ScanActivity : ComponentActivity() {
             else -> 0
         }
         val statusMsg = when {
-            progress.complete -> "✓ 文件恢复完成"
+            progress.complete -> "文件恢复完成"
             !progress.metaConfirmed && progress.receivedSymbols > 0 ->
-                "⏳ 正在同步… 已缓存 ${progress.receivedSymbols} 符号 (~$pct%)"
+                "正在同步… 已缓存 ${progress.receivedSymbols} 符号 (~$pct%)"
             progress.totalSymbols == 0 -> "等待二维码…"
             progress.receivedSymbols > 0 && progress.decodedBlocks == 0 ->
                 "接收中… ${progress.receivedSymbols}/${progress.totalSymbols} 符号 (等待解码)"
@@ -831,668 +770,140 @@ class ScanActivity : ComponentActivity() {
      * Returns the [Intent] to launch the detail/bundle screen, or null if there
      * was nothing to recover. Runs on a background thread under the decode pool's
      * ingest lock (so it can't race an in-flight ingest or a destroy()).
+     */    /**
+     * Assemble the recovered AF2 Canonical Content Stream and stage entries to
+     * disk based on the Manifest entry table (kind = text / file / bundle).
+     * Runs on a background thread under the decode pool's ingest lock.
      */
     private fun recoverAndStage(displayName: String): Intent? {
         updateRecoveryStage("正在组装数据…")
-        if (session.isSegmented()) {
-            // Descriptor-v5 large transfer: recover this segment's **compressed**
-            // bytes (no per-segment decompression — the whole stream is
-            // decompressed once after every segment arrives) and store it.
-            val compressed = session.assembleRawBytes() ?: run {
-                clearRecoveryStage()
-                if (session.isComplete()) {
-                    runOnUiThread {
-                        Toast.makeText(this, "恢复失败: 分段组装失败", Toast.LENGTH_LONG).show()
-                    }
-                    swapReceiverForNextSegment()
-                }
-                return null
-            }
-            return handleSegmentedTransfer(displayName, compressed)
-        }
-        val fileBytes = session.assemble() ?: run {
+        val stream = session.assemble() ?: run {
             clearRecoveryStage()
             if (session.isComplete()) {
-                val detail = session.lastAssembleError().ifEmpty { "数据组装或解压失败" }
                 runOnUiThread {
-                    Toast.makeText(this, "恢复失败: $detail", Toast.LENGTH_LONG).show()
+                    Toast.makeText(this, "恢复失败: 数据组装失败", Toast.LENGTH_LONG).show()
                 }
-                // A completed-but-unassemblable child must not leave the
-                // scanner permanently stopped. Keep durable earlier segments
-                // and accept a fresh scan immediately.
-                swapReceiverForNextSegment()
             }
             return null
         }
-        if (resumeRootId != null) {
-            clearRecoveryStage()
-            runOnUiThread {
-                updateUi { it.copy(statusText = "已忽略其他传输，继续等待选中的恢复任务…") }
-            }
-            swapReceiverForNextSegment()
-            return null
-        }
-        val originalSize = session.fileSize()
-        // Truncate RaptorQ zero-padding back to the original size. originalSize
-        // is a Long (up to 2^63); clamp to the bytes we actually recovered and
-        // never let a bogus/large value overflow Int (the old `originalSize.toInt()`
-        // would wrap for >2GB and throw IndexOutOfBounds in copyOfRange).
-        val truncLen = when {
-            originalSize > 0 && originalSize <= fileBytes.size -> originalSize.toInt()
-            else -> fileBytes.size
-        }
-        // v3 assemble normally already returns exactly originalSize. Reuse that
-        // array instead of allocating a second full-size ByteArray; only legacy
-        // padded results need an actual truncation copy.
-        val truncBytes = if (truncLen == fileBytes.size) {
-            fileBytes
-        } else {
-            fileBytes.copyOfRange(0, truncLen)
-        }
 
-        updateRecoveryStage("正在校验完整性…")
-        val expectedCrc = session.crc32()
-        val crcKnown = session.crc32Known()
-        val receivedCrc = crc32OfBytes(truncBytes)
-
-        // Content-addressed store: one blob per unique content; detail/share/list
-        // all use the blob path (no recovered_* + received/ double-write).
+        val snapshot = session.snapshot()
+        val nonDirEntries = snapshot.entries.filter { it.kind != 3 } // 3 = DIRECTORY
         val store = com.airferry.app.scan.ContentStore
 
-        // Text payload → ETTEXTv1. Detected BEFORE the bundle check.
-        // Prefer the descriptor filename (sender select-page name); fall back
-        // to the default only when the descriptor never supplied one.
-        //
-        // The 8-byte wire magic is stripped up front: BOTH the in-memory text
-        // path and the oversized→file fallback below must see the message
-        // text — the fallback previously saved the raw wire bytes, putting the
-        // literal "ETTEXTv1" protocol header at the start of the user's file.
-        if (TextParser.isText(truncBytes)) {
-            val messageBytes = TextParser.payloadWithoutMagic(truncBytes)
-            // Prefer descriptor name; ensure a .txt-ish save label for pure text.
-            // (Sender already normalizes to *.txt; this is a receive-side belt.)
-            val textName = when {
-                displayName.isEmpty() -> TEXT_RECEIVED_NAME
-                displayName.contains('.') -> displayName
-                else -> "$displayName.txt"
-            }
-            // Size guard: only decode into the in-memory text UI when it fits
-            // the text cap — decoding a multi-MB message into a ~2x UTF-16
-            // String plus a re-encode balloons the JVM heap on low-end devices.
-            val text = if (com.airferry.app.scan.TextLike.fitsTextUi(messageBytes.size))
-                TextParser.parse(truncBytes)
-            else
-                null
+        // Manifest offsets/sizes are u64 and cannot be trusted: bounds-check in
+        // the Long domain before narrowing to Int, so a bogus entry degrades to
+        // empty bytes instead of wrapping into a wrong slice.
+        fun sliceAt(off: Long, sz: Long): ByteArray =
+            if (off >= 0 && sz >= 0 && off + sz <= stream.size.toLong() &&
+                off <= Int.MAX_VALUE && sz <= Int.MAX_VALUE
+            ) stream.copyOfRange(off.toInt(), (off + sz).toInt()) else ByteArray(0)
+
+        // ── Single UTF8_TEXT entry → text view (AF2 kind, no magic sniffing) ──
+        if (nonDirEntries.size == 1 && nonDirEntries[0].kind == 2) {
+            val e0 = nonDirEntries[0]
+            val textBytes = sliceAt(e0.offset, e0.size)
+            val textName = e0.path.ifEmpty { TEXT_RECEIVED_NAME }
+            val text =
+                if (com.airferry.app.scan.TextLike.fitsTextUi(textBytes.size))
+                    com.airferry.app.scan.TextLike.decodeUtf8Strict(textBytes)
+                else null
+
             if (text != null) {
                 updateRecoveryStage("正在保存文字…")
-                val contentBytes = text.toByteArray(Charsets.UTF_8)
-                val contentCrc = crc32OfBytes(contentBytes)
-                val crcHex = java.lang.Long.toHexString(contentCrc)
                 val put = store.putBytes(
-                    this, textName, contentBytes,
-                    crcHex = crcHex, crcUnknown = false, kind = "text",
+                    this, textName, textBytes,
+                    crcUnknown = true, kind = "text",
                 )
                 clearRecoveryStage()
                 return Intent(this, ReceiveTextActivity::class.java).apply {
                     putExtra("FILE_PATH", put.path.absolutePath)
-                    // Prefer the user-facing name (descriptor) over store sanitization.
                     putExtra("FILE_NAME", textName)
                     putExtra("ENTRY_ID", put.entry.id)
-                    putExtra("CRC32", expectedCrc)
-                    putExtra("CRC32_RECEIVED", receivedCrc)
-                    putExtra("CRC32_UNKNOWN", !crcKnown)
+                    putExtra("CRC32_UNKNOWN", true)
                 }
             }
-            // Oversized (over the text cap) or invalid UTF-8 → ordinary .txt
-            // FILE, magic stripped.
+            // Oversized or invalid UTF-8 → ordinary .txt file.
             updateRecoveryStage("正在保存文件…")
-            val contentCrc = crc32OfBytes(messageBytes)
             val put = store.putBytes(
-                this, textName, messageBytes,
-                crcHex = java.lang.Long.toHexString(contentCrc),
-                crcUnknown = false, kind = "file",
+                this, textName, textBytes,
+                crcUnknown = true, kind = "file",
             )
             clearRecoveryStage()
             return Intent(this, ReceiveDetailActivity::class.java).apply {
                 putExtra("FILE_PATH", put.path.absolutePath)
-                putExtra("FILE_SIZE", messageBytes.size.toLong())
+                putExtra("FILE_SIZE", textBytes.size.toLong())
                 putExtra("FILE_NAME", textName)
                 putExtra("ENTRY_ID", put.entry.id)
-                putExtra("CRC32", expectedCrc)
-                putExtra("CRC32_RECEIVED", receivedCrc)
-                putExtra("CRC32_UNKNOWN", !crcKnown)
-                // Already archived into ContentStore — do not copy again.
+                putExtra("CRC32_UNKNOWN", true)
                 putExtra("RESAVE", true)
             }
         }
 
-        // Multi-file bundle → one ContentStore entry per member, shared bundleId.
-        if (BundleParser.isBundle(truncBytes)) {
-            val bundle = BundleParser.parse(truncBytes)
-            if (bundle != null && bundle.files.isNotEmpty()) {
-                val totalFiles = bundle.files.size
-                val paths = ArrayList<String>()
-                val names = ArrayList<String>()
-                val sizes = ArrayList<String>()
-                val entryIds = ArrayList<String>()
-                val ts = java.text.SimpleDateFormat("MMdd_HHmmss", java.util.Locale.getDefault())
-                    .format(java.util.Date())
-                val bundleId = java.util.UUID.randomUUID().toString()
-                val bundleTitle = "发送_$ts"
-                updateRecoveryStage("正在保存 $totalFiles 个文件…")
-                val puts = store.putBytesBatch(
-                    this,
-                    bundle.files.map { f ->
-                        com.airferry.app.scan.ContentStore.PutBytesRequest(
-                            f.name, f.data,
-                        crcHex = "unknown", crcUnknown = true, kind = "file",
-                        bundleId = bundleId, bundleTitle = bundleTitle,
-                        )
-                    },
+        // ── Multiple entries → bundle, one ContentStore entry per member ──
+        if (nonDirEntries.size > 1) {
+            val totalFiles = nonDirEntries.size
+            val ts = java.text.SimpleDateFormat("MMdd_HHmmss", java.util.Locale.getDefault())
+                .format(java.util.Date())
+            val bundleId = java.util.UUID.randomUUID().toString()
+            val bundleTitle = "发送_$ts"
+            updateRecoveryStage("正在保存 $totalFiles 个文件…")
+            val requests = nonDirEntries.map { e ->
+                val bytes = sliceAt(e.offset, e.size)
+                com.airferry.app.scan.ContentStore.PutBytesRequest(
+                    e.path, bytes,
+                    crcUnknown = true, kind = "file",
+                    bundleId = bundleId, bundleTitle = bundleTitle,
                 )
-                for ((f, put) in bundle.files.zip(puts)) {
-                    paths.add(put.path.absolutePath)
-                    names.add(f.name)
-                    sizes.add(f.data.size.toString())
-                    entryIds.add(put.entry.id)
-                }
-                clearRecoveryStage()
-                return Intent(this, ReceiveBundleActivity::class.java).apply {
-                    putStringArrayListExtra("FILE_PATHS", paths)
-                    putStringArrayListExtra("FILE_NAMES", names)
-                    putStringArrayListExtra("FILE_SIZES", sizes)
-                    putStringArrayListExtra("ENTRY_IDS", entryIds)
-                    putExtra("CRC32", expectedCrc)
-                    putExtra("CRC32_RECEIVED", receivedCrc)
-                    putExtra("CRC32_UNKNOWN", !crcKnown)
-                }
+            }
+            val puts = store.putBytesBatch(this, requests)
+
+            val paths = ArrayList<String>()
+            val names = ArrayList<String>()
+            val sizes = ArrayList<String>()
+            val entryIds = ArrayList<String>()
+            for (p in puts) {
+                paths.add(p.path.absolutePath)
+                names.add(p.entry.name)
+                sizes.add(p.entry.size.toString())
+                entryIds.add(p.entry.id)
+            }
+            clearRecoveryStage()
+            return Intent(this, ReceiveBundleActivity::class.java).apply {
+                putStringArrayListExtra("FILE_PATHS", paths)
+                putStringArrayListExtra("FILE_NAMES", names)
+                putStringArrayListExtra("FILE_SIZES", sizes)
+                putStringArrayListExtra("ENTRY_IDS", entryIds)
+                putExtra("BUNDLE_ID", bundleId)
+                putExtra("BUNDLE_TITLE", bundleTitle)
+                putExtra("TOTAL_FILES", totalFiles)
+                putExtra("RESAVE", true)
             }
         }
 
-        // Single-file path (or text-like). Canonical store path only.
+        // ── Single file entry (or empty-entry defensive fallback) ──
+        val entry = nonDirEntries.firstOrNull()
+        val fileName = entry?.path?.takeIf { it.isNotEmpty() }
+            ?: displayName.ifEmpty { "received_file" }
+        val fileBytes = entry?.let { e ->
+            if (e.offset >= 0 && e.size >= 0 && e.offset + e.size <= stream.size.toLong() &&
+                e.offset <= Int.MAX_VALUE && e.size <= Int.MAX_VALUE
+            ) stream.copyOfRange(e.offset.toInt(), (e.offset + e.size).toInt()) else stream
+        } ?: stream
+
         updateRecoveryStage("正在保存文件…")
-        val finalName = if (displayName.isNotEmpty()) displayName else "received_file"
-        val contentCrc = crc32OfBytes(truncBytes)
-        val crcHex = if (crcKnown) java.lang.Long.toHexString(expectedCrc) else java.lang.Long.toHexString(contentCrc)
-        val crcUnknown = !crcKnown
-
-        if (com.airferry.app.scan.TextLike.isTextLikeName(finalName) &&
-            com.airferry.app.scan.TextLike.fitsTextUi(truncBytes.size)
-        ) {
-            val text = com.airferry.app.scan.TextLike.decodeUtf8Strict(truncBytes)
-            if (text != null) {
-                val archiveLabel =
-                    if (finalName.contains('.')) finalName else TEXT_RECEIVED_NAME
-                val put = store.putBytes(
-                    this, archiveLabel, truncBytes,
-                    crcHex = java.lang.Long.toHexString(contentCrc),
-                    crcUnknown = false,
-                    kind = "text",
-                )
-                clearRecoveryStage()
-                return Intent(this, ReceiveTextActivity::class.java).apply {
-                    putExtra("FILE_PATH", put.path.absolutePath)
-                    putExtra("FILE_NAME", finalName)
-                    putExtra("ENTRY_ID", put.entry.id)
-                    putExtra("CRC32", if (crcKnown) expectedCrc else contentCrc)
-                    putExtra("CRC32_RECEIVED", contentCrc)
-                    putExtra("CRC32_UNKNOWN", !crcKnown)
-                }
-            }
-        }
-
         val put = store.putBytes(
-            this, finalName, truncBytes,
-            crcHex = crcHex, crcUnknown = crcUnknown, kind = "file",
+            this, fileName, fileBytes,
+            crcUnknown = true, kind = "file",
         )
         clearRecoveryStage()
         return Intent(this, ReceiveDetailActivity::class.java).apply {
             putExtra("FILE_PATH", put.path.absolutePath)
-            putExtra("FILE_SIZE", if (originalSize > 0) originalSize else truncBytes.size.toLong())
-            putExtra("FILE_NAME", finalName)
+            putExtra("FILE_SIZE", fileBytes.size.toLong())
+            putExtra("FILE_NAME", fileName)
             putExtra("ENTRY_ID", put.entry.id)
-            putExtra("CRC32", expectedCrc)
-            putExtra("CRC32_RECEIVED", receivedCrc)
-            putExtra("CRC32_UNKNOWN", !crcKnown)
-            // Already archived into ContentStore — do not copy again.
+            putExtra("CRC32_UNKNOWN", true)
             putExtra("RESAVE", true)
-        }
-    }
-
-    /**
-     * Store one recovered descriptor-v5 segment into the disk-backed assembler.
-     *
-     * Returns an Intent (navigates to the detail page) only once every segment
-     * of the root transfer has arrived and been merged; otherwise null (the
-     * receiver keeps scanning for the next segment).
-     */
-    private fun handleSegmentedTransfer(displayName: String, compressedBytes: ByteArray): Intent? {
-        val index = session.segmentIndex()
-        val count = session.segmentCount()
-        // rootSize = whole **compressed** stream size (descriptor root_original_size).
-        val rootSize = session.rootOriginalSize()
-        val lo = session.rootSessionIdLo()
-        val hi = session.rootSessionIdHi()
-        // segSize = this segment's **compressed** length (descriptor compressed_size).
-        val segSize = session.compressedSize()
-        val originalOffset = session.originalOffset()
-        val compression = session.compression()
-        val decompressedSize = session.originalSize()
-        val crc32 = session.crc32()
-        val crc32Known = session.crc32Known()
-        val expectedSha256 = requireNotNull(session.rawSha256()) {
-            "分段描述符缺少 SHA-256"
-        }
-        val rootSha256 = requireNotNull(session.rootSha256()) {
-            "分段描述符缺少整文件 SHA-256"
-        }
-
-        require(count in 1..com.airferry.app.scan.SegmentAssembler.MAX_SEGMENT_COUNT) {
-            "分段数量超出安全上限"
-        }
-        require(rootSize > 0 && originalOffset == index.toLong() *
-            com.airferry.app.scan.SegmentAssembler.SEGMENT_RAW_BYTES) {
-            "分段偏移或根文件大小无效"
-        }
-        require(segSize in 1..com.airferry.app.scan.SegmentAssembler.SEGMENT_RAW_BYTES) {
-            "分段长度无效"
-        }
-        require(compressedBytes.size.toLong() == segSize) {
-            "分段实际长度 ${compressedBytes.size} 与描述符 $segSize 不一致"
-        }
-        require(expectedSha256.size == 32) { "分段描述符 SHA-256 长度无效" }
-        require(rootSha256.size == 32) { "整文件 SHA-256 长度无效" }
-        val expectedCount = (rootSize - 1) /
-            com.airferry.app.scan.SegmentAssembler.SEGMENT_RAW_BYTES + 1
-        val expectedLength = minOf(
-            com.airferry.app.scan.SegmentAssembler.SEGMENT_RAW_BYTES,
-            rootSize - originalOffset,
-        )
-        require(index in 0 until count && count.toLong() == expectedCount && segSize == expectedLength) {
-            "分段数量或本段长度与根文件不一致"
-        }
-
-        val actualRootId = rootSessionIdHex(lo, hi)
-        val targetRootId = resumeRootId
-        if (targetRootId != null && actualRootId != targetRootId) {
-            clearRecoveryStage()
-            runOnUiThread {
-                Toast.makeText(this, "已忽略其他大文件任务", Toast.LENGTH_SHORT).show()
-                updateUi { it.copy(statusText = "继续等待选中任务的下一段…") }
-            }
-            swapReceiverForNextSegment()
-            return null
-        }
-
-        val root = com.airferry.app.scan.ContentStore.root(this)
-        // Reuse the active root so a long, sequential transfer does not reopen
-        // the ledger and re-hash every earlier ~32 MiB segment for each child.
-        // Interleaved roots still open their own identity-bound assembler.
-        val active = segAssembler
-        val asm = if (
-            active != null &&
-            active.matches(lo, hi, count, rootSize, rootSha256, displayName)
-        ) {
-            active
-        } else {
-            com.airferry.app.scan.SegmentAssembler.open(
-                root, lo, hi, count, rootSize, decompressedSize, compression,
-                crc32, crc32Known, rootSha256, displayName
-            ).also { segAssembler = it }
-        }
-
-        // Crash recovery: all segments may already be durable while promotion
-        // into ContentStore was interrupted. Re-run the idempotent promotion.
-        if (asm.isComplete()) {
-            return archiveSegmentedTransfer(asm, displayName, decompressedSize)
-        }
-
-        try {
-            val stored = asm.storeSegment(index, compressedBytes, expectedSha256)
-            if (!stored) {
-                updateSegmentedProgress(asm)
-                clearRecoveryStage()
-                swapReceiverForNextSegment()
-                return null
-            }
-        } catch (e: Exception) {
-            runOnUiThread {
-                Toast.makeText(this, "分段写入失败: ${e.message}", Toast.LENGTH_LONG).show()
-            }
-            clearRecoveryStage()
-            // Keep already-verified segments. A bad/current segment can simply
-            // be scanned again; deleting the entire task would make resume lie.
-            swapReceiverForNextSegment()
-            return null
-        }
-
-        if (!asm.isComplete()) {
-            updateSegmentedProgress(asm)
-            clearRecoveryStage()
-            // Keep scanning for the remaining segments.
-            swapReceiverForNextSegment()
-            return null
-        }
-
-        return archiveSegmentedTransfer(asm, displayName, decompressedSize)
-    }
-
-    /**
-     * Re-run the (idempotent) promotion of a fully-received segmented transfer
-     * into ContentStore. Triggered from the duplicate-segment fast path when
-     * the ledger turns out to be COMPLETE — i.e. every segment is durable but
-     * the original archive was interrupted (disk-full during `asm.finish()`,
-     * or the process dying between `finish()` and `putFile`). Skipping to the
-     * next segment instead would strand the data in `.partial` forever, because
-     * the archive branch inside [handleSegmentedTransfer] is only reachable
-     * via a segment's normal completion, which a dup-swap never reaches.
-     *
-     * Scheduling mirrors the completion path in [applySnapshot]: the heavy work
-     * (open ledger → stream-decompress → putFile) is posted to [ioExecutor]
-     * and runs under the *captured* pool's ingest lock — never on the decode
-     * worker that detected it (which already holds the lock), never on the
-     * main thread.
-     *
-     * @param active the in-memory assembler when it already matches this root
-     *        and is complete; null → the durable ledger is re-opened from disk
-     *        using the descriptor snapshot (which re-verifies every stored
-     *        segment's SHA-256 before declaring completeness).
-     */
-    private fun enqueueSegmentedReArchive(active: com.airferry.app.scan.SegmentAssembler?) {
-        // Snapshot every descriptor field the re-open needs BEFORE leaving the
-        // ingest lock — the session may be reset/destroyed by the time the
-        // task runs, and reading it then would be a use-after-free.
-        val lo = session.rootSessionIdLo()
-        val hi = session.rootSessionIdHi()
-        val count = session.segmentCount()
-        val compressedSize = session.rootOriginalSize()
-        val decompressedSize = session.originalSize()
-        val compression = session.compression()
-        val crc32Val = session.crc32()
-        val crc32Known = session.crc32Known()
-        val rootSha256 = session.rootSha256()
-        val fileName = session.fileName()
-        // Block any further ingest: this segment is already durable so the
-        // remaining symbols are useless, and stragglers in the same batched
-        // flush must not re-run the dup check and enqueue a second archive.
-        ingestStopped.set(true)
-        updateRecoveryStage("检测到已完成的分段任务，正在入库…")
-        val poolAtEnqueue = decodePool
-        ioExecutor.execute {
-            try {
-                var intent: Intent? = null
-                val work = fun() {
-                    val sha = requireNotNull(rootSha256) { "分段描述符缺少整文件 SHA-256" }
-                    require(sha.size == 32) { "分段描述符 SHA-256 长度无效" }
-                    val asm = active ?: com.airferry.app.scan.SegmentAssembler.open(
-                        com.airferry.app.scan.ContentStore.root(this),
-                        lo, hi, count, compressedSize, decompressedSize, compression,
-                        crc32Val, crc32Known, sha, fileName,
-                    ).also { segAssembler = it }
-                    if (!asm.isComplete()) {
-                        // The cheap ledger check was a false positive (open()'s
-                        // per-segment re-verification rejected bitmap entries —
-                        // e.g. .partial corrupted in place). Keep the verified
-                        // segments and go back to scanning the missing ones.
-                        Log.i(TAG, "reArchive: ledger not actually complete — resume scanning")
-                        swapReceiverForNextSegment()
-                        clearRecoveryStage()
-                        return
-                    }
-                    intent = archiveSegmentedTransfer(asm, fileName, decompressedSize)
-                }
-                // Always serialize via the captured pool (same reasoning as the
-                // completion path in applySnapshot — see the long comment there).
-                poolAtEnqueue?.runExclusive(work)
-                intent?.let {
-                    runOnUiThread {
-                        completedHandled = true
-                        startActivity(it)
-                    }
-                }
-            } catch (e: Exception) {
-                clearRecoveryStage()
-                resetReceiverAfterRecoveryFailure()
-                runOnUiThread {
-                    Toast.makeText(
-                        this,
-                        e.message ?: "保存接收内容失败",
-                        Toast.LENGTH_LONG,
-                    ).show()
-                }
-            } catch (e: OutOfMemoryError) {
-                Log.e(TAG, "segmented re-archive OOM", e)
-                clearRecoveryStage()
-                resetReceiverAfterRecoveryFailure()
-                runOnUiThread {
-                    Toast.makeText(this, "文件过大，接收内存不足", Toast.LENGTH_LONG).show()
-                }
-            }
-        }
-    }
-
-    private fun archiveSegmentedTransfer(
-        asm: com.airferry.app.scan.SegmentAssembler,
-        displayName: String,
-        rootSize: Long,
-    ): Intent? {
-        // Concatenate the compressed segments and stream-decompress exactly once
-        // to a temp file. The native call already verified the decompressed
-        // length + CRC32 (when known) + root SHA-256 over the decompressed bytes.
-        val decompressedFile = asm.finish()
-            ?: throw IllegalStateException("分段账本已完成，但解压或完整性校验失败")
-        updateRecoveryStage("正在校验完整性…")
-        val crcKnown = asm.crc32Known()
-        val expectedCrc = asm.crc32()
-        val store = com.airferry.app.scan.ContentStore
-
-        // Text / bundle detection needs the bytes in memory. Anything larger
-        // than the legacy whole-transfer ceiling is a single file by
-        // construction, so skip the in-memory dispatch and stream-copy straight
-        // to the content store — this is what lets > 256 MiB files be recovered.
-        val small = decompressedFile.length() <= 256L * 1024 * 1024
-        val originalBytes = if (small) decompressedFile.readBytes() else ByteArray(0)
-
-        if (small) {
-            val receivedCrc = crc32OfBytes(originalBytes)
-
-            // Text payload → ETTEXTv1. Strip the 8-byte wire magic up front
-            // (same restructure as recoverAndStage): the oversized→file
-            // fallback must stage the message text, never bytes starting with
-            // the literal "ETTEXTv1" protocol header.
-            if (com.airferry.app.scan.TextParser.isText(originalBytes)) {
-                val messageBytes =
-                    com.airferry.app.scan.TextParser.payloadWithoutMagic(originalBytes)
-                val textName = when {
-                    displayName.isEmpty() -> TEXT_RECEIVED_NAME
-                    displayName.contains('.') -> displayName
-                    else -> "$displayName.txt"
-                }
-                val text =
-                    if (com.airferry.app.scan.TextLike.fitsTextUi(messageBytes.size))
-                        com.airferry.app.scan.TextParser.parse(originalBytes)
-                    else
-                        null
-                if (text != null) {
-                    updateRecoveryStage("正在保存文字…")
-                    val contentBytes = text.toByteArray(Charsets.UTF_8)
-                    val contentCrc = crc32OfBytes(contentBytes)
-                    val crcHex = java.lang.Long.toHexString(contentCrc)
-                    val put = store.putBytes(
-                        this, textName, contentBytes,
-                        crcHex = crcHex, crcUnknown = false, kind = "text",
-                    )
-                    asm.commitArchived(); segAssembler = null; resumeRootId = null
-                    clearRecoveryStage()
-                    return Intent(this, ReceiveTextActivity::class.java).apply {
-                        putExtra("FILE_PATH", put.path.absolutePath)
-                        putExtra("FILE_NAME", textName)
-                        putExtra("ENTRY_ID", put.entry.id)
-                        putExtra("CRC32", expectedCrc)
-                        putExtra("CRC32_RECEIVED", receivedCrc)
-                        putExtra("CRC32_UNKNOWN", !crcKnown)
-                    }
-                }
-                // Oversized (over the text cap) or invalid UTF-8 → ordinary
-                // .txt FILE, magic stripped.
-                updateRecoveryStage("正在保存文件…")
-                val contentCrc = crc32OfBytes(messageBytes)
-                val put = store.putBytes(
-                    this, textName, messageBytes,
-                    crcHex = java.lang.Long.toHexString(contentCrc),
-                    crcUnknown = false, kind = "file",
-                )
-                asm.commitArchived(); segAssembler = null; resumeRootId = null
-                clearRecoveryStage()
-                return Intent(this, ReceiveDetailActivity::class.java).apply {
-                    putExtra("FILE_PATH", put.path.absolutePath)
-                    putExtra("FILE_SIZE", messageBytes.size.toLong())
-                    putExtra("FILE_NAME", textName)
-                    putExtra("ENTRY_ID", put.entry.id)
-                    putExtra("CRC32", expectedCrc)
-                    putExtra("CRC32_RECEIVED", receivedCrc)
-                    putExtra("CRC32_UNKNOWN", !crcKnown)
-                    putExtra("RESAVE", true)
-                }
-            }
-
-            // Multi-file bundle → one ContentStore entry per member.
-            if (com.airferry.app.scan.BundleParser.isBundle(originalBytes)) {
-                val bundle = com.airferry.app.scan.BundleParser.parse(originalBytes)
-                if (bundle != null && bundle.files.isNotEmpty()) {
-                    val totalFiles = bundle.files.size
-                    val paths = ArrayList<String>()
-                    val names = ArrayList<String>()
-                    val sizes = ArrayList<String>()
-                    val entryIds = ArrayList<String>()
-                    val ts = java.text.SimpleDateFormat("MMdd_HHmmss", java.util.Locale.getDefault())
-                        .format(java.util.Date())
-                    val bundleId = java.util.UUID.randomUUID().toString()
-                    val bundleTitle = "发送_$ts"
-                    updateRecoveryStage("正在保存 $totalFiles 个文件…")
-                    val puts = store.putBytesBatch(
-                        this,
-                        bundle.files.map { f ->
-                            com.airferry.app.scan.ContentStore.PutBytesRequest(
-                                f.name, f.data,
-                                crcHex = "unknown", crcUnknown = true, kind = "file",
-                                bundleId = bundleId, bundleTitle = bundleTitle,
-                            )
-                        },
-                    )
-                    for ((f, put) in bundle.files.zip(puts)) {
-                        paths.add(put.path.absolutePath)
-                        names.add(f.name)
-                        sizes.add(f.data.size.toString())
-                        entryIds.add(put.entry.id)
-                    }
-                    asm.commitArchived(); segAssembler = null; resumeRootId = null
-                    clearRecoveryStage()
-                    return Intent(this, ReceiveBundleActivity::class.java).apply {
-                        putStringArrayListExtra("FILE_PATHS", paths)
-                        putStringArrayListExtra("FILE_NAMES", names)
-                        putStringArrayListExtra("FILE_SIZES", sizes)
-                        putStringArrayListExtra("ENTRY_IDS", entryIds)
-                        putExtra("CRC32", expectedCrc)
-                        putExtra("CRC32_RECEIVED", receivedCrc)
-                        putExtra("CRC32_UNKNOWN", !crcKnown)
-                    }
-                }
-            }
-        }
-
-        // Single-file path (works for both small and very large files — for the
-        // latter, putFile streams/atomically-moves the on-disk original).
-        updateRecoveryStage("正在保存文件…")
-        val finalName = if (displayName.isNotEmpty()) displayName else "received_file"
-        if (small) {
-            if (com.airferry.app.scan.TextLike.isTextLikeName(finalName) &&
-                com.airferry.app.scan.TextLike.fitsTextUi(originalBytes.size)
-            ) {
-                val text = com.airferry.app.scan.TextLike.decodeUtf8Strict(originalBytes)
-                if (text != null) {
-                    val receivedCrc = crc32OfBytes(originalBytes)
-                    val archiveLabel =
-                        if (finalName.contains('.')) finalName else TEXT_RECEIVED_NAME
-                    val put = store.putBytes(
-                        this, archiveLabel, originalBytes,
-                        crcHex = java.lang.Long.toHexString(receivedCrc),
-                        crcUnknown = false,
-                        kind = "text",
-                    )
-                    asm.commitArchived(); segAssembler = null; resumeRootId = null
-                    clearRecoveryStage()
-                    return Intent(this, ReceiveTextActivity::class.java).apply {
-                        putExtra("FILE_PATH", put.path.absolutePath)
-                        putExtra("FILE_NAME", finalName)
-                        putExtra("ENTRY_ID", put.entry.id)
-                        putExtra("CRC32", if (crcKnown) expectedCrc else receivedCrc)
-                        putExtra("CRC32_RECEIVED", receivedCrc)
-                        putExtra("CRC32_UNKNOWN", !crcKnown)
-                    }
-                }
-            }
-        }
-
-        val put = store.putFile(
-            this, finalName, decompressedFile,
-            crcHex = if (crcKnown) java.lang.Long.toHexString(expectedCrc) else "unknown",
-            crcUnknown = !crcKnown,
-            kind = "file",
-            expectedSha256Hex = asm.rootSha256Hex(),
-            expectedSize = rootSize,
-            stableEntryId = "segment-${rootSessionIdHex(asm.rootSessionIdLo(), asm.rootSessionIdHi())}",
-        )
-        // ContentStore index is now durable; the resumable task can be removed.
-        asm.commitArchived()
-        segAssembler = null
-        resumeRootId = null
-        clearRecoveryStage()
-        return Intent(this, ReceiveDetailActivity::class.java).apply {
-            putExtra("FILE_PATH", put.path.absolutePath)
-            putExtra("FILE_SIZE", rootSize)
-            putExtra("FILE_NAME", finalName)
-            putExtra("ENTRY_ID", put.entry.id)
-            putExtra("RESAVE", true)
-        }
-    }
-
-    /** Update the UI progress with how many segments have been stored. */
-    private fun updateSegmentedProgress(asm: com.airferry.app.scan.SegmentAssembler) {
-        val received = asm.receivedCount()
-        val totalSeg = asm.segmentCount()
-        runOnUiThread {
-            val s = "分段 $received/$totalSeg 已收，继续扫描下一段…"
-            Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
-            updateUi { it.copy(statusText = s) }
-        }
-    }
-
-    /**
-     * Swap the receiver to a fresh session for the *next* descriptor-v5 segment.
-     *
-     * Called from `recoverAndStage` which runs *inside* the decode pool's ingest
-     * lock, so we must NOT re-acquire it (`resetSession()` would deadlock).
-     * `ingestStopped` is cleared so the capture loop keeps feeding frames.
-     */
-    private fun swapReceiverForNextSegment() {
-        session.destroy()
-        session = ReceiverSessionManager()
-        ingestStopped.set(false)
-        completedHandled = false
-        lastUiUpdate = 0
-        rateSamples.clear()
-        runOnUiThread {
-            updateUi {
-                it.copy(
-                    complete = false,
-                    progressPct = 0,
-                    receivedSymbols = 0,
-                    totalSymbols = 0,
-                    decodedBlocks = 0,
-                    totalBlocks = 0,
-                )
-            }
         }
     }
 
@@ -1514,15 +925,7 @@ class ScanActivity : ComponentActivity() {
         }
     }
 
-    private fun rootSessionIdHex(lo: Long, hi: Long): String {
-        val low = java.lang.Long.toUnsignedString(lo, 16).padStart(16, '0')
-        val high = java.lang.Long.toUnsignedString(hi, 16).padStart(16, '0')
-        return "$high$low"
-    }
-
-    private fun idleStatus(): String = resumeRootId?.let {
-        "继续恢复任务 ${it.take(8)}… — 对准对应分段二维码"
-    } ?: "就绪 — 对准二维码…"
+    private fun idleStatus(): String = "就绪 — 对准二维码…"
 
     /**
      * Reset the native receiver on a background thread, under the pool's ingest
@@ -1551,7 +954,6 @@ class ScanActivity : ComponentActivity() {
     }
 
     private fun resetSession() {
-        segAssembler = null
         // Swap the receiver under the pool's ingest lock so no worker is mid-ingest
         // while we destroy the old native handle — asynchronously (see
         // [resetReceiverAsync]); the UI-visible counters below reset immediately.
