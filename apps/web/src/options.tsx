@@ -1,0 +1,430 @@
+/**
+ * AirFerry options / sender page (AF2 protocol).
+ *
+ * Route: select → params → play → stats.
+ */
+import { useCallback, useEffect, useRef, useState } from "react"
+import {
+  type CompressPhase,
+  type Page,
+  type PendingItem,
+  type TransferConfig,
+  loadConfig,
+  saveConfig,
+  normalizeConfig,
+} from "@/types"
+import { FileSelectPage } from "@/pages/FileSelectPage"
+import { ParamsPage } from "@/pages/ParamsPage"
+import { PlayPage } from "@/pages/PlayPage"
+import { StatsPage } from "@/pages/StatsPage"
+import {
+  ensureWasm,
+  SenderBuilderWasm,
+  type SenderSessionWasm,
+} from "@/wasm/loader"
+import type { PreparedItem } from "@/workers/compress.worker"
+import "@/assets/app.css"
+
+const iconUrl = new URL("../assets/icon.png", import.meta.url).href
+
+function createCompressWorker(): Worker {
+  if (typeof globalThis !== "undefined" && (globalThis as any).__WORKER_CODE__) {
+    const blob = new Blob([(globalThis as any).__WORKER_CODE__], { type: "application/javascript" })
+    const url = URL.createObjectURL(blob)
+    return new Worker(url)
+  }
+  return new Worker(new URL("./workers/compress.worker.ts", import.meta.url), {
+    type: "module",
+  })
+}
+
+async function initializeCompressWorker(worker: Worker): Promise<void> {
+  worker.postMessage({ type: "wasm-init" })
+}
+
+function itemsToFiles(items: PendingItem[]): File[] {
+  return items.map((it) => {
+    if (it.kind === "file") return it.file
+    const name = it.name?.trim() ? it.name.trim() : "文字消息.txt"
+    const finalName = name.toLowerCase().endsWith(".txt") ? name : `${name}.txt`
+    return new File([it.content], finalName, {
+      type: "text/plain;charset=utf-8",
+      lastModified: Date.now(),
+    })
+  })
+}
+
+interface PreparedPayload {
+  items: PreparedItem[]
+  totalBytes: number
+  displayName: string
+}
+
+export interface AppState {
+  page: Page
+  items: PendingItem[]
+  prepared: PreparedPayload | null
+  session: SenderSessionWasm | null
+  config: TransferConfig
+  initializing: boolean
+  compressPhase: CompressPhase | null
+  error: string | null
+}
+
+const freedSessions = new WeakSet<SenderSessionWasm>()
+function freeSenderSession(session: SenderSessionWasm | null | undefined): void {
+  if (!session || freedSessions.has(session)) return
+  freedSessions.add(session)
+  try {
+    session.free()
+  } catch (_) {
+    // Ignore double-free errors
+  }
+}
+
+export default function App() {
+  useEffect(() => {
+    document.title = "AirFerry · 无网文件传输"
+  }, [])
+
+  const [state, setState] = useState<AppState>({
+    page: "select",
+    items: [],
+    prepared: null,
+    session: null,
+    config: loadConfig(),
+    initializing: false,
+    compressPhase: null,
+    error: null,
+  })
+
+  const ownedSessionRef = useRef<SenderSessionWasm | null>(null)
+  const mountedRef = useRef(false)
+  const releaseOwnedSession = useCallback(() => {
+    const session = ownedSessionRef.current
+    ownedSessionRef.current = null
+    freeSenderSession(session)
+  }, [])
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      releaseOwnedSession()
+    }
+  }, [releaseOwnedSession])
+
+  const epoch = useRef(0)
+  const issuedEpoch = useRef(-1)
+  const workerRef = useRef<Worker | null>(null)
+  const restartWorkerRef = useRef<() => void>(() => undefined)
+
+  const go = useCallback((page: Page) => {
+    if (page === "select") {
+      epoch.current += 1
+      if (issuedEpoch.current >= 0) restartWorkerRef.current()
+      issuedEpoch.current = -1
+      setState((s) => ({
+        ...s,
+        page,
+        compressPhase: null,
+      }))
+      return
+    }
+    setState((s) => ({ ...s, page }))
+  }, [])
+
+  useEffect(() => {
+    let worker: Worker | null = null
+    let disposed = false
+    const handler = (e: MessageEvent) => {
+      const msg = e.data
+      if (!msg || typeof msg.phase !== "string") return
+      if (typeof msg.jobId === "number") {
+        if (msg.jobId !== epoch.current || issuedEpoch.current !== epoch.current) return
+      } else if (issuedEpoch.current !== epoch.current) {
+        return
+      }
+
+      if (msg.phase === "error") {
+        issuedEpoch.current = -1
+        setState((s) => ({
+          ...s,
+          compressPhase: null,
+          error: msg.message || "文件准备失败",
+        }))
+        return
+      }
+
+      if (msg.phase === "reading") {
+        setState((s) => ({
+          ...s,
+          compressPhase: "reading",
+          error: null,
+        }))
+        return
+      }
+
+      if (msg.phase === "done") {
+        issuedEpoch.current = -1
+        const payload: PreparedPayload = {
+          items: msg.items as PreparedItem[],
+          totalBytes: msg.totalBytes as number,
+          displayName: msg.displayName as string,
+        }
+        setState((s) => ({
+          ...s,
+          prepared: payload,
+          page: "params",
+          compressPhase: null,
+          error: null,
+        }))
+      }
+    }
+
+    const failWorker = (message: string) => {
+      if (disposed) return
+      setState((s) => ({
+        ...s,
+        compressPhase: null,
+        error: `文件处理线程错误: ${message}，正在重启…`,
+      }))
+      startWorker()
+    }
+
+    const errorHandler = (e: ErrorEvent) => {
+      e.preventDefault()
+      failWorker(e.message || "worker crashed")
+    }
+    const messageErrorHandler = () => failWorker("无法解析 worker 消息")
+    const startWorker = () => {
+      worker?.removeEventListener("message", handler)
+      worker?.removeEventListener("error", errorHandler)
+      worker?.removeEventListener("messageerror", messageErrorHandler)
+      worker?.terminate()
+      try {
+        worker = createCompressWorker()
+        workerRef.current = worker
+        worker.addEventListener("message", handler)
+        worker.addEventListener("error", errorHandler)
+        worker.addEventListener("messageerror", messageErrorHandler)
+        void initializeCompressWorker(worker).catch((e) =>
+          failWorker(e instanceof Error ? e.message : String(e))
+        )
+      } catch (e) {
+        worker = null
+        workerRef.current = null
+        setState((s) => ({
+          ...s,
+          compressPhase: null,
+          error: `无法启动文件处理线程: ${e instanceof Error ? e.message : String(e)}`,
+        }))
+      }
+    }
+    restartWorkerRef.current = startWorker
+    startWorker()
+    return () => {
+      disposed = true
+      restartWorkerRef.current = () => undefined
+      worker?.terminate()
+      workerRef.current = null
+    }
+  }, [])
+
+  const onItemsChange = useCallback((items: PendingItem[]) => {
+    releaseOwnedSession()
+    epoch.current += 1
+    if (issuedEpoch.current >= 0) restartWorkerRef.current()
+    issuedEpoch.current = -1
+    setState((s) => ({
+      ...s,
+      items,
+      prepared: null,
+      session: null,
+      compressPhase: null,
+      error: null,
+    }))
+  }, [releaseOwnedSession])
+
+  const onSend = useCallback(() => {
+    const items = state.items
+    if (items.length === 0) return
+    if (state.compressPhase != null) return
+    const worker = workerRef.current
+    if (!worker) {
+      setState((s) => ({ ...s, error: "文件处理线程尚未就绪，请重试" }))
+      return
+    }
+    epoch.current += 1
+    const e = epoch.current
+    issuedEpoch.current = e
+    releaseOwnedSession()
+    setState((s) => ({
+      ...s,
+      session: null,
+      compressPhase: "reading",
+      error: null,
+    }))
+    if (items.length === 1 && items[0].kind === "text") {
+      worker.postMessage({
+        jobId: e,
+        text: items[0].content,
+        name: items[0].name,
+      })
+    } else {
+      worker.postMessage({ jobId: e, files: itemsToFiles(items) })
+    }
+  }, [state.items, state.compressPhase, releaseOwnedSession])
+
+  const onStart = useCallback(async () => {
+    if (!state.prepared) return
+    const startEpoch = epoch.current
+    const cfg = state.config
+    const p = state.prepared
+    setState((s) => ({ ...s, initializing: true, error: null }))
+    try {
+      await ensureWasm()
+      if (!mountedRef.current || epoch.current !== startEpoch) {
+        if (mountedRef.current) {
+          setState((s) => ({ ...s, initializing: false }))
+        }
+        return
+      }
+      const builder = new SenderBuilderWasm()
+      for (const it of p.items) {
+        builder.add_entry(it.kind, it.path, new Uint8Array(it.content))
+      }
+      const session = builder.build(
+        cfg.symbolSize,
+        8 * 1024 * 1024,
+        cfg.redundancyPct
+      )
+      if (!mountedRef.current || epoch.current !== startEpoch) {
+        freeSenderSession(session)
+        releaseOwnedSession()
+        if (mountedRef.current) {
+          setState((s) => ({ ...s, session: null, initializing: false }))
+        }
+        return
+      }
+      releaseOwnedSession()
+      ownedSessionRef.current = session
+      setState((s) => ({ ...s, session, page: "play", initializing: false }))
+    } catch (e: any) {
+      console.error("WASM session creation failed:", e)
+      setState((s) => ({
+        ...s,
+        initializing: false,
+        error: `编码器初始化失败: ${e?.message || e}`,
+      }))
+    }
+  }, [state.prepared, state.config, releaseOwnedSession])
+
+  const updateConfig = useCallback(
+    (patch: Partial<TransferConfig>) =>
+      setState((s) => {
+        const next = { ...s.config, ...patch }
+        saveConfig(next)
+        return { ...s, config: next }
+      }),
+    []
+  )
+
+  const stopPlayback = useCallback(() => {
+    releaseOwnedSession()
+    setState((s) => ({
+      ...s,
+      session: null,
+      page: s.prepared ? "params" : "select",
+      initializing: false,
+      error: null,
+    }))
+  }, [releaseOwnedSession])
+
+  return (
+    <div className="app">
+      <header className="app-header">
+        <div className="app-logo">
+          <img src={iconUrl} alt="AirFerry" />
+        </div>
+        <div className="app-title">
+          <h1>AirFerry</h1>
+        </div>
+      </header>
+      <div className="steps">
+        <div
+          className={`step ${state.page === "select" ? "active" : state.prepared ? "done" : ""}`}
+          onClick={() => go("select")}
+        >
+          <span className="step-dot">1</span>
+          <span className="step-label">选择文件</span>
+        </div>
+        <div className="step-line" />
+        <div
+          className={`step ${state.page === "params" ? "active" : state.session ? "done" : ""}`}
+          onClick={() => state.prepared && go("params")}
+        >
+          <span className="step-dot">2</span>
+          <span className="step-label">传输参数</span>
+        </div>
+        <div className="step-line" />
+        <div
+          className={`step ${state.page === "play" ? "active" : ""}`}
+          onClick={() => state.session && go("play")}
+        >
+          <span className="step-dot">3</span>
+          <span className="step-label">播放传输</span>
+        </div>
+        <div className="step-line" />
+        <div
+          className={`step ${state.page === "stats" ? "active" : ""}`}
+          onClick={() => state.session && go("stats")}
+        >
+          <span className="step-dot">4</span>
+          <span className="step-label">统计</span>
+        </div>
+      </div>
+      <main className="app-main">
+        {state.error && (
+          <div className="error-banner" role="alert">
+            {state.error}
+          </div>
+        )}
+        {state.page === "select" && (
+          <FileSelectPage
+            items={state.items}
+            onItemsChange={onItemsChange}
+            onSend={onSend}
+          />
+        )}
+        {state.page === "params" && state.prepared && (
+          <ParamsPage
+            items={state.items}
+            displayName={state.prepared.displayName}
+            originalSize={state.prepared.totalBytes}
+            isBundle={state.items.length > 1}
+            isText={state.items.length === 1 && state.items[0].kind === "text"}
+            config={state.config}
+            onChange={updateConfig}
+            onStart={onStart}
+            initializing={state.initializing}
+          />
+        )}
+        {state.page === "play" && state.session && state.prepared && (
+          <PlayPage
+            session={state.session}
+            config={state.config}
+            totalBytes={state.prepared.totalBytes}
+            onStop={stopPlayback}
+          />
+        )}
+        {state.page === "stats" && state.session && (
+          <StatsPage
+            session={state.session}
+            fileSize={state.prepared?.totalBytes ?? 0}
+          />
+        )}
+      </main>
+    </div>
+  )
+}
