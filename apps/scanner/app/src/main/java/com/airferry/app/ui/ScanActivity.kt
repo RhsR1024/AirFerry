@@ -177,7 +177,7 @@ class ScanActivity : ComponentActivity() {
             false
         } else {
             try {
-                val h = NativeBridge.receiverCreate(0L, 1L, 1, 100, 1024)
+                val h = NativeBridge.receiverCreate(0L, 1L)
                 NativeBridge.receiverDestroy(h)
                 true
             } catch (e: Exception) {

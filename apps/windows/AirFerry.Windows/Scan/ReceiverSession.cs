@@ -6,24 +6,15 @@ namespace AirFerry.Windows.Scan;
 
 /// <summary>
 /// High-level receiver session manager — the Windows equivalent of Android's
-/// <c>ReceiverSessionManager.kt</c>. Wraps the Rust C ABI and drives the same
-/// state machine: lazy-init from the first ROOT/META frame, then a forced
-/// re-init if the session-mismatch streak climbs without ever accepting a
-/// symbol.
+/// <c>ReceiverSessionManager.kt</c>. Frames pass straight through to the Rust
+/// C-ABI receiver, which owns the entire AF2 state machine (frame validation,
+/// ROOT lock / 3-ROOT debounce re-lock, object routing, OTI integrity).
 /// </summary>
 /// <remarks>
 /// <para>
-/// The native receiver is <b>only</b> initialized from a ROOT or OBJECT_META
-/// frame (<see cref="FrameHeader.IsMetaOrRoot"/>). Ordinary data frames are
-/// silently dropped until a metadata frame arrives. This prevents a corrupted
-/// first QR decode (which only passes magic+version but may carry a garbage
-/// session_id) from permanently locking out every subsequent correct frame.
-/// </para>
-/// <para>
-/// Once initialized, a persistent session-mismatch streak with zero accepted
-/// symbols triggers a forced re-init from the next metadata frame that
-/// arrives — covering the edge-case where the first metadata frame itself was
-/// corrupted but a later one is clean.
+/// No wire-format parsing happens on the C# side (SPEC §9: hosts must not
+/// mirror the wire protocol). The packed <see cref="IngestStatus"/> word and
+/// the snapshot JSON are the only native surfaces consumed here.
 /// </para>
 /// <para>
 /// Every access to the native handle is serialized by this wrapper. Callers may
@@ -35,96 +26,112 @@ public sealed class ReceiverSession : IDisposable
 {
     private readonly object _gate = new();
     private IntPtr _handle = IntPtr.Zero;
-    private ulong _sessionIdLo;
-    private ulong _sessionIdHi;
-    private uint _symbolSize;
     private bool _initialized;
-    private int _estimatedTotalSymbols;
-    private int _mismatchStreak;
-    private bool _everAccepted;
+    private Snapshot? _cachedSnapshot;
 
     public bool IsInitialized { get { lock (_gate) return _initialized; } }
-    public int EstimatedTotalSymbols { get { lock (_gate) return _estimatedTotalSymbols; } }
-    public uint SymbolSizeBytes { get { lock (_gate) return _symbolSize; } }
+    /// <summary>Estimated total symbols from the locked transfer (0 before ROOT).</summary>
+    public int EstimatedTotalSymbols
+    {
+        get
+        {
+            var snap = GetSnapshot();
+            if (!snap.MetaConfirmed || snap.SymbolSize == 0) return 0;
+            return (int)Math.Min(int.MaxValue,
+                (snap.TotalRawSize + snap.SymbolSize - 1) / snap.SymbolSize);
+        }
+    }
+    /// <summary>Wire symbol size T reported by Rust (0 before lock).</summary>
+    public uint SymbolSizeBytes { get { var snap = GetSnapshot(); return snap.SymbolSize; } }
 
     /// <summary>
-    /// Ingest a decoded QR payload. Returns a lightweight
-    /// <see cref="IngestStatus"/> (no JSON) so the hot ingest path doesn't
-    /// allocate/parse a string per frame; call <see cref="Progress"/> on the
-    /// UI refresh cadence for the full snapshot.
+    /// Ingest a decoded QR payload. Direct passthrough to the native AF2 receiver
+    /// engine, which holds the single source-of-truth state machine (frame validation,
+    /// 3-ROOT debounce, object routing, and OTI integrity).
     /// </summary>
     public IngestStatus? Ingest(byte[] frameBytes)
     {
         lock (_gate)
         {
-        FrameHeader? header = FrameHeader.Parse(frameBytes);
-        if (header is null)
-        {
-            return null;
-        }
-        FrameHeader h = header.Value;
-
-        // Cache estimated total symbols from the first frame for approximate
-        // UI progress before the descriptor arrives.
-        if (_estimatedTotalSymbols == 0 && h.TotalSymbols > 0)
-        {
-            _estimatedTotalSymbols = (int)h.TotalSymbols;
-        }
-
-        bool isMetaOrRoot = h.IsMetaOrRoot;
-
-        // --- Lazy init: only from ROOT/META frames ---
-        // Until a metadata frame arrives the authoritative OTI is unknown;
-        // feeding data frames to a guessed decoder (the old path) corrupted
-        // multi-block recovery. Drop them silently and wait.
-        if (!_initialized)
-        {
-            if (!isMetaOrRoot)
-            {
-                return null; // wait for a ROOT/META frame
-            }
-            CreateReceiver(h);
-            if (!_initialized)
+            if (frameBytes is null || frameBytes.Length == 0)
             {
                 return null;
             }
-        }
 
-        // --- Session-mismatch re-init ---
-        // If the streak is high and we never accepted anything, the first
-        // metadata frame was likely corrupt → destroy and re-init on the next
-        // metadata frame (the next Ingest call re-enters the lazy-init block above).
-        if (_initialized && !isMetaOrRoot && _mismatchStreak >= 3 && !_everAccepted)
-        {
-            Destroy();
-            return null;
-        }
+            if (!_initialized)
+            {
+                CreateReceiver();
+                if (!_initialized)
+                {
+                    return null;
+                }
+            }
 
-        ulong word = NativeBridge.ReceiverIngest(_handle, frameBytes, (nuint)frameBytes.Length);
-        IngestStatus? status = IngestStatus.Unpack(word);
-        if (status is null)
-        {
-            return null; // error sentinel: rejected frame, nothing to do.
-        }
-        IngestStatus s = status.Value;
+            ulong word = NativeBridge.ReceiverIngest(_handle, frameBytes, (nuint)frameBytes.Length);
+            IngestStatus? status = IngestStatus.Unpack(word);
+            if (status is null)
+            {
+                return null; // error sentinel: rejected frame, nothing to do.
+            }
+            IngestStatus s = status.Value;
 
-        // Track mismatch streak for the re-init heuristic above.
-        if (s.MismatchStreak >= 3)
-        {
-            _mismatchStreak = s.MismatchStreak;
-        }
-        else if (s.Accepted)
-        {
-            _everAccepted = true;
-            _mismatchStreak = 0;
-            if (s.ReceivedSymbols == 0)
+            if (s.Accepted && s.ReceivedSymbols == 0)
             {
                 // Relocked in native AF2: clear stale snapshot cache.
                 _cachedSnapshot = null;
             }
-        }
 
-        return s;
+            return s;
+        }
+    }
+
+    private void CreateReceiver()
+    {
+        _handle = NativeBridge.ReceiverCreate(0, 0);
+        _initialized = _handle != IntPtr.Zero;
+        _cachedSnapshot = null;
+    }
+
+    /// <summary>Verify a staged raw chunk against the ROOT-bound Manifest table (§11).</summary>
+    public bool VerifyChunk(uint index, byte[] rawBytes)
+    {
+        lock (_gate)
+        {
+            if (!_initialized || _handle == IntPtr.Zero || rawBytes is null)
+            {
+                return false;
+            }
+            return NativeBridge.ReceiverVerifyChunk(_handle, index, rawBytes, (nuint)rawBytes.Length) == 1;
+        }
+    }
+
+    /// <summary>Run §13 ⑧⑨ integrity chain over the reassembled canonical stream.</summary>
+    public bool VerifyFinalStream(byte[] streamBytes)
+    {
+        lock (_gate)
+        {
+            if (!_initialized || _handle == IntPtr.Zero || streamBytes is null)
+            {
+                return false;
+            }
+            return NativeBridge.ReceiverVerifyFinalStream(_handle, streamBytes, (nuint)streamBytes.Length) == 1;
+        }
+    }
+
+    /// <summary>Restore session from stored ROOT frame bytes + completed chunk indices (§12 resume).</summary>
+    public bool Resume(byte[] rootFrameBytes, uint[] completedIndices)
+    {
+        lock (_gate)
+        {
+            if (!_initialized)
+            {
+                CreateReceiver();
+            }
+            if (!_initialized || _handle == IntPtr.Zero || rootFrameBytes is null || completedIndices is null)
+            {
+                return false;
+            }
+            return NativeBridge.ReceiverResume(_handle, rootFrameBytes, (nuint)rootFrameBytes.Length, completedIndices, (nuint)completedIndices.Length) == 1;
         }
     }
 
@@ -200,6 +207,7 @@ public sealed class ReceiverSession : IDisposable
         public uint EntryCount;
         public uint ChunkCount;
         public uint ChunkRawSize;
+        public uint SymbolSize;
         public IReadOnlyList<ManifestEntryDto> Entries = Array.Empty<ManifestEntryDto>();
     }
 
@@ -217,7 +225,7 @@ public sealed class ReceiverSession : IDisposable
             {
                 return new Snapshot();
             }
-            if (_cachedSnapshot is { MetaConfirmed: true, Entries.Count: > 0 } cached)
+            if (_cachedSnapshot is { MetaConfirmed: true } cached)
             {
                 return cached;
             }
@@ -241,6 +249,7 @@ public sealed class ReceiverSession : IDisposable
                     EntryCount = root.TryGetProperty("entry_count", out var ec) ? (uint)ec.GetUInt64() : 0u,
                     ChunkCount = root.TryGetProperty("chunk_count", out var cc) ? (uint)cc.GetUInt64() : 0u,
                     ChunkRawSize = root.TryGetProperty("chunk_raw_size", out var crs) ? (uint)crs.GetUInt64() : 0u,
+                    SymbolSize = root.TryGetProperty("symbol_size", out var ss) ? (uint)ss.GetUInt64() : 0u,
                 };
                 if (root.TryGetProperty("entries", out var entriesEl) &&
                     entriesEl.ValueKind == System.Text.Json.JsonValueKind.Array)
@@ -402,49 +411,8 @@ public sealed class ReceiverSession : IDisposable
     /// <summary>Whole decompressed original size.</summary>
     public ulong OriginalSize() => GetSnapshot().TotalRawSize;
 
-    /// <summary>Session id as a lowercase hex string (high||low, 32 chars).</summary>
-    public string SessionIdHex()
-    {
-        lock (_gate)
-        {
-            string lo = _sessionIdLo.ToString("x16");
-            string hi = _sessionIdHi.ToString("x16");
-            return hi + lo;
-        }
-    }
-
-    /// <summary>True when the id equals the locked session's (false while uninitialized).</summary>
-    public bool MatchesLocked(ulong lo, ulong hi)
-    {
-        lock (_gate)
-        {
-            return _initialized && lo == _sessionIdLo && hi == _sessionIdHi;
-        }
-    }
-
-    /// <summary>The locked session id, for frame-level filtering (false while uninitialized).</summary>
-    public bool TryGetLockedSessionId(out ulong lo, out ulong hi)
-    {
-        lock (_gate)
-        {
-            lo = _sessionIdLo;
-            hi = _sessionIdHi;
-            return _initialized;
-        }
-    }
-
-    /// <summary>Create (or re-create) the native receiver from a parsed header.</summary>
-    private void CreateReceiver(FrameHeader h)
-    {
-        _sessionIdLo = h.SessionIdLo;
-        _sessionIdHi = h.SessionIdHi;
-        _symbolSize = h.SymbolSize > 0 ? h.SymbolSize : 1024;
-        _handle = NativeBridge.ReceiverCreate(_sessionIdLo, _sessionIdHi);
-        _initialized = _handle != IntPtr.Zero;
-        _mismatchStreak = 0;
-        _everAccepted = false;
-        _cachedSnapshot = null;
-    }
+    /// <summary>Transfer id as a lowercase hex string ("" before ROOT lock).</summary>
+    public string SessionIdHex() => GetSnapshot().TransferIdHex;
 
     public void Destroy()
     {

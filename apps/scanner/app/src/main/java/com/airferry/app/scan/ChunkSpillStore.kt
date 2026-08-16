@@ -23,12 +23,17 @@ class ChunkSpillStore(dir: File, transferIdHex: String) {
     private val path = File(dir, "af2-${transferIdHex.ifEmpty { "session" }}.partial")
     private var raf: RandomAccessFile? = null
 
-    /** pwrite one completed chunk at its canonical-stream offset. */
+    /** pwrite one completed chunk at its canonical-stream offset + fsync. */
     fun write(index: Int, chunkRawSize: Int, bytes: ByteArray) {
         if (index < 0 || chunkRawSize <= 0 || bytes.isEmpty()) return
         val f = raf ?: RandomAccessFile(path, "rw").also { raf = it }
         f.seek(index.toLong() * chunkRawSize.toLong())
         f.write(bytes)
+        try {
+            f.fd.sync()
+        } catch (e: Exception) {
+            android.util.Log.w("ChunkSpillStore", "flush failed", e)
+        }
     }
 
     /** Current spill size in bytes (0 when nothing was spilled yet). */
@@ -41,7 +46,12 @@ class ChunkSpillStore(dir: File, transferIdHex: String) {
      */
     fun readRange(offset: Long, size: Long): ByteArray? {
         if (offset < 0 || size < 0 || size > Int.MAX_VALUE) return null
-        val f = raf ?: RandomAccessFile(path, "r").also { raf = it }
+        if (!path.isFile && raf == null) return null
+        val f = raf ?: try {
+            RandomAccessFile(path, "r").also { raf = it }
+        } catch (_: Exception) {
+            return null
+        }
         if (offset + size > f.length()) return null
         val out = ByteArray(size.toInt())
         f.seek(offset)

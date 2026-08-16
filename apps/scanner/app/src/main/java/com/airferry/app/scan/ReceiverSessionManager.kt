@@ -6,22 +6,12 @@ import org.json.JSONObject
 /**
  * High-level receiver session manager (AF2 protocol).
  *
- * Wraps the Rust `transfer_engine` native library via JNI.
+ * Wraps the Rust `transfer_engine` native library via JNI. No wire-format
+ * parsing happens on the Kotlin side (SPEC §9): frames pass straight to the
+ * native state machine, and the packed IngestStatus word / snapshot JSON are
+ * the only consumed surfaces.
  */
 class ReceiverSessionManager {
-
-    data class FrameHeader(
-        val magic: Int,
-        val version: Int,
-        val flags: Int,
-        val sessionIdLo: Long,
-        val sessionIdHi: Long,
-        val sbn: Int,
-        val esi: Int,
-        val totalBlocks: Long,
-        val totalSymbols: Long,
-        val symbolSize: Long
-    )
 
     data class Progress(
         val totalSymbols: Int,
@@ -72,7 +62,12 @@ class ReceiverSessionManager {
         }
     }
 
-    fun getEstimatedTotalSymbols(): Int = 1000
+    fun getEstimatedTotalSymbols(): Int {
+        val snap = snapshot()
+        if (!snap.metaConfirmed || symbolSize <= 0) return 0
+        val total = (snap.totalRawSize + symbolSize - 1) / symbolSize
+        return total.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+    }
 
     data class IngestStatus(
         val complete: Boolean,
@@ -116,28 +111,10 @@ class ReceiverSessionManager {
 
     fun symbolSizeBytes(): Int = symbolSize
 
-    fun parseHeader(bytes: ByteArray): FrameHeader? {
-        if (bytes.size < 30) return null
-        val magic = u16be(bytes, 0)
-        if (magic != MAGIC) return null
-        val version = bytes[2].toInt() and 0xFF
-        if (version != PROTOCOL_VERSION) return null
-        val flags = bytes[3].toInt() and 0xFF
-        val sessionIdHi = u64be(bytes, 4)
-        val sessionIdLo = u64be(bytes, 12)
-        val bodyLen = u16be(bytes, 20).toLong()
-        val sbn = bytes[22].toInt() and 0xFF
-        val esi = u24be(bytes, 23)
-        return FrameHeader(
-            magic, version, flags, sessionIdLo, sessionIdHi,
-            sbn, esi, 1L, 1L, bodyLen
-        )
-    }
-
     fun ingest(frameBytes: ByteArray): IngestStatus? {
         if (destroyed) return null
         if (!initialized) {
-            handle = NativeBridge.receiverCreate(0L, 0L, 0, 0, symbolSize)
+            handle = NativeBridge.receiverCreate(0L, 0L)
             initialized = handle != 0L
             cachedSnapshot = null
         }
@@ -152,6 +129,24 @@ class ReceiverSessionManager {
 
     fun isComplete(): Boolean =
         initialized && NativeBridge.receiverIsComplete(handle) == 1
+
+    /** Verify a staged chunk against the ROOT-bound Manifest table (§11). */
+    fun verifyChunk(index: Int, rawBytes: ByteArray): Boolean =
+        initialized && NativeBridge.receiverVerifyChunk(handle, index, rawBytes)
+
+    /** Run §13 ⑧⑨ integrity chain over the reassembled canonical stream. */
+    fun verifyFinalStream(streamBytes: ByteArray): Boolean =
+        initialized && NativeBridge.receiverVerifyFinalStream(handle, streamBytes)
+
+    /** Restore session from stored ROOT frame bytes + completed chunk indices (§12 resume). */
+    fun resume(rootFrameBytes: ByteArray, completedIndices: IntArray): Boolean {
+        if (!initialized) {
+            handle = NativeBridge.receiverCreate(0L, 0L)
+            initialized = handle != 0L
+            cachedSnapshot = null
+        }
+        return initialized && NativeBridge.receiverResume(handle, rootFrameBytes, completedIndices)
+    }
 
     data class ManifestEntry(
         val kind: Int,
@@ -177,7 +172,7 @@ class ReceiverSessionManager {
     fun snapshot(): Snapshot {
         if (!initialized) return Snapshot(false, "", "", 0L, 0, 0, 0, emptyList())
         cachedSnapshot?.let { snap ->
-            if (snap.metaConfirmed && snap.entries.isNotEmpty()) return snap
+            if (snap.metaConfirmed) return snap
         }
         val json = NativeBridge.receiverSnapshotJson(handle)
             ?: return cachedSnapshot ?: Snapshot(false, "", "", 0L, 0, 0, 0, emptyList())
@@ -285,19 +280,5 @@ class ReceiverSessionManager {
     companion object {
         const val MAGIC = 0x4146 // ASCII 'AF' (protocol 2)
         const val PROTOCOL_VERSION = 2
-
-        private fun u16be(b: ByteArray, o: Int): Int =
-            ((b[o].toInt() and 0xFF) shl 8) or (b[o + 1].toInt() and 0xFF)
-
-        private fun u24be(b: ByteArray, o: Int): Int =
-            ((b[o].toInt() and 0xFF) shl 16) or ((b[o + 1].toInt() and 0xFF) shl 8) or (b[o + 2].toInt() and 0xFF)
-
-        private fun u64be(b: ByteArray, o: Int): Long {
-            var v = 0L
-            for (i in 0 until 8) {
-                v = (v shl 8) or (b[o + i].toLong() and 0xFFL)
-            }
-            return v
-        }
     }
 }

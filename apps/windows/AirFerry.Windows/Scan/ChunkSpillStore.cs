@@ -44,6 +44,14 @@ public sealed class ChunkSpillStore : IDisposable
             _path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
         fs.Seek((long)index * chunkRawSize, SeekOrigin.Begin);
         fs.Write(bytes, 0, bytes.Length);
+        try
+        {
+            fs.Flush(true);
+        }
+        catch (IOException ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"[ChunkSpillStore] flush failed: {ex.Message}");
+        }
     }
 
     /// <summary>Current spill size in bytes (0 when nothing was spilled yet).</summary>
@@ -68,8 +76,20 @@ public sealed class ChunkSpillStore : IDisposable
         {
             return null;
         }
-        FileStream fs = _stream ??= new FileStream(
-            _path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        if (_stream is null && !File.Exists(_path))
+        {
+            return null;
+        }
+        FileStream fs;
+        try
+        {
+            fs = _stream ??= new FileStream(
+                _path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        }
+        catch (IOException)
+        {
+            return null;
+        }
         if ((ulong)fs.Length < totalRawSize)
         {
             return null;

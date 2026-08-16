@@ -230,6 +230,21 @@ internal static class NativeBridge
         EntryPoint = "airferry_free_string")]
     public static extern void FreeString(IntPtr ptr);
 
+    /// <summary>Verify a staged raw chunk against the ROOT-bound Manifest table (§11).</summary>
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl,
+        EntryPoint = "airferry_receiver_verify_chunk")]
+    public static extern int ReceiverVerifyChunk(IntPtr handle, uint index, byte[] rawBytes, nuint rawLen);
+
+    /// <summary>Run §13 ⑧⑨ integrity chain over the reassembled canonical stream.</summary>
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl,
+        EntryPoint = "airferry_receiver_verify_final_stream")]
+    public static extern int ReceiverVerifyFinalStream(IntPtr handle, byte[] streamBytes, nuint streamLen);
+
+    /// <summary>Restore receiver from stored ROOT frame bytes + completed chunk indices (§12 resume).</summary>
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl,
+        EntryPoint = "airferry_receiver_resume")]
+    public static extern int ReceiverResume(IntPtr handle, byte[] rootFrameBytes, nuint rootLen, uint[] completedIndices, nuint completedLen);
+
     /// <summary>Report the native ABI / capability version of the loaded DLL.</summary>
     /// <remarks>
     /// Mirrors the Android <c>NativeBridge.nativeAbiVersion()</c> handshake:

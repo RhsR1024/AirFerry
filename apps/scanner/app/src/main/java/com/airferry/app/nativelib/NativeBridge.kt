@@ -30,10 +30,7 @@ object NativeBridge {
     /** Create a receiver session. Returns an opaque pointer (Long). */
     external fun receiverCreate(
         sessionIdLo: Long,
-        sessionIdHi: Long,
-        totalBlocks: Int,
-        totalSymbols: Int,
-        symbolSize: Int
+        sessionIdHi: Long
     ): Long
 
     /**
@@ -86,6 +83,15 @@ object NativeBridge {
      * when the chunk was resident. Completion tracking is unaffected.
      */
     external fun receiverForgetChunk(handle: Long, index: Int): Boolean
+
+    /** Verify a staged raw chunk against the ROOT-bound Manifest table (§11). */
+    external fun receiverVerifyChunk(handle: Long, index: Int, rawBytes: ByteArray): Boolean
+
+    /** Run §13 ⑧⑨ integrity chain over the reassembled canonical stream. */
+    external fun receiverVerifyFinalStream(handle: Long, streamBytes: ByteArray): Boolean
+
+    /** Restore receiver from stored ROOT frame bytes + completed chunk indices (§12 resume). */
+    external fun receiverResume(handle: Long, rootFrameBytes: ByteArray, completedIndices: IntArray): Boolean
 
     external fun receiverDestroy(handle: Long)
 }

@@ -112,31 +112,39 @@ function ingestBatch(frames: Uint8Array[], jobId: number): {
 
   let acceptedCount = 0
   for (const frame of frames) {
-    const code = session.ingest(frame)
-    if (code > 0) {
+    const rawWord = session.ingest(frame)
+    // Unpack 64-bit status word (BigInt in JS from wasm64)
+    const word = typeof rawWord === "bigint" ? rawWord : BigInt(rawWord)
+    const ERROR_RECEIVED = 0xFFFFFFFFn
+    if (((word >> 32n) & 0xFFFFFFFFn) === ERROR_RECEIVED) {
+      continue
+    }
+    const accepted = ((word >> 1n) & 1n) !== 0n
+    const manifestReady = ((word >> 2n) & 1n) !== 0n
+    const chunkReady = ((word >> 3n) & 1n) !== 0n
+    const receivedSymbols = Number((word >> 32n) & 0xFFFFFFFFn)
+
+    if (accepted) {
       acceptedCount++
       totalAcceptedSymbols++
     }
-    if (code === 3) {
-      // Relocked: the Rust state machine dropped the previous transfer's root,
-      // manifest and decoders — the worker's chunk ledger must follow, or stale
-      // chunks from the old transfer would mix into the new one's assembled
-      // stream (each chunk is individually hash-valid, so the corruption is
-      // silent). The meta flag resets so the new manifest gets re-posted.
+    if (accepted && receivedSymbols === 0) {
+      // Relocked in native AF2:
       receivedChunks.clear()
       lastMetaSent = false
       totalAcceptedSymbols = 0
-      // Tell the main thread too: its progress/name display must not keep
-      // showing the previous transfer until the new manifest arrives.
       post({ type: "relock", jobId })
-    } else if (code === 7) {
-      // ManifestReady
+    }
+    if (manifestReady) {
       maybePostMeta(jobId)
-    } else if (code === 8) {
-      // ChunkReady
+    }
+    if (chunkReady) {
       const idx = session.last_chunk_index()
-      const bytes = new Uint8Array(session.last_chunk_bytes())
-      receivedChunks.set(idx, bytes)
+      const bytes = new Uint8Array(session.assemble_chunk(idx))
+      if (bytes.length > 0) {
+        receivedChunks.set(idx, bytes)
+        session.forget_chunk(idx)
+      }
       maybePostMeta(jobId)
     }
   }
@@ -296,6 +304,16 @@ self.addEventListener("message", async (e: MessageEvent) => {
         const chunk = receivedChunks.get(i)!
         stream.set(chunk, offset)
         offset += chunk.byteLength
+      }
+
+      // 1b. Final integrity gate (§13 ⑧⑨): verify full stream through Rust core
+      if (!session.verify_final_stream(stream)) {
+        post({
+          type: "error",
+          message: "传输终验失败：条目哈希、UTF-8 或 Content ID 校验未通过",
+          jobId: activeJobId,
+        })
+        return
       }
 
       // 2. Materialize entries from the Manifest entry table

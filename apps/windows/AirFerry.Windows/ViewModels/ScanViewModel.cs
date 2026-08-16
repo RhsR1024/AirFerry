@@ -66,25 +66,6 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     private const int RateMinMilliseconds = 500;
     /// <summary>Continuous-receive folder sink (null = single-receive mode).</summary>
     private AirFerry.Windows.Bundle.ContinuousSaver? _continuousSaver;
-    /// <summary>
-    /// Continuous mode: frames of a pre-scan-skipped transfer are dropped at
-    /// the header level so a looping sender cannot re-lock the fresh receiver.
-    /// </summary>
-    private ulong _ignoreSessionLo;
-    private ulong _ignoreSessionHi;
-    private bool _ignoreSessionActive;
-    /// <summary>
-    /// Timestamp of the last accepted symbol. A different-session descriptor
-    /// may only take over the receiver after the current stream has gone
-    /// silent for this long — guards against thrash when two senders are
-    /// visible at once while still letting a sender switch be picked up.
-    /// </summary>
-    private long _lastAcceptedTimestamp;
-    private static readonly long RelockSilenceTicks = (long)(1.5 * Stopwatch.Frequency);
-    /// <summary>Re-lock request set by OnDecoded (under IngestLock) when a
-    /// different-session descriptor arrives during silence; serviced by
-    /// RefreshProgress on the UI cadence to keep the lock order uniform.</summary>
-    private long _relockPending;
     /// <summary>Session whose pre-scan duplicate checks already ran (once per receiver).</summary>
     private ReceiverSession? _preScanCheckedSession;
 
@@ -250,10 +231,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         LossRatioText = "0.0%";
         ResetLiveMetrics();
         RecoveryStageText = string.Empty;
-        _ignoreSessionActive = false;
         _preScanCheckedSession = null;
-        Volatile.Write(ref _lastAcceptedTimestamp, 0);
-        Volatile.Write(ref _relockPending, 0);
 
         try
         {
@@ -262,6 +240,12 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             {
                 throw new InvalidOperationException(
                     $"二维码解码库 ABI 不兼容（期望 1，实际 {zxingAbi}）");
+            }
+            uint nativeAbi = NativeBridge.NativeAbiVersion();
+            if (nativeAbi < NativeBridge.NativeAbiVersion2)
+            {
+                throw new InvalidOperationException(
+                    $"传输引擎 ABI 不兼容（期望 >= {NativeBridge.NativeAbiVersion2}，实际 {nativeAbi}）");
             }
             _chunkSpill?.Discard();
             _chunkSpill = null;
@@ -587,40 +571,6 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         {
             return false;
         }
-        if (ContinuousMode)
-        {
-            FrameHeader? parsed = FrameHeader.Parse(payload);
-            if (parsed is { } h)
-            {
-                // Frames of a transfer already skipped as a pre-scan duplicate
-                // never reach the native session — a looping sender must not
-                // occupy the receiver (or the UI) again.
-                if (_ignoreSessionActive &&
-                    h.SessionIdLo == _ignoreSessionLo &&
-                    h.SessionIdHi == _ignoreSessionHi)
-                {
-                    return false;
-                }
-                // The sender switched files: once a session has accepted
-                // symbols, ReceiverSession's own mismatch re-init never fires,
-                // which used to strand the receiver on a dead transfer until
-                // the user stopped and restarted the scan. In continuous mode
-                // a ROOT/META frame for a DIFFERENT session requests a re-lock
-                // once the current stream has been silent briefly. The swap itself
-                // runs on the UI refresh cadence — performing it here would
-                // take _lifecycleGate while already holding the pool's
-                // IngestLock, the inverse of every other swap path's lock
-                // order (AB-BA deadlock with a concurrent StopScan-side swap).
-                if (h.IsMetaOrRoot && session.IsInitialized &&
-                    !session.MatchesLocked(h.SessionIdLo, h.SessionIdHi) &&
-                    Stopwatch.GetTimestamp() - Volatile.Read(ref _lastAcceptedTimestamp)
-                        > RelockSilenceTicks)
-                {
-                    Volatile.Write(ref _relockPending, 1);
-                    return false;
-                }
-            }
-        }
         IngestStatus? status = session.Ingest(payload);
         if (status is null)
         {
@@ -628,10 +578,6 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         }
         IngestStatus s = status.Value;
         int epoch = Volatile.Read(ref _sessionEpoch);
-        if (s.Accepted)
-        {
-            Volatile.Write(ref _lastAcceptedTimestamp, Stopwatch.GetTimestamp());
-        }
 
         // Bounded-memory ledger: spill the chunk this frame completed to disk
         // and evict it from native memory, so peak native usage stays O(chunk)
@@ -973,33 +919,6 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>
-    /// Continuous mode: a different-session descriptor arrived while the
-    /// current stream was silent (sender switched files). Performed on the UI
-    /// refresh cadence — NOT from OnDecoded, which runs under the pool's
-    /// IngestLock and must not reach for _lifecycleGate (inverse lock order
-    /// vs every other swap path). The fresh receiver lazy-locks on the next
-    /// descriptor (they recur every 17 frames, so the takeover is
-    /// imperceptible); the abandoned partial is worthless (its sender is
-    /// gone).
-    /// </summary>
-    private void RelockStaleReceiverIfRequested(ReceiverSession session, QrDecodePool pool)
-    {
-        if (Volatile.Read(ref _relockPending) != 1)
-        {
-            return;
-        }
-        Volatile.Write(ref _relockPending, 0);
-        if (!session.IsInitialized ||
-            Stopwatch.GetTimestamp() - Volatile.Read(ref _lastAcceptedTimestamp)
-                <= RelockSilenceTicks)
-        {
-            return; // the old stream came back to life — keep it
-        }
-        FileSummaryText = "发送端已切换文件，正在接收新传输…";
-        SwapReceiverForNextSegment(session, pool);
-    }
-
-    /// <summary>
     /// The stable identity of the session's transfer: Content ID or Transfer ID
     /// from the AF2 Root / Manifest snapshot when confirmed, falling back to
     /// the session id. Callers must hold the ingest lock.
@@ -1057,17 +976,6 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         StatusText = $"重复，已跳过: {name}（秒判，无需扫描）";
         FileSummaryText = "等待下一份文件…";
         Progress = 0;
-        if (!segmented)
-        {
-            (ulong Lo, ulong Hi) locked = pool.RunExclusive(() =>
-            {
-                session.TryGetLockedSessionId(out ulong lo, out ulong hi);
-                return (lo, hi);
-            });
-            _ignoreSessionLo = locked.Lo;
-            _ignoreSessionHi = locked.Hi;
-            _ignoreSessionActive = true;
-        }
         SwapReceiverForNextSegment(session, pool);
     }
 
@@ -1330,11 +1238,6 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         // Service a pending sender-switch re-lock (continuous mode). Runs on
         // the UI thread holding no locks — the same context as every other
         // swap call site, so the lifecycle/ingest lock order stays uniform.
-        if (ContinuousMode)
-        {
-            RelockStaleReceiverIfRequested(session, pool);
-        }
-
         LiveSnapshot live = pool.RunExclusive(() =>
         {
             if (!session.IsInitialized)
