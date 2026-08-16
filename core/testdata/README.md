@@ -23,13 +23,14 @@ JSON 数字安全上限 2^53，所有 u64 一律以 hex 字符串承载。
 
 | 端 | 测试 | 覆盖面 |
 |---|---|---|
-| Rust | `core/af2/tests/golden_vectors.rs` | 帧头/根记录/Meta/三层 ID 推导/BLAKE3 空哈希 |
+| Rust | `core/af2/tests/golden_vectors.rs` | 帧头/根记录/Meta/三层 ID 推导/BLAKE3 空哈希（全量往返，唯一权威） |
 | Android | `apps/scanner/app/src/test/java/com/airferry/app/Af2GoldenVectorTest.kt` | 帧头解析、ID 推导 |
 | Windows | `apps/windows/AirFerry.Windows.Tests/Af2GoldenVectorTests.cs` | 帧头解析、ID 推导 |
+| Web | `apps/web/test/golden-vectors.test.mjs`（`npm test`） | 帧头解析、ID 宽度、线常量 |
 
-Web 端无独立 golden 断言：收发/解析逻辑已收敛进 Rust WASM（`transfer-engine`），由 Rust 侧 golden 覆盖；前端仅按快照 entries 切片落盘。
+三端宿主只做帧头级断言（协议语义收敛在 Rust，宿主仅路由帧）；完整记录/ID 往返校验由 Rust 侧独占。
 
 ## 更新流程
 
 1. 修改线格式后同步 hex 字段（保持确定性）；
-2. 三端断言同步跑 `cargo test --workspace`、`cd apps/scanner && ./gradlew :app:testDebugUnitTest`、`dotnet test apps/windows/AirFerry.Windows.Tests`。
+2. 四端断言同步跑 `cargo test --workspace`、`cd apps/scanner && ./gradlew :app:testDebugUnitTest`、`dotnet test apps/windows/AirFerry.Windows.Tests`、`cd apps/web && npm test`。

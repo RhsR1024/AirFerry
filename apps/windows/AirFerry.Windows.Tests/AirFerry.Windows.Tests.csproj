@@ -20,7 +20,7 @@
   <!-- The WPF app project targets net8.0-windows, which won't build on
        non-Windows hosts. Reference only the pure-C# sources (no WPF deps)
        by linking them in directly, so the tests verify the protocol math
-       (IngestStatus bits, FrameHeader parsing, BundleParser) everywhere. -->
+       (IngestStatus bits, FrameHeader parsing) everywhere. -->
   <ItemGroup>
     <Compile Include="..\AirFerry.Windows\Models\DeviceInfo.cs" Link="Models\DeviceInfo.cs" />
     <Compile Include="..\AirFerry.Windows\Models\ScanSource.cs" Link="Models\ScanSource.cs" />

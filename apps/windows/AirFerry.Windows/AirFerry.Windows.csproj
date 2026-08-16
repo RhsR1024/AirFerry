@@ -7,16 +7,16 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
     <LangVersion>latest</LangVersion>
-    <!-- Version mirrors apps/sender/package.json, apps/scanner build.gradle.kts,
+    <!-- Version mirrors apps/web/package.json, apps/scanner build.gradle.kts,
          and Cargo.toml workspace version — keep all four in sync. -->
     <Version>1.2.7</Version>
     <AssemblyName>AirFerry</AssemblyName>
     <RootNamespace>AirFerry.Windows</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
-    <!-- Exe/taskbar/Alt-Tab receiver icon (multi-size 16–128, generated from
-         apps/sender/assets/receiver-icon*.png — see AGENTS.md §3.4 for the regen
-         command). Note: ApplicationIcon sets the Win32 exe icon; XAML use via
-         pack:// URI requires the explicit <Resource Include="Assets\app.ico" /> below. -->
+    <!-- Exe/taskbar/Alt-Tab receiver icon (multi-size 16–128; source PNGs live
+         in apps/web/assets/receiver-icon*.png). Note: ApplicationIcon sets the
+         Win32 exe icon; XAML use via pack:// URI requires the explicit
+         <Resource Include="Assets\app.ico" /> below. -->
     <ApplicationIcon>Assets\app.ico</ApplicationIcon>
     <Platforms>x64</Platforms>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
