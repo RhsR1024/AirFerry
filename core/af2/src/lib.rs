@@ -1,9 +1,8 @@
 //! # af2 — AirFerry Protocol 2 core
 //!
-//! Pure-Rust AF2 implementation (design doc:
-//! `docs/protocol/AF2-PROTOCOL-INDEPENDENT-FABLE.md`). Runs beside the v1
-//! engine (`transfer-engine`) during the migration; product entry points
-//! switch over in Phase F and v1 artifacts are then deleted.
+//! Pure-Rust AF2 implementation (wire spec: `docs/SPEC.md`). The v1
+//! artifacts were deleted with the Phase F cutover; `transfer-engine` now
+//! binds this crate directly.
 //!
 //! Layout:
 //! - [`frame`]: 26B-header wire frames (ROOT / OBJECT_META / SYMBOL)

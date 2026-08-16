@@ -106,7 +106,7 @@ impl RootRecord {
         if self.chunk_count > MAX_CHUNK_COUNT {
             return Err(RootError::ChunkCountTooLarge(self.chunk_count));
         }
-        let ext = crate::tlv::encode_tlvs(&self.extensions);
+        let ext = crate::tlv::encode_tlvs(&self.extensions)?;
         let mut out = Vec::with_capacity(ROOT_FIXED_LEN + ext.len());
         out.extend_from_slice(ROOT_MAGIC);
         out.push(ROOT_SCHEMA);

@@ -85,21 +85,14 @@ pub enum ManifestError {
 }
 
 fn is_nfc(s: &str) -> bool {
-    // unicode-normalization is not a dependency; NFC fast-path check: any
-    // combining mark (Mn/Mc/Me) whose canonical combining class is non-zero
-    // *before* a starter that could compose is rare in practice. The precise
-    // rule needs the full normalization algorithm — reject strings containing
-    // ANY combining mark to stay conservative and dependency-free. Senders
-    // must emit NFC (which contains no uncomposed composable sequences).
-    // This is stricter than the spec (rejects legitimate non-composable
-    // combining marks) — a conservative fail-closed choice for v1 of AF2.
-    !s.chars().any(|c| {
-        // Combining Diacritical Marks + common combining blocks.
-        matches!(c as u32,
-            0x0300..=0x036F | 0x0483..=0x0489 | 0x0591..=0x05BD | 0x0610..=0x061A
-            | 0x064B..=0x065F | 0x0E31 | 0x0E34..=0x0E3A | 0x0E47..=0x0E4E
-            | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x20D0..=0x20F0 | 0xFE00..=0xFE0F)
-    })
+    // True NFC check (SPEC §7.2 path rules): accept exactly the strings that
+    // are already in Normalization Form C. A blacklist of combining blocks
+    // would be wrong in both directions — it rejected spec-legal NFC text
+    // (Thai vowels, Hebrew niqqud and Arabic marks legitimately remain as
+    // combining characters after NFC) while missing decomposed sequences
+    // outside the listed blocks.
+    use unicode_normalization::UnicodeNormalization;
+    s.nfc().eq(s.chars())
 }
 
 /// Validate one canonical path (§7.2 rules). Public for sender-side reuse.
@@ -232,7 +225,7 @@ impl Manifest {
         let mut entry_area = Vec::new();
         for e in &self.entries {
             let path = e.path.as_bytes();
-            let ext = crate::tlv::encode_tlvs(&e.extensions);
+            let ext = crate::tlv::encode_tlvs(&e.extensions)?;
             let record_len = ENTRY_FIXED + path.len() + ext.len();
             entry_area.extend_from_slice(&(record_len as u32).to_be_bytes());
             entry_area.push(e.kind);
@@ -247,7 +240,7 @@ impl Manifest {
             entry_area.extend_from_slice(&ext);
         }
         let chunk_area_len = self.chunk_hashes.len() * 32;
-        let ext_area = crate::tlv::encode_tlvs(&self.extensions);
+        let ext_area = crate::tlv::encode_tlvs(&self.extensions)?;
         let manifest_len = HEADER_SIZE + entry_area.len() + chunk_area_len + ext_area.len();
         if manifest_len > MAX_MANIFEST_BYTES {
             return Err(ManifestError::TooLarge(manifest_len));
@@ -466,14 +459,21 @@ pub fn build_manifest<'a>(
     items: impl IntoIterator<Item = (u8, &'a str, &'a [u8])>,
     chunk_raw_size: u32,
 ) -> Result<Manifest, ManifestError> {
-    // Sort by canonical path byte order first (identity requires it).
-    let mut items: Vec<(u8, &str, &[u8])> = items.into_iter().collect();
+    // Sender-side NFC normalization (SPEC §7.2): the wire requires NFC and
+    // macOS hands out NFD filenames, so normalize up front instead of
+    // failing the transfer. Sort by canonical path byte order afterwards
+    // (identity requires it).
+    use unicode_normalization::UnicodeNormalization;
+    let mut items: Vec<(u8, String, &[u8])> = items
+        .into_iter()
+        .map(|(kind, path, content)| (kind, path.nfc().collect::<String>(), content))
+        .collect();
     items.sort_by(|a, b| a.1.as_bytes().cmp(b.1.as_bytes()));
     let mut entries = Vec::new();
     let mut stream = Vec::new();
     let mut stream_end: u64 = 0;
     for (kind, path, content) in items {
-        validate_path(path).map_err(|reason| ManifestError::BadEntry {
+        validate_path(&path).map_err(|reason| ManifestError::BadEntry {
             index: entries.len(),
             reason,
         })?;
@@ -493,7 +493,7 @@ pub fn build_manifest<'a>(
         };
         entries.push(ManifestEntry {
             kind,
-            path: path.to_string(),
+            path,
             content_offset: offset,
             content_size: size,
             content_hash: chash,
@@ -503,10 +503,12 @@ pub fn build_manifest<'a>(
     let total = stream.len() as u64;
     let chunk_count = crate::root::expected_chunk_count(total, chunk_raw_size);
     let mut chunk_hashes = Vec::with_capacity(chunk_count as usize);
-    for i in 0..chunk_count as usize {
-        let start = i * chunk_raw_size as usize;
-        let end = (start + chunk_raw_size as usize).min(stream.len());
-        chunk_hashes.push(hash(&stream[start..end]));
+    // u64 offsets: see sender.rs — usize math wraps on wasm32 for >4 GiB
+    // streams. Casts below are bounded by stream.len() <= usize::MAX.
+    for i in 0..u64::from(chunk_count) {
+        let start = i * u64::from(chunk_raw_size);
+        let end = (start + u64::from(chunk_raw_size)).min(stream.len() as u64);
+        chunk_hashes.push(hash(&stream[start as usize..end as usize]));
     }
     Ok(Manifest {
         entries,

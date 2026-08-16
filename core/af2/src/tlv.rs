@@ -31,6 +31,10 @@ pub enum TlvError {
     NotAscending { prev: u16, got: u16 },
     #[error("unknown critical TLV type 0x{type_id:04X} — receiver too old, upgrade needed")]
     UnknownCritical { type_id: u16 },
+    #[error("TLV value of {len} bytes exceeds the u16 length field (65535)")]
+    ValueTooLarge { len: usize },
+    #[error("TLV scope area of {len} bytes exceeds the u16 scope length field (65535)")]
+    ScopeTooLarge { len: usize },
 }
 
 /// Known Optional Entry TLV types (§7.2). None are Critical in v1 of AF2.
@@ -40,14 +44,25 @@ pub const TLV_MIME: u16 = 0x0103;
 pub const TLV_TYPE_CLASS: u16 = 0x0104;
 
 /// Encode one scope's TLV list (must already be ascending + unique).
-pub fn encode_tlvs(tlvs: &[Tlv]) -> Vec<u8> {
+///
+/// Fails loudly when a value or the whole scope area does not fit the u16
+/// fields of the wire format — a silent `as u16` truncation would emit
+/// self-inconsistent bytes that the parser then rejects with a confusing
+/// BodyLenMismatch.
+pub fn encode_tlvs(tlvs: &[Tlv]) -> Result<Vec<u8>, TlvError> {
     let mut out = Vec::new();
     for t in tlvs {
+        if t.value.len() > u16::MAX as usize {
+            return Err(TlvError::ValueTooLarge { len: t.value.len() });
+        }
         out.extend_from_slice(&t.type_id.to_be_bytes());
         out.extend_from_slice(&(t.value.len() as u16).to_be_bytes());
         out.extend_from_slice(&t.value);
     }
-    out
+    if out.len() > u16::MAX as usize {
+        return Err(TlvError::ScopeTooLarge { len: out.len() });
+    }
+    Ok(out)
 }
 
 /// Parse one scope's TLV area. `allow_unknown_critical = false` for the
@@ -103,8 +118,30 @@ mod tests {
             Tlv { type_id: TLV_MTIME_MS, value: 12345u64.to_be_bytes().to_vec() },
             Tlv { type_id: TLV_MIME, value: b"text/plain".to_vec() },
         ];
-        let bytes = encode_tlvs(&tlvs);
+        let bytes = encode_tlvs(&tlvs).unwrap();
         assert_eq!(parse_tlvs(&bytes).unwrap(), tlvs);
+    }
+
+    #[test]
+    fn oversize_value_and_scope_fail_loudly() {
+        // A single value past the u16 length field must error, not truncate.
+        let big = Tlv { type_id: TLV_MIME, value: vec![0u8; u16::MAX as usize + 1] };
+        assert!(matches!(
+            encode_tlvs(&[big]),
+            Err(TlvError::ValueTooLarge { .. })
+        ));
+        // Many small values overflowing the scope area must error as well.
+        let many: Vec<Tlv> = (0..16_000)
+            .map(|i| Tlv {
+                // Ascending Optional types from the experimental range.
+                type_id: 0x4000 + (i as u16),
+                value: vec![0u8; 8],
+            })
+            .collect();
+        assert!(matches!(
+            encode_tlvs(&many),
+            Err(TlvError::ScopeTooLarge { .. })
+        ));
     }
 
     #[test]
@@ -112,7 +149,8 @@ mod tests {
         let bad = encode_tlvs(&[
             Tlv { type_id: TLV_MIME, value: vec![] },
             Tlv { type_id: TLV_MTIME_MS, value: vec![] }, // descending
-        ]);
+        ])
+        .unwrap();
         assert!(matches!(
             parse_tlvs(&bad),
             Err(TlvError::NotAscending { .. })
@@ -120,9 +158,11 @@ mod tests {
         let dup = encode_tlvs(&[
             Tlv { type_id: TLV_MIME, value: vec![] },
             Tlv { type_id: TLV_MIME, value: vec![] },
-        ]);
+        ])
+        .unwrap();
         assert!(matches!(parse_tlvs(&dup), Err(TlvError::NotAscending { .. })));
-        let truncated = &encode_tlvs(&[Tlv { type_id: TLV_MIME, value: vec![1, 2, 3] }])[..5];
+        let truncated = &encode_tlvs(&[Tlv { type_id: TLV_MIME, value: vec![1, 2, 3] }])
+            .unwrap()[..5];
         assert!(matches!(
             parse_tlvs(truncated),
             Err(TlvError::TruncatedHeader { .. }) | Err(TlvError::ValueOverflow { .. })

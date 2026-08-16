@@ -311,6 +311,14 @@ impl Af2Receiver {
                 }
                 // ③ OTI gate (16 MiB manifest ceiling).
                 let meta = object_meta_from_oti(&record.oti, 16 << 20)?;
+                // Cross-check the OTI-declared symbol size against the T
+                // observed on the wire: a mismatched decoder silently discards
+                // every symbol (length inequality) while the frozen META makes
+                // later ones look like duplicates — a wedged session that only
+                // a 3-ROOT relock can break. Reject the META instead.
+                if usize::from(meta.symbol_size) != self.t {
+                    return Ok(IngestEvent::MetaRejected);
+                }
                 let decoder =
                     Decoder::new(meta).map_err(|e| Af2ReceiverError::Decoder(e.to_string()))?;
                 self.manifest_decoder = Some(decoder);
@@ -338,6 +346,10 @@ impl Af2Receiver {
                 }
                 // ③ OTI gate (encoded chunk ≤ 32 MiB wire ceiling).
                 let meta = object_meta_from_oti(&record.oti, 32 << 20)?;
+                // Same T cross-check as the manifest branch (see above).
+                if usize::from(meta.symbol_size) != self.t {
+                    return Ok(IngestEvent::MetaRejected);
+                }
                 let decoder =
                     Decoder::new(meta).map_err(|e| Af2ReceiverError::Decoder(e.to_string()))?;
                 let event = IngestEvent::MetaBound {

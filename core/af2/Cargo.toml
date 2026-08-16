@@ -13,6 +13,7 @@ raptorq-core.workspace = true
 qr-protocol.workspace = true
 crc32fast.workspace = true
 thiserror.workspace = true
+unicode-normalization.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

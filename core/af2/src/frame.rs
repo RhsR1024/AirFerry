@@ -19,7 +19,7 @@
 //! `body_len..T` 必须全零。Frame CRC32（IEEE）覆盖 Header + 完整 Payload Area
 //! （含零填充）。CRC 只查扫码误码，不认证。
 //!
-//! Spec: `docs/protocol/AF2-PROTOCOL-INDEPENDENT-FABLE.md` §5.
+//! Spec: `docs/SPEC.md` §5.
 
 use crc32fast::Hasher;
 
@@ -252,6 +252,15 @@ impl Af2Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crc32_ieee_self_check() {
+        // SPEC §3: every platform's CRC32 must be IEEE-802.3 polynomial;
+        // "123456789" -> 0xCBF43926 is the canonical cross-implementation
+        // check value. The Kotlin/C# golden tests assert header fields only,
+        // so this Rust-side vector is the wire-level CRC anchor.
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+    }
 
     fn frame(frame_type: FrameType, t: usize) -> Af2Frame {
         let mut body = vec![0u8; t];

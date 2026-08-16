@@ -103,7 +103,7 @@ impl ObjectMetaRecord {
         if self.role == ROLE_MANIFEST && self.codec_id != CODEC_RAW {
             return Err(MetaError::ManifestNotRaw(self.codec_id));
         }
-        let ext = crate::tlv::encode_tlvs(&self.extensions);
+        let ext = crate::tlv::encode_tlvs(&self.extensions)?;
         let mut out = Vec::with_capacity(META_FIXED_LEN + ext.len());
         out.extend_from_slice(META_MAGIC);
         out.push(META_SCHEMA);

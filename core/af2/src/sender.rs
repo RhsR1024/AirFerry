@@ -231,10 +231,15 @@ impl Af2Sender {
 
         let mut chunk_encoders = Vec::new();
         for i in 0..manifest.chunk_count {
-            let start = (i as usize) * config.chunk_raw_size as usize;
-            let end = (start + config.chunk_raw_size as usize).min(stream.len());
-            let raw = if start < stream.len() {
-                &stream[start..end]
+            // Chunk offsets in u64: on wasm32 (32-bit usize) `i * chunk_raw_size`
+            // wraps for >4 GiB streams and silently desyncs the chunk hash
+            // table from the slices. The casts below are bounded by
+            // stream.len() ≤ usize::MAX.
+            let start64 = u64::from(i) * u64::from(config.chunk_raw_size);
+            let end64 =
+                (start64 + u64::from(config.chunk_raw_size)).min(stream.len() as u64);
+            let raw = if start64 < stream.len() as u64 {
+                &stream[start64 as usize..end64 as usize]
             } else {
                 &[]
             };
