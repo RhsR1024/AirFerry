@@ -77,6 +77,8 @@ class ReceiverSessionManager {
     data class IngestStatus(
         val complete: Boolean,
         val accepted: Boolean,
+        val manifestReady: Boolean,
+        val chunkReady: Boolean,
         val mismatchStreak: Int,
         val receivedSymbols: Int
     ) {
@@ -88,9 +90,11 @@ class ReceiverSessionManager {
                 if (((bits shr 32) and 0xFFFFFFFFuL).toInt() == ERROR_RECEIVED) return null
                 val complete = (bits and 1uL) != 0uL
                 val accepted = ((bits shr 1) and 1uL) != 0uL
+                val manifestReady = ((bits shr 2) and 1uL) != 0uL
+                val chunkReady = ((bits shr 3) and 1uL) != 0uL
                 val streak = ((bits shr 8) and 0xFFFFuL).toInt()
                 val received = ((bits shr 32) and 0xFFFFFFFFuL).toInt()
-                return IngestStatus(complete, accepted, streak, received)
+                return IngestStatus(complete, accepted, manifestReady, chunkReady, streak, received)
             }
         }
     }
@@ -235,6 +239,37 @@ class ReceiverSessionManager {
     fun assembleChunk(index: Int): ByteArray? {
         if (!initialized) return null
         return NativeBridge.receiverAssembleChunk(handle, index)
+    }
+
+    /**
+     * Index of the chunk completed by the most recent ChunkReady frame, or -1.
+     * Persist it with [assembleChunk] then release it with [forgetChunk] so
+     * native memory stays bounded by one chunk instead of the whole object.
+     */
+    fun lastChunkIndex(): Int {
+        if (!initialized) return -1
+        return NativeBridge.receiverLastChunkIndex(handle)
+    }
+
+    /** Release a persisted chunk from native memory. True when it was resident. */
+    fun forgetChunk(index: Int): Boolean {
+        if (!initialized) return false
+        return NativeBridge.receiverForgetChunk(handle, index)
+    }
+
+    /**
+     * Drain the chunk completed by the frame just ingested: hand it to
+     * [sink] and evict it from native memory. Must be called on the ingest
+     * thread right after [ingest] reported `chunkReady` (the ingest path is
+     * serialized, so the drain cannot race another ingest).
+     */
+    fun drainLastChunk(sink: (index: Int, chunkRawSize: Int, bytes: ByteArray) -> Unit) {
+        val index = lastChunkIndex()
+        if (index < 0) return
+        val bytes = assembleChunk(index) ?: return
+        val chunkRawSize = snapshot().chunkRawSize
+        sink(index, chunkRawSize, bytes)
+        forgetChunk(index)
     }
 
     fun destroy() {

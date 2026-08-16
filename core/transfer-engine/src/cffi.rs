@@ -39,9 +39,9 @@ use std::os::raw::c_char;
 /// ABI / capability version of this C ABI library, mirroring the Android-side
 /// `AIRFERRY_NATIVE_ABI_VERSION` handshake.
 ///
-/// - 1: descriptor-v5 segmented (large-file) receive path.
+/// - 1: legacy v1 (pre-AF2) segmented receive path.
 /// - 2: the 16 per-field receiver getters were replaced by the single
-///      [`airferry_receiver_snapshot_json`] (`ReceiverSnapshotV1`).
+///      [`airferry_receiver_snapshot_json`] (`ReceiverSnapshotV2`).
 ///
 /// The Windows host (`NativeBridge.NativeAbiVersion`) must verify this at
 /// startup and refuse to run against an older DLL.
@@ -239,6 +239,36 @@ pub unsafe extern "C" fn airferry_receiver_assemble_chunk(
     1
 }
 
+/// Index of the chunk completed by the most recent ChunkReady frame, or -1.
+/// The host persists that chunk via [`airferry_receiver_assemble_chunk`] and
+/// forgets it via [`airferry_receiver_forget_chunk`] to keep native memory
+/// bounded by one chunk instead of the whole object.
+#[no_mangle]
+pub unsafe extern "C" fn airferry_receiver_last_chunk_index(
+    handle: *const ReceiverSession,
+) -> i32 {
+    if handle.is_null() {
+        return -1;
+    }
+    let session = unsafe { &*handle };
+    session.last_completed_chunk_index().map(|i| i as i32).unwrap_or(-1)
+}
+
+/// Release a persisted chunk from native memory (eviction). Returns 1 when the
+/// chunk was resident, 0 otherwise. Completion tracking is unaffected — the
+/// ledger counts every ChunkReady, not what is still resident.
+#[no_mangle]
+pub unsafe extern "C" fn airferry_receiver_forget_chunk(
+    handle: *mut ReceiverSession,
+    index: u32,
+) -> i32 {
+    if handle.is_null() {
+        return 0;
+    }
+    let session = unsafe { &mut *handle };
+    session.forget_chunk(index) as i32
+}
+
 /// Decompress a caller-provided byte buffer according to a compression tag
 /// (0=None, 1=Zstd, 2=Xz), bounded by `max_output` bytes. Used by the host to
 /// decompress the concatenated compressed stream of a segmented transfer once.
@@ -392,14 +422,14 @@ pub unsafe extern "C" fn airferry_receiver_progress_json(
     write_cstr(&json, out, cap)
 }
 
-/// Single-JSON receiver snapshot (`ReceiverSnapshotV1`, see
+/// Single-JSON receiver snapshot (`ReceiverSnapshotV2`, see
 /// [`ReceiverSession::snapshot_json`]).
 ///
 /// Replaces the former 16 per-field getters (compression / compressed_size /
 /// original_size / file_name / file_size / crc32 / crc32_known / is_segmented
 /// / segment_index / segment_count / root_original_size / original_offset /
 /// root_session_id_lo/hi / raw_sha256 / root_sha256): one call returns every
-/// descriptor-derived field atomically, with no torn reads across getters.
+/// AF2 snapshot field atomically, with no torn reads across getters.
 ///
 /// Returns a Rust-allocated, NUL-terminated UTF-8 `char*` that the caller must
 /// release with [`airferry_free_string`] (never `free` it from the host).
@@ -499,7 +529,7 @@ mod tests {
         // silently drifted back in).
         assert_eq!(ingest_status::INGEST_ERROR, 0xFFFF_FFFFu64 << 32);
         assert_eq!(
-            ingest_status::pack(true, true, 0x1234, 0x5678),
+            ingest_status::pack(true, true, false, false, 0x1234, 0x5678),
             0b11 | (0x1234u64 << 8) | (0x5678u64 << 32)
         );
     }

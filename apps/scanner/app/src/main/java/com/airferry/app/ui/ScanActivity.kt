@@ -42,6 +42,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.airferry.app.nativelib.NativeBridge
+import com.airferry.app.scan.ChunkSpillStore
 import com.airferry.app.scan.QrDecodePool
 import com.airferry.app.scan.QrStreamAnalyzer
 import com.airferry.app.scan.ReceiverSessionManager
@@ -59,6 +60,14 @@ private val Success = Color(0xFF22C55E)
 class ScanActivity : ComponentActivity() {
 
     private var session = ReceiverSessionManager()
+    /**
+     * On-disk staging for completed chunks (bounded-memory ledger): chunks are
+     * spilled + evicted as they complete on the ingest thread; recovery slices
+     * manifest entries straight from the file. Null until the first ChunkReady
+     * (most sessions are small and never need it) — and on text transfers the
+     * single chunk still goes through the same path, keeping one code shape.
+     */
+    private var chunkSpill: ChunkSpillStore? = null
     private val cameraExecutor = Executors.newSingleThreadExecutor()
     /** Dedicated single-thread executor for the post-recovery heavy work
      *  (JNI assemble, CRC, disk writes, bundle unpacking) so it never blocks
@@ -551,6 +560,24 @@ class ScanActivity : ComponentActivity() {
         // stays cheap; the full progress is fetched only on the throttled UI tick.
         val status = session.ingest(payload) ?: return
 
+        // Bounded-memory ledger: spill + evict the chunk this frame completed so
+        // native memory stays O(chunk) instead of O(whole object). The same
+        // serialized ingest thread drains it, so no extra synchronization.
+        if (status.accepted && status.receivedSymbols == 0) {
+            // Relock (or first lock): a foreign Transfer now owns the session —
+            // the old spill's bytes belong to nobody. Discard before any drain.
+            chunkSpill?.discard()
+            chunkSpill = null
+        }
+        if (status.chunkReady) {
+            val spill = chunkSpill ?: ChunkSpillStore(
+                cacheDir, session.snapshot().transferIdHex
+            ).also { chunkSpill = it }
+            session.drainLastChunk { index, chunkRawSize, bytes ->
+                spill.write(index, chunkRawSize, bytes)
+            }
+        }
+
         // UI refresh throttle: ~7 Hz is plenty for a progress bar, and keeps the
         // main thread free. Always let the final "complete" frame through.
         val now = System.currentTimeMillis()
@@ -564,10 +591,9 @@ class ScanActivity : ComponentActivity() {
         // Read file metadata from session (JNI) — keep on this background thread.
         val fn = if (session.isInitialized) session.fileName() else ""
         val fs = if (session.isInitialized) session.fileSize() else 0L
-        // Real compressed size. For a segmented transfer each child session only
-        // reports THIS segment's compressed length; the user-facing "压缩后" is
-        // the whole compressed stream (root_original_size). For a single-object
-        // transfer compressed_size is exactly the payload size.
+        // Size display: in AF2 the snapshot reports ONE total raw size for the
+        // whole content regardless of chunk count; the segment* shims below map
+        // to chunk count / total raw size (no per-segment child sessions).
         val segmented = session.isInitialized && session.isSegmented()
         val cs = if (session.isInitialized) {
             if (segmented) session.rootOriginalSize() else session.compressedSize()
@@ -776,8 +802,30 @@ class ScanActivity : ComponentActivity() {
      * Runs on a background thread under the decode pool's ingest lock.
      */
     private fun recoverAndStage(displayName: String): Intent? {
+        val intent = stageFromLedger(displayName)
+        if (intent != null) {
+            // Entries are in ContentStore now — the spill has been consumed.
+            chunkSpill?.discard()
+            chunkSpill = null
+        }
+        return intent
+    }
+
+    private fun stageFromLedger(displayName: String): Intent? {
         updateRecoveryStage("正在组装数据…")
-        val stream = session.assemble() ?: run {
+        val snapshot = session.snapshot()
+
+        // Prefer the on-disk chunk spill: every completed chunk was pwrite'd
+        // there (and evicted from native memory) as it arrived, so slicing
+        // entries from the file keeps peak memory at one entry instead of the
+        // whole canonical stream. Fall back to the in-memory assemble for
+        // sessions that completed without a spill (defensive).
+        val spill = chunkSpill
+        val spillUsable =
+            spill != null && snapshot.totalRawSize > 0 &&
+                spill.length() >= snapshot.totalRawSize
+        val stream: ByteArray? = if (spillUsable) null else session.assemble()
+        if (stream == null && !spillUsable) {
             clearRecoveryStage()
             if (session.isComplete()) {
                 runOnUiThread {
@@ -787,17 +835,22 @@ class ScanActivity : ComponentActivity() {
             return null
         }
 
-        val snapshot = session.snapshot()
         val nonDirEntries = snapshot.entries.filter { it.kind != 3 } // 3 = DIRECTORY
         val store = com.airferry.app.scan.ContentStore
 
         // Manifest offsets/sizes are u64 and cannot be trusted: bounds-check in
         // the Long domain before narrowing to Int, so a bogus entry degrades to
-        // empty bytes instead of wrapping into a wrong slice.
-        fun sliceAt(off: Long, sz: Long): ByteArray =
-            if (off >= 0 && sz >= 0 && off + sz <= stream.size.toLong() &&
+        // empty bytes instead of wrapping into a wrong slice. Reads come from
+        // the spill file when usable, else from the in-memory stream.
+        fun sliceAt(off: Long, sz: Long): ByteArray {
+            if (spillUsable) {
+                return spill!!.readRange(off, sz) ?: ByteArray(0)
+            }
+            val st = stream!!
+            return if (off >= 0 && sz >= 0 && off + sz <= st.size.toLong() &&
                 off <= Int.MAX_VALUE && sz <= Int.MAX_VALUE
-            ) stream.copyOfRange(off.toInt(), (off + sz).toInt()) else ByteArray(0)
+            ) st.copyOfRange(off.toInt(), (off + sz).toInt()) else ByteArray(0)
+        }
 
         // ── Single UTF8_TEXT entry → text view (AF2 kind, no magic sniffing) ──
         if (nonDirEntries.size == 1 && nonDirEntries[0].kind == 2) {
@@ -885,11 +938,13 @@ class ScanActivity : ComponentActivity() {
         val entry = nonDirEntries.firstOrNull()
         val fileName = entry?.path?.takeIf { it.isNotEmpty() }
             ?: displayName.ifEmpty { "received_file" }
-        val fileBytes = entry?.let { e ->
-            if (e.offset >= 0 && e.size >= 0 && e.offset + e.size <= stream.size.toLong() &&
-                e.offset <= Int.MAX_VALUE && e.size <= Int.MAX_VALUE
-            ) stream.copyOfRange(e.offset.toInt(), (e.offset + e.size).toInt()) else stream
-        } ?: stream
+        val fileBytes = when {
+            entry != null && entry.offset >= 0 && entry.size >= 0 &&
+                entry.offset + entry.size <= snapshot.totalRawSize &&
+                entry.offset <= Int.MAX_VALUE && entry.size <= Int.MAX_VALUE ->
+                sliceAt(entry.offset, entry.size)
+            else -> sliceAt(0L, snapshot.totalRawSize)
+        }
 
         updateRecoveryStage("正在保存文件…")
         val put = store.putBytes(
@@ -913,6 +968,8 @@ class ScanActivity : ComponentActivity() {
         val swap = {
             session.destroy()
             session = ReceiverSessionManager()
+            chunkSpill?.discard()
+            chunkSpill = null
             ingestStopped.set(false)
             completedHandled = false
             lastUiUpdate = 0
@@ -943,6 +1000,8 @@ class ScanActivity : ComponentActivity() {
             val swap = {
                 session.destroy()
                 session = ReceiverSessionManager()
+                chunkSpill?.discard()
+                chunkSpill = null
                 ingestStopped.set(false)
             }
             try {
@@ -1023,6 +1082,8 @@ class ScanActivity : ComponentActivity() {
         val pool = decodePool
         decodePool = null
         val sessionRef = session
+        val spillRef = chunkSpill
+        chunkSpill = null
         // Drain the IO executor BEFORE tearing down the decode pool: the pending
         // recovery task holds the pool's ingest lock and touches the native
         // session, so freeing the handle first would race it. Shutdown lets an
@@ -1046,9 +1107,13 @@ class ScanActivity : ComponentActivity() {
             // handle (use-after-free). destroy() is idempotent.
             if (pool != null) {
                 pool.shutdown()
-                pool.runExclusive { sessionRef.destroy() }
+                pool.runExclusive {
+                    sessionRef.destroy()
+                    spillRef?.discard()
+                }
             } else {
                 sessionRef.destroy()
+                spillRef?.discard()
             }
         }.apply { isDaemon = true; name = "airferry-destroy" }.start()
     }

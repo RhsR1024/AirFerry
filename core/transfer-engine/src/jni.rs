@@ -31,9 +31,9 @@ use jni::JNIEnv;
 /// *separate* Android-side capability marker that advances whenever the native
 /// library gains behaviour the Kotlin host depends on.
 ///
-/// - 1: descriptor-v5 segmented (large-file) receive path.
+/// - 1: legacy v1 (pre-AF2) segmented receive path.
 /// - 2: the 16 per-field receiver getters were replaced by the single
-///      `receiverSnapshotJson` (`ReceiverSnapshotV1`); old hosts calling the
+///      `receiverSnapshotJson` (`ReceiverSnapshotV2`); old hosts calling the
 ///      removed symbols get an `UnsatisfiedLinkError` instead of silent zeros.
 ///
 /// The host (`NativeBridge.nativeAbiVersion`) handshakes on startup: if the
@@ -258,14 +258,46 @@ pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverAsse
     }
 }
 
-/// Single-JSON receiver snapshot (`ReceiverSnapshotV1`, see
+/// Index of the chunk completed by the most recent ChunkReady frame, or -1.
+/// The host persists that chunk via `receiverAssembleChunk` + forgets it with
+/// `receiverForgetChunk` to keep native memory bounded by one chunk.
+#[no_mangle]
+pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverLastChunkIndex(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jint {
+    if handle == 0 {
+        return -1;
+    }
+    let session = unsafe { &*(handle as *const ReceiverSession) };
+    session.last_completed_chunk_index().map(|i| i as jint).unwrap_or(-1)
+}
+
+/// Release a persisted chunk from native memory (eviction). Returns true when
+/// the chunk was resident. Completion tracking is unaffected.
+#[no_mangle]
+pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverForgetChunk(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    index: jint,
+) -> jni::sys::jboolean {
+    if handle == 0 || index < 0 {
+        return 0;
+    }
+    let session = unsafe { &mut *(handle as *mut ReceiverSession) };
+    session.forget_chunk(index as u32) as jni::sys::jboolean
+}
+
+/// Single-JSON receiver snapshot (`ReceiverSnapshotV2`, see
 /// [`ReceiverSession::snapshot_json`]).
 ///
 /// Replaces the former 16 per-field getters (compression / compressed_size /
 /// original_size / file_name / file_size / crc32 / crc32_known / is_segmented
 /// / segment_index / segment_count / root_original_size / original_offset /
 /// root_session_id_lo/hi / raw_sha256 / root_sha256). One call returns every
-/// descriptor-derived field atomically — no torn reads across getters — and
+/// AF2 snapshot field atomically — no torn reads across getters — and
 /// the Kotlin side parses it with `JSONObject`. Returns null on a null handle
 /// or string-conversion failure.
 #[no_mangle]
@@ -293,7 +325,7 @@ fn null_byte_array(env: &mut JNIEnv) -> jni::sys::jbyteArray {
     }
 }
 
-// ===== File + descriptor-v5 segment metadata =====
+// ===== Recovered-file / manifest snapshot + progress JSON =====
 // All consumed through the single `receiverSnapshotJson` snapshot above; the
 // per-field accessors were removed with AIRFERRY_NATIVE_ABI_VERSION 2.
 

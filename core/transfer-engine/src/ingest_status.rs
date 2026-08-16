@@ -14,9 +14,13 @@
 //! ## Bit layout of the packed `u64` (all fields unsigned, little-endian bits)
 //! - bit  0      : `complete` (1 once the object is fully decoded)
 //! - bit  1      : `accepted` (1 if this frame contributed a new symbol)
+//! - bit  2      : `manifest_ready` (1 on the frame that completed the manifest)
+//! - bit  3      : `chunk_ready` (1 on the frame that completed a chunk —
+//!                 fetch it with `receiver_assemble_chunk(last_chunk_index)`
+//!                 then release it with `receiver_forget_chunk`)
 //! - bits 8..23  : `session_mismatch_streak` (0..=0xFFFF, clamped)
 //! - bits 32..63 : `received_symbols` (low 32 bits; real transfers stay well
-//!   below 2^32)
+//!                 below 2^32)
 //!
 //! `received_symbols == u32::MAX` (i.e. bits 32..63 all set, flags clear) is
 //! reserved as the [`INGEST_ERROR`] sentinel — a real transfer never reaches it.
@@ -24,6 +28,8 @@
 /// Packed ingest-status bit offsets / widths.
 const COMPLETE_BIT: u32 = 0;
 const ACCEPTED_BIT: u32 = 1;
+const MANIFEST_READY_BIT: u32 = 2;
+const CHUNK_READY_BIT: u32 = 3;
 const STREAK_OFFSET: u32 = 8;
 const STREAK_WIDTH: u32 = 16;
 const RECEIVED_OFFSET: u32 = 32;
@@ -36,13 +42,26 @@ pub const INGEST_ERROR: u64 = 0xFFFF_FFFFu64 << RECEIVED_OFFSET;
 /// Pack the per-frame status into the 64-bit layout documented at the module
 /// level. `mismatch_streak` is clamped into 16 bits; `received_symbols` is
 /// clamped into 32 bits.
-pub fn pack(complete: bool, accepted: bool, mismatch_streak: u32, received_symbols: u32) -> u64 {
+pub fn pack(
+    complete: bool,
+    accepted: bool,
+    manifest_ready: bool,
+    chunk_ready: bool,
+    mismatch_streak: u32,
+    received_symbols: u32,
+) -> u64 {
     let mut bits: u64 = 0;
     if complete {
         bits |= 1u64 << COMPLETE_BIT;
     }
     if accepted {
         bits |= 1u64 << ACCEPTED_BIT;
+    }
+    if manifest_ready {
+        bits |= 1u64 << MANIFEST_READY_BIT;
+    }
+    if chunk_ready {
+        bits |= 1u64 << CHUNK_READY_BIT;
     }
     // Clamp streak into 16 bits (it's reset well before 2^16 in practice).
     let streak_mask: u64 = (1u64 << STREAK_WIDTH) - 1;
@@ -59,32 +78,45 @@ mod tests {
 
     #[test]
     fn complete_and_accept_flags() {
-        assert_eq!(pack(false, false, 0, 0), 0);
-        assert_eq!(pack(true, false, 0, 0), 1);
-        assert_eq!(pack(false, true, 0, 0), 1 << 1);
-        assert_eq!(pack(true, true, 0, 0), 0b11);
+        assert_eq!(pack(false, false, false, false, 0, 0), 0);
+        assert_eq!(pack(true, false, false, false, 0, 0), 1);
+        assert_eq!(pack(false, true, false, false, 0, 0), 1 << 1);
+        assert_eq!(pack(true, true, false, false, 0, 0), 0b11);
+    }
+
+    #[test]
+    fn event_bits_are_independent_of_complete() {
+        // A chunk can complete before the whole object: chunk_ready must be
+        // observable on its own so hosts can persist + evict incrementally.
+        assert_eq!(pack(false, true, false, true, 0, 7), (1 << 1) | (1 << 3) | (7 << 32));
+        assert_eq!(pack(false, true, true, false, 0, 3), (1 << 1) | (1 << 2) | (3 << 32));
+        // All flags set at once stays representable.
+        assert_eq!(
+            pack(true, true, true, true, 0, 1),
+            0b1111 | (1u64 << 32)
+        );
     }
 
     #[test]
     fn streak_packed_into_bits_8_23() {
-        assert_eq!(pack(false, false, 1, 0), 1 << 8);
-        assert_eq!(pack(false, false, 0xFFFF, 0), 0xFFFFu64 << 8);
+        assert_eq!(pack(false, false, false, false, 1, 0), 1 << 8);
+        assert_eq!(pack(false, false, false, false, 0xFFFF, 0), 0xFFFFu64 << 8);
     }
 
     #[test]
     fn streak_clamped_to_16_bits() {
-        assert_eq!(pack(false, false, 0x1FFFF, 0), 0xFFFFu64 << 8);
+        assert_eq!(pack(false, false, false, false, 0x1FFFF, 0), 0xFFFFu64 << 8);
     }
 
     #[test]
     fn received_symbols_packed_into_bits_32_63() {
-        assert_eq!(pack(false, false, 0, 1), 1u64 << 32);
+        assert_eq!(pack(false, false, false, false, 0, 1), 1u64 << 32);
     }
 
     #[test]
     fn combined_fields() {
         assert_eq!(
-            pack(true, true, 0x1234, 0x5678),
+            pack(true, true, false, false, 0x1234, 0x5678),
             0b11 | (0x1234u64 << 8) | (0x5678u64 << 32)
         );
     }

@@ -15,9 +15,9 @@ object NativeBridge {
     /**
      * Native ABI / protocol capability version (see
      * `AIRFERRY_NATIVE_ABI_VERSION` in `core/transfer-engine/src/jni.rs`).
-     * - 1: descriptor-v5 segmented / large-file receive path.
+     * - 1: legacy v1 (pre-AF2) segmented / large-file receive path.
      * - 2: the 16 per-field receiver getters were replaced by the single
-     *   [receiverSnapshotJson] (`ReceiverSnapshotV1`).
+     *   [receiverSnapshotJson] (`ReceiverSnapshotV2`).
      * A stale `.so` either lacks this symbol (calling it throws
      * `UnsatisfiedLinkError`) or reports an older version — either way the
      * host must refuse to run instead of silently "staying synchronising".
@@ -55,10 +55,10 @@ object NativeBridge {
     external fun receiverIsComplete(handle: Long): Int
 
     /**
-     * Single-JSON receiver snapshot (`ReceiverSnapshotV1`): every
-     * descriptor-derived field (file name/sizes/CRC/compression tag, session
-     * id, and the descriptor-v5 segment metadata) in ONE atomic call,
-     * replacing the former 16 per-field getters. Parse with `JSONObject`.
+     * Single-JSON receiver snapshot (`ReceiverSnapshotV2`): every AF2
+     * snapshot field (name/sizes/CRC/codec, session id, manifest/chunk
+     * metadata) in ONE atomic call, replacing the former 16 per-field
+     * getters. Parse with `JSONObject`.
      * Null only on a null handle / string failure.
      */
     external fun receiverSnapshotJson(handle: Long): String?
@@ -73,6 +73,19 @@ object NativeBridge {
 
     /** Reassemble chunk `index` bytes. */
     external fun receiverAssembleChunk(handle: Long, index: Int): ByteArray?
+
+    /**
+     * Index of the chunk completed by the most recent ChunkReady frame, or -1.
+     * Pair with [receiverAssembleChunk] + [receiverForgetChunk] to persist
+     * chunks incrementally and keep native memory bounded by one chunk.
+     */
+    external fun receiverLastChunkIndex(handle: Long): Int
+
+    /**
+     * Release a persisted chunk from native memory (eviction). Returns true
+     * when the chunk was resident. Completion tracking is unaffected.
+     */
+    external fun receiverForgetChunk(handle: Long, index: Int): Boolean
 
     external fun receiverDestroy(handle: Long)
 }

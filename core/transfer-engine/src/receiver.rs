@@ -4,6 +4,7 @@
 //! native bindings.
 
 use af2::{Af2Receiver, IngestEvent};
+use crate::ingest_status::pack;
 use std::collections::HashMap;
 
 /// A receiver session driven by AF2.
@@ -14,6 +15,10 @@ pub struct ReceiverSession {
     session_mismatch_streak: u32,
     last_chunk: Option<(u32, Vec<u8>)>,
     completed_chunks: HashMap<u32, Vec<u8>>,
+    /// Chunks that ever reached ChunkReady, INCLUDING ones the host released
+    /// via [`ReceiverSession::forget_chunk`] — completion is defined by this
+    /// ledger, not by what is still resident.
+    completed_count: u32,
 }
 
 fn escape_json(s: &str) -> String {
@@ -49,6 +54,7 @@ impl ReceiverSession {
             session_mismatch_streak: 0,
             last_chunk: None,
             completed_chunks: HashMap::new(),
+            completed_count: 0,
         }
     }
 
@@ -63,38 +69,46 @@ impl ReceiverSession {
         match self.inner.ingest(frame_bytes) {
             Ok(IngestEvent::RootLocked) => {
                 self.session_mismatch_streak = 0;
-                crate::ingest_status::pack(self.is_complete(), true, 0, self.received_symbols)
+                pack(self.is_complete(), true, false, false, 0, self.received_symbols)
             }
             Ok(IngestEvent::RootMismatch { streak }) => {
                 self.session_mismatch_streak = streak;
-                crate::ingest_status::pack(self.is_complete(), false, streak, self.received_symbols)
+                pack(self.is_complete(), false, false, false, streak, self.received_symbols)
             }
             Ok(IngestEvent::Relocked) => {
                 self.session_mismatch_streak = 0;
                 self.received_symbols = 0;
                 self.completed_chunks.clear();
-                crate::ingest_status::pack(false, true, 0, 0)
+                self.completed_count = 0;
+                self.last_chunk = None;
+                pack(false, true, false, false, 0, 0)
             }
             Ok(IngestEvent::MetaBound { .. }) => {
-                crate::ingest_status::pack(self.is_complete(), true, 0, self.received_symbols)
+                pack(self.is_complete(), true, false, false, 0, self.received_symbols)
             }
             Ok(IngestEvent::SymbolAccepted) => {
                 self.received_symbols = self.received_symbols.saturating_add(1);
-                crate::ingest_status::pack(self.is_complete(), true, 0, self.received_symbols)
+                pack(self.is_complete(), true, false, false, 0, self.received_symbols)
             }
             Ok(IngestEvent::ManifestReady) => {
                 self.received_symbols = self.received_symbols.saturating_add(1);
-                crate::ingest_status::pack(self.is_complete(), true, 0, self.received_symbols)
+                pack(self.is_complete(), true, true, false, 0, self.received_symbols)
             }
             Ok(IngestEvent::ChunkReady { index, raw }) => {
                 self.received_symbols = self.received_symbols.saturating_add(1);
-                self.completed_chunks.insert(index, raw.clone());
+                if self.completed_chunks.insert(index, raw.clone()).is_none() {
+                    // A replayed chunk can complete twice after a relock; only
+                    // novel completions advance the ledger.
+                    self.completed_count = self.completed_count.saturating_add(1);
+                }
                 self.last_chunk = Some((index, raw));
-                crate::ingest_status::pack(self.is_complete(), true, 0, self.received_symbols)
+                pack(self.is_complete(), true, false, true, 0, self.received_symbols)
             }
             Ok(IngestEvent::MetaRejected | IngestEvent::ChunkRejected | IngestEvent::Dropped) => {
-                crate::ingest_status::pack(
+                pack(
                     self.is_complete(),
+                    false,
+                    false,
                     false,
                     self.session_mismatch_streak,
                     self.received_symbols,
@@ -106,10 +120,24 @@ impl ReceiverSession {
 
     pub fn is_complete(&self) -> bool {
         if let Some(r) = self.inner.root() {
-            self.completed_chunks.len() as u32 >= r.chunk_count && r.chunk_count > 0
+            self.completed_count >= r.chunk_count && r.chunk_count > 0
         } else {
             false
         }
+    }
+
+    /// Index of the chunk completed by the most recent ChunkReady frame
+    /// (None if no chunk completed yet, or after the host released it).
+    pub fn last_completed_chunk_index(&self) -> Option<u32> {
+        self.last_chunk.as_ref().map(|(i, _)| *i)
+    }
+
+    /// Release a chunk the host has persisted. Completion tracking is
+    /// unaffected (the ledger counts every ChunkReady), so memory stays
+    /// bounded by one chunk while [`ReceiverSession::assemble_chunk`]
+    /// simply returns None for released indices.
+    pub fn forget_chunk(&mut self, index: u32) -> bool {
+        self.completed_chunks.remove(&index).is_some()
     }
 
     pub fn snapshot_json(&self) -> String {
@@ -179,7 +207,7 @@ impl ReceiverSession {
                 u32::try_from(r.total_raw_size.div_ceil(u64::from(t))).unwrap_or(u32::MAX)
             })
             .unwrap_or(0);
-        let decoded_symbols = est_symbols(self.completed_chunks.len() as u32).min(total_symbols);
+        let decoded_symbols = est_symbols(self.completed_count).min(total_symbols);
         crate::Progress {
             decoded_symbols,
             total_symbols,
@@ -188,7 +216,7 @@ impl ReceiverSession {
             frames_seen: self.frames_seen,
             frames_duplicate: 0,
             frames_corrupt: 0,
-            decoded_blocks: self.completed_chunks.len() as u32,
+            decoded_blocks: self.completed_count,
             total_blocks: root.map(|r| r.chunk_count).unwrap_or(0),
             meta_confirmed: root.is_some(),
             session_mismatch_streak: self.session_mismatch_streak,
@@ -202,7 +230,7 @@ impl ReceiverSession {
     /// Reassemble all chunks in order into the full canonical stream.
     pub fn assemble_all(&self) -> Option<Vec<u8>> {
         let root = self.inner.root()?;
-        if (self.completed_chunks.len() as u32) < root.chunk_count {
+        if self.completed_count < root.chunk_count {
             return None;
         }
         let mut out = Vec::with_capacity(root.total_raw_size as usize);
