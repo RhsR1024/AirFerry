@@ -15,8 +15,7 @@
 //!
 //! ## Memory ownership
 //! - Strings/byte buffers returned by value (e.g. [`airferry_receiver_ingest`]'s
-//!   status word, [`airferry_receiver_file_size`]) are copied and need no
-//!   cleanup.
+//!   status word) are copied and need no cleanup.
 //! - [`airferry_receiver_assemble`] returns a Rust-allocated buffer + length;
 //!   the caller must copy the bytes out and then call [`airferry_buffer_free`]
 //!   on the pointer to release Rust's allocation. Never `free` it from the host.
@@ -30,13 +29,29 @@
 use crate::ingest_status;
 use crate::receiver::ReceiverSession;
 use crate::Progress;
-use qr_protocol::frame::SessionIdRaw;
 use raptorq_core::MAX_ORIGINAL_BYTES;
 use std::os::raw::c_char;
 
 // Per-frame status packing + the error sentinel now live in the shared
 // [`ingest_status`] module so the JNI, C ABI, and WASM bindings cannot drift
 // from the wire contract (bit layout documented there).
+
+/// ABI / capability version of this C ABI library, mirroring the Android-side
+/// `AIRFERRY_NATIVE_ABI_VERSION` handshake.
+///
+/// - 1: descriptor-v5 segmented (large-file) receive path.
+/// - 2: the 16 per-field receiver getters were replaced by the single
+///      [`airferry_receiver_snapshot_json`] (`ReceiverSnapshotV1`).
+///
+/// The Windows host (`NativeBridge.NativeAbiVersion`) must verify this at
+/// startup and refuse to run against an older DLL.
+pub const AIRFERRY_NATIVE_ABI_VERSION: u32 = 2;
+
+/// Report the native ABI / capability version ([`AIRFERRY_NATIVE_ABI_VERSION`]).
+#[no_mangle]
+pub extern "C" fn airferry_native_abi_version() -> u32 {
+    AIRFERRY_NATIVE_ABI_VERSION
+}
 
 /// Create a "cache-only" receiver. `sid_lo`/`sid_hi` split the 128-bit session
 /// id into its low/high 64-bit halves (host order). As on Android, no object
@@ -45,7 +60,7 @@ use std::os::raw::c_char;
 /// non-null opaque handle on success.
 #[no_mangle]
 pub extern "C" fn airferry_receiver_create(sid_lo: u64, sid_hi: u64) -> *mut ReceiverSession {
-    let sid: SessionIdRaw = ((sid_hi as u128) << 64) | (sid_lo as u128);
+    let sid: u128 = ((sid_hi as u128) << 64) | (sid_lo as u128);
     let session = ReceiverSession::new_pending(sid);
     Box::into_raw(Box::new(session))
 }
@@ -102,26 +117,7 @@ pub unsafe extern "C" fn airferry_receiver_ingest(
     };
     // SAFETY: caller guarantees `handle` is valid and not concurrently mutated.
     let session = unsafe { &mut *handle };
-    let frame = match qr_protocol::Frame::from_bytes(slice) {
-        Ok(f) => f,
-        Err(e) => {
-            cffi_log(&format!("frame rejected (len={}): {:?}", slice.len(), e));
-            return ingest_status::INGEST_ERROR;
-        }
-    };
-    let prev_received = session.progress().received_symbols;
-    if let Err(e) = session.ingest(frame) {
-        cffi_log(&format!("ingest error: {e}"));
-    }
-    let p = session.progress();
-    let complete = session.is_complete();
-    let accepted = p.received_symbols > prev_received;
-    ingest_status::pack(
-        complete,
-        accepted,
-        p.session_mismatch_streak,
-        p.received_symbols,
-    )
+    session.ingest(slice)
 }
 
 /// Return 1 if the object is fully decoded, 0 otherwise (including a null
@@ -174,14 +170,10 @@ pub unsafe extern "C" fn airferry_receiver_assemble(
         return 0;
     }
     // SAFETY: shared borrow; caller guarantees the handle is valid.
-    let session = unsafe { &mut *handle };
-    let data = match session.assemble_result() {
-        Ok(Some(d)) => d,
-        Ok(None) => return 0,
-        Err(e) => {
-            cffi_log(&format!("assemble failed: {e}"));
-            return 0;
-        }
+    let session = unsafe { &*handle };
+    let data = match session.assemble_all() {
+        Some(d) => d,
+        None => return 0,
     };
     let len = data.len();
     let ptr = Box::into_raw(data.into_boxed_slice()) as *mut u8;
@@ -215,18 +207,12 @@ pub unsafe extern "C" fn airferry_buffer_free(ptr: *mut u8, len: usize) {
     }
 }
 
-/// Reassemble this segment's transmitted bytes **as received** (trimmed to its
-/// `compressed_size`), **without** decompression. For descriptor-v5
-/// compressed-stream segmentation, Kotlin/C# stores these compressed bytes and
-/// concatenates + decompresses once after every segment arrives.
-///
-/// The returned buffer is freed with [`airferry_buffer_free`].
-///
-/// # Safety
-/// Identical contract to [`airferry_receiver_assemble`].
+/// Reassemble chunk `index` into a freshly-allocated Rust buffer. Free with
+/// [`airferry_buffer_free`].
 #[no_mangle]
-pub unsafe extern "C" fn airferry_receiver_assemble_raw(
+pub unsafe extern "C" fn airferry_receiver_assemble_chunk(
     handle: *mut ReceiverSession,
+    index: u32,
     out_buf: *mut *mut u8,
     out_len: *mut usize,
 ) -> i32 {
@@ -241,17 +227,9 @@ pub unsafe extern "C" fn airferry_receiver_assemble_raw(
         return 0;
     }
     let session = unsafe { &mut *handle };
-    let Some(mut data) = session.assemble_raw() else {
+    let Some(data) = session.assemble_chunk(index) else {
         return 0;
     };
-    let fm = session.file_meta();
-    if fm.compressed_size_known {
-        if let Ok(len) = usize::try_from(fm.compressed_size) {
-            if len <= data.len() {
-                data.truncate(len);
-            }
-        }
-    }
     let len = data.len();
     let ptr = Box::into_raw(data.into_boxed_slice()) as *mut u8;
     unsafe {
@@ -259,45 +237,6 @@ pub unsafe extern "C" fn airferry_receiver_assemble_raw(
         *out_len = len;
     }
     1
-}
-
-/// Compression-algorithm tag of the confirmed descriptor (0=None,1=Zstd,2=Xz).
-///
-/// # Safety
-/// A non-null handle must refer to a live receiver and be externally serialized.
-#[no_mangle]
-pub unsafe extern "C" fn airferry_receiver_compression(handle: *const ReceiverSession) -> u8 {
-    if handle.is_null() {
-        return 0;
-    }
-    let session = unsafe { &*handle };
-    session.file_meta().compression
-}
-
-/// Transmitted (compressed) payload length of this object.
-///
-/// # Safety
-/// A non-null handle must refer to a live receiver and be externally serialized.
-#[no_mangle]
-pub unsafe extern "C" fn airferry_receiver_compressed_size(handle: *const ReceiverSession) -> u64 {
-    if handle.is_null() {
-        return 0;
-    }
-    let session = unsafe { &*handle };
-    session.file_meta().compressed_size
-}
-
-/// Whole decompressed original size (same across every segment of a root).
-///
-/// # Safety
-/// A non-null handle must refer to a live receiver and be externally serialized.
-#[no_mangle]
-pub unsafe extern "C" fn airferry_receiver_original_size(handle: *const ReceiverSession) -> u64 {
-    if handle.is_null() {
-        return 0;
-    }
-    let session = unsafe { &*handle };
-    session.file_meta().original_size
 }
 
 /// Decompress a caller-provided byte buffer according to a compression tag
@@ -453,249 +392,51 @@ pub unsafe extern "C" fn airferry_receiver_progress_json(
     write_cstr(&json, out, cap)
 }
 
-/// Write the recovered file name (UTF-8 + NUL) into the caller buffer using
-/// the same length-query protocol as [`airferry_receiver_progress_json`].
-/// Empty string when no descriptor has been received yet.
+/// Single-JSON receiver snapshot (`ReceiverSnapshotV1`, see
+/// [`ReceiverSession::snapshot_json`]).
 ///
-/// # Safety
-/// A non-null handle must be live. A non-null `out` must point to `cap`
-/// writable bytes.
-#[no_mangle]
-pub unsafe extern "C" fn airferry_receiver_file_name(
-    handle: *const ReceiverSession,
-    out: *mut u8,
-    cap: usize,
-) -> usize {
-    if handle.is_null() {
-        return 0;
-    }
-    let session = unsafe { &*handle };
-    let name = session.file_meta().filename.clone();
-    write_cstr(&name, out, cap)
-}
-
-/// Original file size in bytes (0 if no descriptor received / null handle).
+/// Replaces the former 16 per-field getters (compression / compressed_size /
+/// original_size / file_name / file_size / crc32 / crc32_known / is_segmented
+/// / segment_index / segment_count / root_original_size / original_offset /
+/// root_session_id_lo/hi / raw_sha256 / root_sha256): one call returns every
+/// descriptor-derived field atomically, with no torn reads across getters.
 ///
-/// # Safety
-/// A non-null handle must refer to a live receiver and be externally serialized.
-#[no_mangle]
-pub unsafe extern "C" fn airferry_receiver_file_size(handle: *const ReceiverSession) -> u64 {
-    if handle.is_null() {
-        return 0;
-    }
-    let session = unsafe { &*handle };
-    session.file_meta().original_size
-}
-
-/// CRC32 of the original file (0 if unknown). Returned as `u64` so the full
-/// unsigned 32-bit range survives — mirroring the JNI layer's decision to use
-/// `jlong` instead of `jint` (CRC32 values like `0xDEADBEEF` would otherwise
-/// look negative as a signed 32-bit int).
-///
-/// # Safety
-/// A non-null handle must refer to a live receiver and be externally serialized.
-#[no_mangle]
-pub unsafe extern "C" fn airferry_receiver_crc32(handle: *const ReceiverSession) -> u64 {
-    if handle.is_null() {
-        return 0;
-    }
-    let session = unsafe { &*handle };
-    session.file_meta().crc32 as u64
-}
-
-/// Return 1 if the descriptor supplied a real CRC32 (so the host should verify
-/// it against the recovered bytes), or 0 if the CRC is unknown and must NOT be
-/// compared. CRC32 can legitimately be 0, so `crc32() == 0` is not a safe test.
-///
-/// # Safety
-/// A non-null handle must refer to a live receiver and be externally serialized.
-#[no_mangle]
-pub unsafe extern "C" fn airferry_receiver_crc32_known(handle: *const ReceiverSession) -> i32 {
-    if handle.is_null() {
-        return 0;
-    }
-    let session = unsafe { &*handle };
-    session.file_meta().crc32_known as i32
-}
-
-// ─── descriptor-v5 segment metadata getters ───────────────────────────────
-// A large transfer is split into independent child sessions (one per segment).
-// These getters let a host detect that the confirmed descriptor is a v5
-// segment and drive a disk-backed `.partial` writer. All mirror the JNI and
-// WASM bindings and read `session.segment_meta()`.
-
-/// Return 1 if the confirmed descriptor was a v5 large-transfer child object,
-/// else 0.
-///
-/// # Safety
-/// A non-null handle must refer to a live receiver and be externally serialized.
-#[no_mangle]
-pub unsafe extern "C" fn airferry_receiver_is_segmented(handle: *const ReceiverSession) -> i32 {
-    if handle.is_null() {
-        return 0;
-    }
-    let session = unsafe { &*handle };
-    session.segment_meta().is_some() as i32
-}
-
-/// Zero-based index of this segment within the root transfer (0 if not segmented).
-///
-/// # Safety
-/// A non-null handle must refer to a live receiver and be externally serialized.
-#[no_mangle]
-pub unsafe extern "C" fn airferry_receiver_segment_index(handle: *const ReceiverSession) -> u32 {
-    if handle.is_null() {
-        return 0;
-    }
-    let session = unsafe { &*handle };
-    session.segment_meta().map(|s| s.segment_index).unwrap_or(0)
-}
-
-/// Total segment count of the root transfer (1 if not segmented).
-///
-/// # Safety
-/// A non-null handle must refer to a live receiver and be externally serialized.
-#[no_mangle]
-pub unsafe extern "C" fn airferry_receiver_segment_count(handle: *const ReceiverSession) -> u32 {
-    if handle.is_null() {
-        return 0;
-    }
-    let session = unsafe { &*handle };
-    session.segment_meta().map(|s| s.segment_count).unwrap_or(1)
-}
-
-/// Root (whole-file) original size in bytes (0 if not segmented).
-///
-/// # Safety
-/// A non-null handle must refer to a live receiver and be externally serialized.
-#[no_mangle]
-pub unsafe extern "C" fn airferry_receiver_root_original_size(
-    handle: *const ReceiverSession,
-) -> u64 {
-    if handle.is_null() {
-        return 0;
-    }
-    let session = unsafe { &*handle };
-    session
-        .segment_meta()
-        .map(|s| s.root_original_size)
-        .unwrap_or(0)
-}
-
-/// Original (uncompressed) offset of this segment in the root file (0 if not
-/// segmented).
-///
-/// # Safety
-/// A non-null handle must refer to a live receiver and be externally serialized.
-#[no_mangle]
-pub unsafe extern "C" fn airferry_receiver_original_offset(handle: *const ReceiverSession) -> u64 {
-    if handle.is_null() {
-        return 0;
-    }
-    let session = unsafe { &*handle };
-    session
-        .segment_meta()
-        .map(|s| s.original_offset)
-        .unwrap_or(0)
-}
-
-/// Root session id low 64 bits (whole transfer id), or 0 if not segmented.
-///
-/// # Safety
-/// A non-null handle must refer to a live receiver and be externally serialized.
-#[no_mangle]
-pub unsafe extern "C" fn airferry_receiver_root_session_id_lo(
-    handle: *const ReceiverSession,
-) -> u64 {
-    if handle.is_null() {
-        return 0;
-    }
-    let session = unsafe { &*handle };
-    session
-        .segment_meta()
-        .map(|s| s.root_session_id as u64)
-        .unwrap_or(0)
-}
-
-/// Root session id high 64 bits, or 0 if not segmented.
-///
-/// # Safety
-/// A non-null handle must refer to a live receiver and be externally serialized.
-#[no_mangle]
-pub unsafe extern "C" fn airferry_receiver_root_session_id_hi(
-    handle: *const ReceiverSession,
-) -> u64 {
-    if handle.is_null() {
-        return 0;
-    }
-    let session = unsafe { &*handle };
-    session
-        .segment_meta()
-        .map(|s| (s.root_session_id >> 64) as u64)
-        .unwrap_or(0)
-}
-
-/// Copy the 32-byte SHA-256 of this segment's uncompressed bytes into `out`.
-///
-/// Returns the number of bytes that *would* be written (32), mirroring the
-/// two-pass length protocol used by `airferry_receiver_file_name`. If `out` is
-/// null or `cap < 32`, nothing is written and 32 is returned. Returns 0 if the
-/// confirmed descriptor is not a v5 segment.
+/// Returns a Rust-allocated, NUL-terminated UTF-8 `char*` that the caller must
+/// release with [`airferry_free_string`] (never `free` it from the host).
+/// Returns null on a null handle.
 ///
 /// # Safety
 /// A non-null handle must refer to a live receiver and be externally
-/// serialized; `out[..cap]` must be writable for this call.
+/// serialized (the same serialization that guards `airferry_receiver_ingest`).
 #[no_mangle]
-pub unsafe extern "C" fn airferry_receiver_raw_sha256(
+pub unsafe extern "C" fn airferry_receiver_snapshot_json(
     handle: *const ReceiverSession,
-    out: *mut u8,
-    cap: usize,
-) -> usize {
+) -> *mut c_char {
     if handle.is_null() {
-        return 0;
+        return std::ptr::null_mut();
     }
     let session = unsafe { &*handle };
-    match session.segment_meta() {
-        None => 0,
-        Some(seg) => {
-            const N: usize = 32;
-            if out.is_null() || cap < N {
-                return N;
-            }
-            // SAFETY: caller guarantees `out[..cap]` writable and `cap >= N`.
-            unsafe { std::ptr::copy_nonoverlapping(seg.raw_sha256.as_ptr(), out, N) };
-            N
-        }
+    // A CString conversion only fails on interior NULs, which the JSON
+    // escaping in snapshot_json rules out; fall back to null defensively.
+    match std::ffi::CString::new(session.snapshot_json()) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
     }
 }
 
-/// Copy the 32-byte SHA-256 of the complete uncompressed root file into `out`.
-/// The return/capacity contract matches [`airferry_receiver_raw_sha256`].
+/// Free a string returned by [`airferry_receiver_snapshot_json`].
+/// Passing null is a no-op.
 ///
 /// # Safety
-/// A non-null handle must refer to a live receiver and be externally
-/// serialized; `out[..cap]` must be writable for this call.
+/// `ptr` must be null or a pointer previously returned by
+/// [`airferry_receiver_snapshot_json`] that has not been freed yet.
 #[no_mangle]
-pub unsafe extern "C" fn airferry_receiver_root_sha256(
-    handle: *const ReceiverSession,
-    out: *mut u8,
-    cap: usize,
-) -> usize {
-    if handle.is_null() {
-        return 0;
+pub unsafe extern "C" fn airferry_free_string(ptr: *mut c_char) {
+    if ptr.is_null() {
+        return;
     }
-    let session = unsafe { &*handle };
-    match session.segment_meta() {
-        None => 0,
-        Some(seg) => {
-            const N: usize = 32;
-            if out.is_null() || cap < N {
-                return N;
-            }
-            unsafe { std::ptr::copy_nonoverlapping(seg.root_sha256.as_ptr(), out, N) };
-            N
-        }
-    }
+    // SAFETY: caller guarantees the provenance of `ptr`.
+    unsafe { drop(std::ffi::CString::from_raw(ptr)) };
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────────
@@ -794,11 +535,17 @@ mod tests {
                 airferry_receiver_ingest(h, std::ptr::null(), 0),
                 ingest_status::INGEST_ERROR
             );
-            // Accessors on a fresh (no-descriptor) session report empty/zero.
+            // A fresh (no-descriptor) session reports empty/zero snapshot
+            // fields; the JSON is complete and parseable.
             assert_eq!(airferry_receiver_is_complete(h), 0);
-            assert_eq!(airferry_receiver_file_size(h), 0);
-            assert_eq!(airferry_receiver_crc32(h), 0);
-            assert_eq!(airferry_receiver_crc32_known(h), 0);
+            let snap = airferry_receiver_snapshot_json(h);
+            let snap_str = std::ffi::CStr::from_ptr(snap);
+            let json = snap_str.to_str().unwrap();
+            assert!(json.starts_with('{') && json.ends_with('}'));
+            assert!(json.contains("\"schema_version\":2"));
+            assert!(json.contains("\"meta_confirmed\":false"));
+            assert!(json.contains("\"transfer_id_hex\":\"\""));
+            airferry_free_string(snap);
             // progress_json first returns the required length when the buffer is
             // too small, then writes a `{`-prefixed JSON + NUL when it fits.
             let mut tiny = [0u8; 8];
@@ -836,17 +583,18 @@ mod tests {
                 airferry_receiver_progress_json(std::ptr::null(), std::ptr::null_mut(), 0),
                 0
             );
-            assert_eq!(
-                airferry_receiver_file_name(std::ptr::null(), std::ptr::null_mut(), 0),
-                0
-            );
-            assert_eq!(airferry_receiver_file_size(std::ptr::null()), 0);
-            assert_eq!(airferry_receiver_crc32(std::ptr::null()), 0);
-            assert_eq!(airferry_receiver_crc32_known(std::ptr::null()), 0);
+            assert!(airferry_receiver_snapshot_json(std::ptr::null()).is_null());
             // destroy/free are no-ops on null.
             airferry_receiver_destroy(std::ptr::null_mut());
             airferry_buffer_free(std::ptr::null_mut(), 0);
+            airferry_free_string(std::ptr::null_mut());
         }
+    }
+
+    #[test]
+    fn abi_version_is_reported() {
+        assert_eq!(airferry_native_abi_version(), AIRFERRY_NATIVE_ABI_VERSION);
+        assert_eq!(AIRFERRY_NATIVE_ABI_VERSION, 2);
     }
 
     #[test]
