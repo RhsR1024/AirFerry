@@ -16,6 +16,8 @@ pub mod qr_render;
 pub enum Error {
     #[error("compression error: {0}")]
     Compress(String),
+    #[error("buffer too short: need {need}, have {have}")]
+    BufferTooShort { need: usize, have: usize },
 }
 
 pub(crate) type Result<T> = core::result::Result<T, Error>;

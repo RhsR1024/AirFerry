@@ -354,3 +354,120 @@ fn boundary_suite_5_stream_switching_and_relock() {
     // Next frame from B locks the new root
     assert_eq!(rx.ingest(&fb_root).unwrap(), IngestEvent::RootLocked);
 }
+
+#[test]
+fn boundary_suite_6_cross_instance_isolation_no_poisoning() {
+    println!("\n--- Suite 6: §17 d) Cross-Instance Isolation (Alternating Instances) ---");
+    // Same payload, two senders with different T (yielding distinct Object IDs).
+    // Alternating symbol/meta frames from both instances must NEVER poison the
+    // receiver's active decoder — foreign symbols are dropped at the routing layer.
+    let payload = vec![0x5A; 8192];
+    let mut sender_t512 = Af2Sender::new(
+        vec![(1, "data.bin".into(), payload.clone())],
+        SenderConfig {
+            symbol_size: 512,
+            chunk_raw_size: 1 << 20,
+            redundancy_pct: 30,
+        },
+    )
+    .unwrap();
+    let mut sender_t1024 = Af2Sender::new(
+        vec![(1, "data.bin".into(), payload.clone())],
+        SenderConfig {
+            symbol_size: 1024,
+            chunk_raw_size: 1 << 20,
+            redundancy_pct: 30,
+        },
+    )
+    .unwrap();
+
+    let mut rx = Af2Receiver::new();
+    // Ingest all frames from T=1024 while interleaving symbols from T=512
+    let mut chunk_recovered = false;
+    for _ in 0..500 {
+        // Feed foreign T=512 frame: if it is a data frame it is dropped; if it
+        // is ROOT we skip it here so we specifically test symbol-level isolation.
+        let f_other = sender_t512.next_frame().unwrap();
+        let frame_parsed = af2::frame::Af2Frame::from_bytes(&f_other).unwrap();
+        if frame_parsed.frame_type != af2::frame::FrameType::Root {
+            let _ = rx.ingest(&f_other);
+        }
+
+        let f_target = sender_t1024.next_frame().unwrap();
+        let ev = rx.ingest(&f_target).unwrap();
+        if let IngestEvent::ChunkReady { raw, .. } = ev {
+            assert_eq!(raw, payload);
+            chunk_recovered = true;
+            break;
+        }
+    }
+    assert!(chunk_recovered, "Target instance must recover cleanly despite interleaved foreign symbols");
+}
+
+#[test]
+fn boundary_suite_7_late_joiner_linear_convergence() {
+    println!("\n--- Suite 7: §17 c) Late Joiner (Arbitrary Start Point) ---");
+    // A receiver joining mid-broadcast after hundreds of frames have already
+    // been emitted must synchronize and recover via subsequent fresh repair symbols.
+    let data = vec![0x7E; 12 * 1024];
+    let mut sender = Af2Sender::new(
+        vec![(1, "late.bin".into(), data.clone())],
+        SenderConfig {
+            symbol_size: 512,
+            chunk_raw_size: 1 << 20,
+            redundancy_pct: 50,
+        },
+    )
+    .unwrap();
+
+    // Burn 150 frames before the receiver turns on
+    for _ in 0..150 {
+        let _ = sender.next_frame().unwrap();
+    }
+
+    let mut rx = Af2Receiver::new();
+    let mut completed = false;
+    for _ in 0..600 {
+        let f = sender.next_frame().unwrap();
+        let ev = rx.ingest(&f).unwrap();
+        if let IngestEvent::ChunkReady { raw, .. } = ev {
+            assert_eq!(raw, data);
+            completed = true;
+            break;
+        }
+    }
+    assert!(completed, "Late joiner must lock onto periodic control frames and decode");
+}
+
+#[test]
+fn boundary_suite_8_manifest_post_verification_and_stream_gate() {
+    println!("\n--- Suite 8: §17 f) Post-Verification & §13 ⑧⑨ Finalize Gate ---");
+    let text = "Hello AF2 full integrity chain verification!".as_bytes().to_vec();
+    let mut sender = Af2Sender::new(
+        vec![(2, "msg.txt".into(), text.clone())],
+        SenderConfig::default(),
+    )
+    .unwrap();
+    let mut rx = Af2Receiver::new();
+
+    let mut staged_raw = None;
+    for _ in 0..500 {
+        let f = sender.next_frame().unwrap();
+        let ev = rx.ingest(&f).unwrap();
+        if let IngestEvent::ChunkReady { raw, .. } = ev {
+            staged_raw = Some(raw);
+            break;
+        }
+    }
+    let raw = staged_raw.expect("Chunk must complete");
+    // Verify against Manifest table
+    assert!(rx.verify_chunk(0, &raw));
+    // Verify bad hash fails
+    let mut bad_raw = raw.clone();
+    bad_raw[0] ^= 0xFF;
+    assert!(!rx.verify_chunk(0, &bad_raw));
+
+    // Full stream finalization gate
+    rx.verify_final_stream(&raw).expect("Final stream gate must pass");
+    assert!(rx.verify_final_stream(&bad_raw).is_err());
+}

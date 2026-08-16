@@ -207,5 +207,53 @@ Interleave: META 每 ~17 帧广播；ROOT 每 ~31 帧广播；每 ~8 个 Chunk S
 
 ## 9. 跨端职责分工
 
-- **Rust Core 唯一实现**：帧/ROOT/META/Manifest/TLV 编解码、哈希与三层 ID 派生、路径清洗、OTI 验证、状态机、有界解压接口、单一 Receiver Snapshot ABI。
+- **Rust Core 唯一实现**：帧/ROOT/META/Manifest/TLV 编解码、哈希与三层 ID 派生、路径校验、OTI 验证、状态机、有界解压接口、单一 Receiver Snapshot ABI。
 - **宿主层（TS / Kotlin / C#）**：相机与屏幕捕获、QR 灰度解码、文件系统与 IndexedDB 落盘、UI 视图。禁止在宿主语言中镜像线格式协议。
+
+---
+
+## 10. 发送端预处理流水线（SHOULD）
+
+1. **单趟读取**：entry hash、chunk hash、全文 content 派生在同一次读取中完成，禁止为哈希与分块分别通读。
+2. **重发免哈希缓存**：发送端本地按 `(规范路径, size, mtime)` 缓存已算好的 entry_hash / chunk 表 / content_id；命中即零预处理直接开播。mtime 仅为本地缓存失效键，不进协议身份。
+3. **惰性编码**：Chunk 的压缩与 RaptorQ 编码在播放开始后按 playlist 顺序惰性进行，降低峰值内存。
+
+---
+
+## 11. 断点恢复账本（宿主格式，非 wire）
+
+```text
+ledger_version, transfer_id, manifest_hash, content_id(Manifest 后写),
+total_raw_size, chunk_raw_size, chunk_count, completed_bitmap, chunk_hash[](Manifest 后写)
+```
+
+- **提交顺序**：恢复 Encoded → 验 object_id/encoded_hash → 有界解压 → 验 chunk hash → pwrite → fsync 数据 → 写临时账本 fsync → 原子 rename 账本 → 内存置位。
+- **重开复核**：重开任务必须重算已完成位对应范围的 chunk hash，不符位清零（治愈账本虚报）。
+- **跨实例复用**：完成位以 `(transfer_id, chunk_index, raw_hash)` 判定，跨 codec、压缩 level、T、修复调度变化均可复用。
+
+---
+
+## 12. 强制资源上限
+
+| 项 | 上限 |
+|---|---:|
+| T | 256..=2400，8 对齐 |
+| Manifest | 16 MiB |
+| Entry 数 / 单路径 | 4096 / 1024 B |
+| chunk_raw_size | 1..32 MiB 2 的幂（默认 8） |
+| chunk_count / 总大小 | 131072 / 4 TiB（`total_raw_size ≥ 1`） |
+| 单 Encoded Object | 32 MiB（Manifest 16 MiB） |
+| Source Blocks / ESI | 255 / < 2²⁴（触顶循环） |
+| zstd windowLog / XZ 内存 | 23 / 128 MiB |
+| 活跃 Decoder | Manifest 1 + Chunk 1 |
+| 未知 Object 符号缓存 | **0** |
+
+---
+
+## 13. 跨端能力矩阵
+
+| 端 | 发送端支持 | 接收端支持 | 备注 |
+|---|---|---|---|
+| Native (Android / Windows) | RAW, Zstd, XZ | RAW, Zstd, XZ | 全功能 |
+| Web (WASM) | RAW | RAW | 压缩流接收显式报 `UnsupportedCodec` |
+

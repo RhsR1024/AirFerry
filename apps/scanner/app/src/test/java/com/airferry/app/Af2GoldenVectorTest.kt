@@ -34,14 +34,33 @@ class Af2GoldenVectorTest {
         throw IllegalStateException("core/testdata/af2/manifest.json not found above working directory")
     }
 
+    private data class ParsedHeader(
+        val magic: Int,
+        val version: Int,
+        val flags: Int,
+        val sbn: Int,
+        val esi: Long
+    )
+
+    private fun parseWireHeader(bytes: ByteArray): ParsedHeader? {
+        if (bytes.size < 30) return null
+        val magic = ((bytes[0].toInt() and 0xFF) shl 8) or (bytes[1].toInt() and 0xFF)
+        val version = bytes[2].toInt() and 0xFF
+        val flags = bytes[3].toInt() and 0xFF
+        val sbn = bytes[22].toInt() and 0xFF
+        val esi = ((bytes[23].toLong() and 0xFF) shl 16) or
+                ((bytes[24].toLong() and 0xFF) shl 8) or
+                (bytes[25].toLong() and 0xFF)
+        return ParsedHeader(magic, version, flags, sbn, esi)
+    }
+
     @Test
     fun af2GoldenVectors_verifyHeaders() {
         val manifest = loadManifest()
-        val manager = ReceiverSessionManager()
 
         // 1. Verify ROOT frame header
         val rootFrameBytes = unhex(manifest.getString("root_frame_hex"))
-        val rootHeader = manager.parseHeader(rootFrameBytes)
+        val rootHeader = parseWireHeader(rootFrameBytes)
         assertNotNull(rootHeader)
         assertEquals(ReceiverSessionManager.MAGIC, rootHeader!!.magic)
         assertEquals(ReceiverSessionManager.PROTOCOL_VERSION, rootHeader.version)
@@ -49,13 +68,13 @@ class Af2GoldenVectorTest {
 
         // 2. Verify OBJECT_META frame header
         val metaFrameBytes = unhex(manifest.getString("object_meta_frame_hex"))
-        val metaHeader = manager.parseHeader(metaFrameBytes)
+        val metaHeader = parseWireHeader(metaFrameBytes)
         assertNotNull(metaHeader)
         assertEquals(2, metaHeader!!.flags) // FrameTypeObjectMeta = 2
 
         // 3. Verify SYMBOL frame header
         val symbolFrameBytes = unhex(manifest.getString("symbol_frame_hex"))
-        val symbolHeader = manager.parseHeader(symbolFrameBytes)
+        val symbolHeader = parseWireHeader(symbolFrameBytes)
         assertNotNull(symbolHeader)
         assertEquals(3, symbolHeader!!.flags) // FrameTypeSymbol = 3
         assertEquals(1, symbolHeader.sbn)

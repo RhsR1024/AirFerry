@@ -1,17 +1,10 @@
 //! Unified compression interface (Zstd + XZ/LZMA2).
 //!
-//! Only available on native / Android targets. On `wasm32-unknown-unknown` the
-//! underlying C libraries do not compile, so the browser extension performs
-//! compression on the JavaScript side (using the same standard zstd format)
-//! before handing the bytes to the Rust core. The on-wire format is identical,
-//! so bytes compressed on one side decompress correctly on the other.
-//!
-//! ## Algorithm selection
-//!
-//! The wire protocol tags every transfer with a [`COMPRESSION_*`] byte so the
-//! receiver knows which decoder to run. Zstd is the default; XZ (LZMA2) gives
-//! a better ratio for text-heavy payloads. Native Rust implements both directions,
-//! while the browser supplies interoperable zstd/XZ streams from its worker.
+//! Dual-algorithm bounded compression: Zstd (default, fast) and XZ (LZMA2,
+//! higher ratio for text). The strictly-smaller invariant is enforced by AF2
+//! chunk layers before wire emission. On `wasm32-unknown-unknown` the C
+//! compressor libraries are omitted; the web sender transmits uncompressed
+//! RAW chunks.
 
 #![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 
@@ -40,12 +33,8 @@ pub fn is_known_compression_tag(tag: u8) -> bool {
 /// We use level 6 (the default for xz tools) with the EXTREME flag. Level 9
 /// peaks at ~700 MB of memory on the *decoder* side, which OOMs the typical
 /// Android JVM heap (256 MB); level 6 keeps the decoder footprint around
-/// ~95 MB while still compressing text-heavy payloads well.
-///
-/// NOTE: the browser sender (`compress.ts`) uses level 9. The two presets
-/// produce *interoperable* .xz streams (any compliant LZMA2 reader handles
-/// either), so the cross-language link is correct — only the ratio/speed
-/// trade-off differs per side. See `XZ_COMPRESSION_PLAN.md` for the rationale.
+/// ~95 MB while still compressing text-heavy payloads well. Dictionary size
+/// is bounded by `XZ_DECODER_MEMORY_LIMIT` (128 MiB).
 #[cfg(not(target_arch = "wasm32"))]
 const LZMA_PRESET_EXTREME: u32 = 0x8000_0000;
 #[cfg(not(target_arch = "wasm32"))]
