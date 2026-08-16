@@ -8,8 +8,8 @@ using AirFerry.Windows.Bundle;
 using AirFerry.Windows.Models;
 using AirFerry.Windows.Services;
 using AirFerry.Windows.ViewModels;
+using AirFerry.Windows.Controls;
 using Microsoft.Win32;
-using Wpf.Ui.Controls;
 
 namespace AirFerry.Windows.Views;
 

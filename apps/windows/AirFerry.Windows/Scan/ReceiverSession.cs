@@ -117,6 +117,11 @@ public sealed class ReceiverSession : IDisposable
         {
             _everAccepted = true;
             _mismatchStreak = 0;
+            if (s.ReceivedSymbols == 0)
+            {
+                // Relocked in native AF2: clear stale snapshot cache.
+                _cachedSnapshot = null;
+            }
         }
 
         return s;
@@ -175,110 +180,128 @@ public sealed class ReceiverSession : IDisposable
         }
     }
 
-    /// <summary>Original filename from the descriptor, or empty.</summary>
+    // ── descriptor snapshot (ReceiverSnapshotV1) ─────────────────────────────
+    //
+    // The former 16 per-field P/Invoke getters were folded into ONE
+    // `airferry_receiver_snapshot_json` call (native ABI v2). The public
+    // per-field methods below keep their shapes so callers are unchanged, but
+    // read a cached snapshot: descriptor-derived fields are immutable once
+    // `meta_confirmed` is true, so the cache refreshes only until confirmation
+    // and freezes afterwards — one P/Invoke + one JSON parse per session
+    // instead of 16 per UI refresh.
+
+    /// <summary>Parsed <c>ReceiverSnapshotV2</c> fields.</summary>
+    public sealed class Snapshot
+    {
+        public bool MetaConfirmed;
+        public string TransferIdHex = "";
+        public string ContentIdHex = "";
+        public ulong TotalRawSize;
+        public uint EntryCount;
+        public uint ChunkCount;
+        public uint ChunkRawSize;
+        public IReadOnlyList<ManifestEntryDto> Entries = Array.Empty<ManifestEntryDto>();
+    }
+
+    /// <summary>One AF2 Manifest entry (kind/path/offset/size).</summary>
+    public sealed record ManifestEntryDto(int Kind, string Path, ulong Offset, ulong Size);
+
+    private Snapshot? _cachedSnapshot;
+
+    /// <summary>Current snapshot (cached once the manifest has entries).</summary>
+    public Snapshot GetSnapshot()
+    {
+        lock (_gate)
+        {
+            if (!_initialized)
+            {
+                return new Snapshot();
+            }
+            if (_cachedSnapshot is { MetaConfirmed: true, Entries.Count: > 0 } cached)
+            {
+                return cached;
+            }
+            IntPtr ptr = NativeBridge.ReceiverSnapshotJson(_handle);
+            if (ptr == IntPtr.Zero)
+            {
+                return _cachedSnapshot ?? new Snapshot();
+            }
+            try
+            {
+                string json = Marshal.PtrToStringUTF8(ptr) ?? "";
+                using var doc = System.Text.Json.JsonDocument.Parse(
+                    json, new System.Text.Json.JsonDocumentOptions { AllowTrailingCommas = true });
+                var root = doc.RootElement;
+                var snap = new Snapshot
+                {
+                    MetaConfirmed = root.TryGetProperty("meta_confirmed", out var mc) && mc.GetBoolean(),
+                    TransferIdHex = root.TryGetProperty("transfer_id_hex", out var tid) ? tid.GetString() ?? "" : "",
+                    ContentIdHex = root.TryGetProperty("content_id_hex", out var cid) ? cid.GetString() ?? "" : "",
+                    TotalRawSize = root.TryGetProperty("total_raw_size", out var trs) ? trs.GetUInt64() : 0UL,
+                    EntryCount = root.TryGetProperty("entry_count", out var ec) ? (uint)ec.GetUInt64() : 0u,
+                    ChunkCount = root.TryGetProperty("chunk_count", out var cc) ? (uint)cc.GetUInt64() : 0u,
+                    ChunkRawSize = root.TryGetProperty("chunk_raw_size", out var crs) ? (uint)crs.GetUInt64() : 0u,
+                };
+                if (root.TryGetProperty("entries", out var entriesEl) &&
+                    entriesEl.ValueKind == System.Text.Json.JsonValueKind.Array)
+                {
+                    var list = new List<ManifestEntryDto>(entriesEl.GetArrayLength());
+                    foreach (var e in entriesEl.EnumerateArray())
+                    {
+                        list.Add(new ManifestEntryDto(
+                            e.TryGetProperty("kind", out var k) ? k.GetInt32() : 1,
+                            e.TryGetProperty("path", out var p) ? p.GetString() ?? "" : "",
+                            e.TryGetProperty("offset", out var o) ? o.GetUInt64() : 0UL,
+                            e.TryGetProperty("size", out var s) ? s.GetUInt64() : 0UL));
+                    }
+                    snap.Entries = list;
+                }
+                _cachedSnapshot = snap;
+                return snap;
+            }
+            catch (System.Text.Json.JsonException)
+            {
+                return _cachedSnapshot ?? new Snapshot();
+            }
+            finally
+            {
+                NativeBridge.FreeString(ptr);
+            }
+        }
+    }
+
     public string FileName()
     {
-        lock (_gate)
-        {
-        if (!_initialized)
-        {
-            return string.Empty;
-        }
-        return ReadCString(NativeBridge.ReceiverFileName);
-        }
+        var snap = GetSnapshot();
+        var nonDir = snap.Entries.FindAll(e => e.Kind != 3);
+        if (nonDir.Count == 1) return nonDir[0].Path;
+        if (nonDir.Count > 1) return $"多文件传输包 ({nonDir.Count} 项)";
+        if (snap.EntryCount > 1) return $"多文件传输包 ({snap.EntryCount} 项)";
+        return "文件传输";
     }
+    public ulong FileSize() => GetSnapshot().TotalRawSize;
+    public bool IsSegmented() => GetSnapshot().ChunkCount > 1;
+    public uint SegmentIndex() => 0u;
+    public uint SegmentCount() => Math.Max(GetSnapshot().ChunkCount, 1u);
+    public ulong RootOriginalSize() => GetSnapshot().TotalRawSize;
 
-    /// <summary>Original file size, or 0.</summary>
-    public ulong FileSize()
-    {
-        lock (_gate) return _initialized ? NativeBridge.ReceiverFileSize(_handle) : 0UL;
-    }
-
-    /// <summary>Expected CRC32 (unsigned 32-bit in a ulong), or 0.</summary>
-    public ulong Crc32()
-    {
-        lock (_gate) return _initialized ? NativeBridge.ReceiverCrc32(_handle) : 0UL;
-    }
-
-    /// <summary>
-    /// True if the descriptor supplied a real CRC32 (so the receiver should
-    /// verify it). Use this — NOT <c>Crc32() == 0</c> — to decide whether to
-    /// verify: CRC32 can legitimately be 0.
-    /// </summary>
-    public bool Crc32Known()
-    {
-        lock (_gate) return _initialized && NativeBridge.ReceiverCrc32Known(_handle) == 1;
-    }
-
-    // ── descriptor-v5 segment metadata (large-transfer child objects) ───────
-
-    /// <summary>1 if the confirmed descriptor was a v5 large-transfer child object.</summary>
-    public bool IsSegmented()
-    {
-        lock (_gate) return _initialized && NativeBridge.ReceiverIsSegmented(_handle) == 1;
-    }
-
-    /// <summary>Zero-based index of this segment within the root transfer (0 if not segmented).</summary>
-    public uint SegmentIndex()
-    {
-        lock (_gate) return _initialized ? NativeBridge.ReceiverSegmentIndex(_handle) : 0u;
-    }
-
-    /// <summary>Total segment count of the root transfer (1 if not segmented).</summary>
-    public uint SegmentCount()
-    {
-        lock (_gate) return _initialized ? NativeBridge.ReceiverSegmentCount(_handle) : 1u;
-    }
-
-    /// <summary>Root (whole-file) original size in bytes (0 if not segmented).</summary>
-    public ulong RootOriginalSize()
-    {
-        lock (_gate) return _initialized ? NativeBridge.ReceiverRootOriginalSize(_handle) : 0UL;
-    }
-
-    /// <summary>Original (uncompressed) offset of this segment in the root file (0 if not segmented).</summary>
-    public ulong OriginalOffset()
-    {
-        lock (_gate) return _initialized ? NativeBridge.ReceiverOriginalOffset(_handle) : 0UL;
-    }
-
-    /// <summary>Root session id low 64 bits (whole transfer id), or 0 if not segmented.</summary>
-    public ulong RootSessionIdLo()
-    {
-        lock (_gate) return _initialized ? NativeBridge.ReceiverRootSessionIdLo(_handle) : 0UL;
-    }
-
-    /// <summary>Root session id high 64 bits, or 0 if not segmented.</summary>
-    public ulong RootSessionIdHi()
-    {
-        lock (_gate) return _initialized ? NativeBridge.ReceiverRootSessionIdHi(_handle) : 0UL;
-    }
-
-    /// <summary>32-byte SHA-256 of this segment's uncompressed bytes, or empty if not segmented.</summary>
-    public byte[] RawSha256()
+    public byte[]? AssembleChunk(uint index)
     {
         lock (_gate)
         {
-            if (!_initialized) return Array.Empty<byte>();
-            var len = NativeBridge.ReceiverRawSha256(_handle, null, 0);
-            if (len == 0) return Array.Empty<byte>();
-            var buf = new byte[len];
-            NativeBridge.ReceiverRawSha256(_handle, buf, len);
-            return buf;
-        }
-    }
-
-    /// <summary>32-byte SHA-256 of the complete root file, or empty if not segmented.</summary>
-    public byte[] RootSha256()
-    {
-        lock (_gate)
-        {
-            if (!_initialized) return Array.Empty<byte>();
-            var len = NativeBridge.ReceiverRootSha256(_handle, null, 0);
-            if (len == 0) return Array.Empty<byte>();
-            var buf = new byte[len];
-            NativeBridge.ReceiverRootSha256(_handle, buf, len);
-            return buf;
+            if (!_initialized) return null;
+            int ok = NativeBridge.ReceiverAssembleChunk(_handle, index, out IntPtr buf, out nuint len);
+            if (ok == 0 || buf == IntPtr.Zero || len == 0) return null;
+            try
+            {
+                byte[] data = new byte[(int)len];
+                Marshal.Copy(buf, data, 0, (int)len);
+                return data;
+            }
+            finally
+            {
+                NativeBridge.BufferFree(buf, len);
+            }
         }
     }
 
@@ -296,56 +319,15 @@ public sealed class ReceiverSession : IDisposable
     {
         lock (_gate)
         {
-        if (!_initialized)
-        {
-            return null;
-        }
-        int ok = NativeBridge.ReceiverAssemble(_handle, out IntPtr buf, out nuint len);
-        if (ok == 0 || buf == IntPtr.Zero || len == 0)
-        {
-            return null;
-        }
-        if (len > int.MaxValue)
-        {
-            NativeBridge.BufferFree(buf, len);
-            return null;
-        }
-        try
-        {
-            // Copy the whole recovered object (may include trailing zero pad).
-            byte[] all = new byte[(int)len];
-            Marshal.Copy(buf, all, 0, (int)len);
-            ulong original = NativeBridge.ReceiverFileSize(_handle);
-            // Trim zero-padding back to the true length. If the descriptor
-            // didn't carry a size (0), keep the whole recovered buffer.
-            int truncLen = original > 0 && original <= len
-                ? (int)original : (int)len;
-            if (truncLen == all.Length)
+            if (!_initialized)
             {
-                return all;
+                return null;
             }
-            Array.Resize(ref all, truncLen);
-            return all;
-        }
-        finally
-        {
-            // Always release the Rust allocation, even on exception.
-            NativeBridge.BufferFree(buf, len);
-        }
-        }
-    }
-
-    /// <summary>
-    /// Reassemble this segment's transmitted (compressed) bytes as received,
-    /// without decompression. Returns the raw bytes, or null when incomplete.
-    /// </summary>
-    public byte[]? AssembleRaw()
-    {
-        lock (_gate)
-        {
-            if (!_initialized) return null;
-            int ok = NativeBridge.ReceiverAssembleRaw(_handle, out IntPtr buf, out nuint len);
-            if (ok == 0 || buf == IntPtr.Zero || len == 0) return null;
+            int ok = NativeBridge.ReceiverAssemble(_handle, out IntPtr buf, out nuint len);
+            if (ok == 0 || buf == IntPtr.Zero || len == 0)
+            {
+                return null;
+            }
             if (len > int.MaxValue)
             {
                 NativeBridge.BufferFree(buf, len);
@@ -364,23 +346,11 @@ public sealed class ReceiverSession : IDisposable
         }
     }
 
-    /// <summary>Compression-algorithm tag of the confirmed descriptor.</summary>
-    public byte Compression()
-    {
-        lock (_gate) return _initialized ? NativeBridge.ReceiverCompression(_handle) : (byte)0;
-    }
+    /// <summary>This object's transmitted payload length.</summary>
+    public ulong CompressedSize() => GetSnapshot().TotalRawSize;
 
-    /// <summary>This object's transmitted (compressed) payload length.</summary>
-    public ulong CompressedSize()
-    {
-        lock (_gate) return _initialized ? NativeBridge.ReceiverCompressedSize(_handle) : 0UL;
-    }
-
-    /// <summary>Whole decompressed original size (same across segments of a root).</summary>
-    public ulong OriginalSize()
-    {
-        lock (_gate) return _initialized ? NativeBridge.ReceiverOriginalSize(_handle) : 0UL;
-    }
+    /// <summary>Whole decompressed original size.</summary>
+    public ulong OriginalSize() => GetSnapshot().TotalRawSize;
 
     /// <summary>Session id as a lowercase hex string (high||low, 32 chars).</summary>
     public string SessionIdHex()
@@ -390,6 +360,26 @@ public sealed class ReceiverSession : IDisposable
             string lo = _sessionIdLo.ToString("x16");
             string hi = _sessionIdHi.ToString("x16");
             return hi + lo;
+        }
+    }
+
+    /// <summary>True when the id equals the locked session's (false while uninitialized).</summary>
+    public bool MatchesLocked(ulong lo, ulong hi)
+    {
+        lock (_gate)
+        {
+            return _initialized && lo == _sessionIdLo && hi == _sessionIdHi;
+        }
+    }
+
+    /// <summary>The locked session id, for frame-level filtering (false while uninitialized).</summary>
+    public bool TryGetLockedSessionId(out ulong lo, out ulong hi)
+    {
+        lock (_gate)
+        {
+            lo = _sessionIdLo;
+            hi = _sessionIdHi;
+            return _initialized;
         }
     }
 
@@ -403,34 +393,7 @@ public sealed class ReceiverSession : IDisposable
         _initialized = _handle != IntPtr.Zero;
         _mismatchStreak = 0;
         _everAccepted = false;
-    }
-
-    /// <summary>
-    /// Shared helper for the two-pass length protocol used by
-    /// <c>ReceiverFileName</c> / <c>ReceiverProgressJson</c>.
-    /// </summary>
-    private delegate nuint StringReader(IntPtr handle, byte[]? buf, nuint cap);
-
-    private string ReadCString(StringReader reader)
-    {
-        nuint needed = reader(_handle, null, 0);
-        if (needed == 0)
-        {
-            return string.Empty;
-        }
-        if (needed > int.MaxValue)
-        {
-            return string.Empty;
-        }
-        byte[] buf = new byte[(int)needed];
-        nuint written = reader(_handle, buf, (nuint)buf.Length);
-        if (written == 0)
-        {
-            return string.Empty;
-        }
-        // The buffer is NUL-terminated; the last byte is the NUL.
-        int len = (int)written - 1;
-        return len > 0 ? Encoding.UTF8.GetString(buf, 0, len) : string.Empty;
+        _cachedSnapshot = null;
     }
 
     public void Destroy()

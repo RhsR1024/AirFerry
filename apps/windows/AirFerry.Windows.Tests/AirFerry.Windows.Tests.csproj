@@ -33,11 +33,10 @@
     <Compile Include="..\AirFerry.Windows\Scan\ProgressSnapshot.cs" Link="Scan\ProgressSnapshot.cs" />
     <Compile Include="..\AirFerry.Windows\Scan\PreviewFrame.cs" Link="Scan\PreviewFrame.cs" />
     <Compile Include="..\AirFerry.Windows\Scan\ZxingDecoder.cs" Link="Scan\ZxingDecoder.cs" />
-    <Compile Include="..\AirFerry.Windows\Bundle\BundleParser.cs" Link="Bundle\BundleParser.cs" />
-    <Compile Include="..\AirFerry.Windows\Bundle\TextParser.cs" Link="Bundle\TextParser.cs" />
     <Compile Include="..\AirFerry.Windows\Bundle\FileNameUtil.cs" Link="Bundle\FileNameUtil.cs" />
     <Compile Include="..\AirFerry.Windows\Bundle\ShareExport.cs" Link="Bundle\ShareExport.cs" />
     <Compile Include="..\AirFerry.Windows\Bundle\ContinuousSave.cs" Link="Bundle\ContinuousSave.cs" />
+    <Compile Include="..\AirFerry.Windows\Bundle\ContentStore.cs" Link="Bundle\ContentStore.cs" />
     <Compile Include="..\AirFerry.Windows\Services\AppSettings.cs" Link="Services\AppSettings.cs" />
     <Compile Include="..\AirFerry.Windows\Native\NativeBridge.cs" Link="Native\NativeBridge.cs" />
     <Compile Include="..\AirFerry.Windows\Native\NativeZxingBridge.cs" Link="Native\NativeZxingBridge.cs" />

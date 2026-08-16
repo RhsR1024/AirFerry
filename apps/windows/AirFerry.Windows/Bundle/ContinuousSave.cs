@@ -54,6 +54,20 @@ public sealed record ContinuousSaveReport(
 /// fresh copy.
 /// Single-threaded by design: the recovery pipeline runs one save at a time.
 /// </summary>
+/// <summary>
+/// Descriptor facts of one incoming transfer — all known the moment its
+/// descriptor is confirmed, and the input to the pre-scan duplicate check.
+/// </summary>
+/// <param name="Identity">Content-derived session id, or the root id of a
+/// segmented transfer (same across all its segments).</param>
+/// <param name="Name">Descriptor file name.</param>
+/// <param name="Size">Decompressed original size.</param>
+/// <param name="Crc32">CRC32 over the whole original, null when unknown.</param>
+/// <param name="RootSha256Hex">Whole-file SHA-256 (segmented descriptor-v5
+/// only), lowercase hex; null otherwise.</param>
+public sealed record TransferProbe(
+    string Identity, string Name, long Size, uint? Crc32, string? RootSha256Hex);
+
 public sealed class ContinuousSaver
 {
     /// <summary>
@@ -65,6 +79,17 @@ public sealed class ContinuousSaver
     /// </summary>
     private const string BundleMarkerFileName = ".airferry-bundle-id";
 
+    /// <summary>
+    /// Hidden index file in the target folder root persisting the dedup
+    /// records, so the pre-scan skip survives app restarts. Dedup truth
+    /// travels with the data, same as the bundle markers: copying the folder
+    /// elsewhere carries the index, deleting it resets dedup.
+    /// </summary>
+    private const string IndexFileName = ".airferry-continuous-index.json";
+
+    /// <summary>Cap on persisted records; the oldest by updatedAt are evicted.</summary>
+    private const int MaxIndexEntries = 4096;
+
     /// <summary>Where a digest was previously saved, for re-verified skips.</summary>
     private sealed record SavedRecord(string Path, bool IsBundle);
 
@@ -75,8 +100,96 @@ public sealed class ContinuousSaver
 
     private sealed record BundleMemberManifestEntry(string Name, long Size, string Sha256);
 
+    /// <summary>One persisted dedup record; names are plain relative file names.</summary>
+    private sealed record IndexEntry(
+        string Identity, string Digest, string Kind, string SavedName,
+        string Name, long Size, uint? Crc32, long UpdatedAt);
+
+    /// <summary>Content lookup key for renamed / re-touched re-sends.</summary>
+    private readonly record struct TripleKey(string Name, long Size, uint Crc32);
+
     private readonly string _dir;
     private readonly Dictionary<string, SavedRecord> _saved = new(StringComparer.Ordinal);
+    /// <summary>Transfer identity (session/root id) → saved content digest.</summary>
+    private readonly Dictionary<string, string> _transferIdentity = new(StringComparer.Ordinal);
+    /// <summary>(name, size, crc32) → saved content digest.</summary>
+    private readonly Dictionary<TripleKey, string> _byTriple = new();
+    /// <summary>Persisted records backing both lookup maps.</summary>
+    private readonly List<IndexEntry> _entries = new();
+
+    /// <summary>
+    /// Record a transfer as received, mapped to the content digest it was
+    /// saved under. Enables the pre-scan duplicate check below — across
+    /// restarts too, via the persisted index. The probe's descriptor facts are
+    /// recorded alongside, so a renamed or re-touched re-send (new session id,
+    /// same content) is still caught pre-scan. Reports with an empty digest
+    /// (or without a verified on-disk record to point at) are ignored.
+    /// </summary>
+    public void MarkTransfer(TransferProbe probe, ContinuousSaveReport report)
+    {
+        string digest = report.Sha256Hex;
+        if (string.IsNullOrEmpty(digest) ||
+            string.IsNullOrEmpty(probe.Identity) ||
+            string.IsNullOrEmpty(probe.Name))
+        {
+            return;
+        }
+        if (!_saved.TryGetValue(digest, out SavedRecord? record))
+        {
+            return;
+        }
+        string savedName = Path.GetFileName(record.Path);
+        if (string.IsNullOrEmpty(savedName))
+        {
+            return;
+        }
+        AddEntry(new IndexEntry(
+            probe.Identity, digest, record.IsBundle ? "bundle" : "file",
+            savedName, probe.Name, probe.Size, probe.Crc32,
+            DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
+        EvictOverflow();
+        PersistIndex();
+    }
+
+    /// <summary>
+    /// Pre-scan duplicate check: true only when the incoming transfer matches a
+    /// previous save AND its folder copy still verifies intact — a deleted or
+    /// tampered previous copy must stay recoverable, so a stale record never
+    /// blocks receiving again. Three levels, strongest first:
+    /// ① the exact transfer identity (content-derived session/root id);
+    /// ② the segmented root SHA-256 — cryptographic, catches renamed re-sends
+    ///   of single-file transfers (bundle/text digests are over the container,
+    ///   not the descriptor root hash; those fall back to ① or post-scan);
+    /// ③ the (name, size, CRC32) triple — CRC32 is NOT an authenticator, but a
+    ///   same-name same-size match implies equal content in practice (~2⁻³²
+    ///   accidental collision per pair); the post-scan save-time dedup remains
+    ///   as the backstop either way.
+    /// </summary>
+    public bool ShouldSkipTransfer(TransferProbe probe)
+    {
+        if (_transferIdentity.TryGetValue(probe.Identity, out string? digest) &&
+            VerifyDigest(digest))
+        {
+            return true;
+        }
+        if (probe.RootSha256Hex is { Length: 64 } rootSha &&
+            VerifyDigest(rootSha))
+        {
+            return true;
+        }
+        if (probe.Crc32 is uint crc &&
+            _byTriple.TryGetValue(
+                new TripleKey(probe.Name, probe.Size, crc), out string? tripleDigest) &&
+            VerifyDigest(tripleDigest))
+        {
+            return true;
+        }
+        return false;
+    }
+
+    private bool VerifyDigest(string digest) =>
+        _saved.TryGetValue(digest, out SavedRecord? record) &&
+        VerifySavedRecord(record, digest);
 
     public ContinuousSaver(string targetDir)
     {
@@ -85,6 +198,7 @@ public sealed class ContinuousSaver
             throw new ArgumentException("持续接收目录不能为空", nameof(targetDir));
         }
         _dir = targetDir;
+        LoadIndex();
     }
 
     public string TargetDir => _dir;
@@ -384,6 +498,170 @@ public sealed class ContinuousSaver
         catch
         {
             return null;
+        }
+    }
+
+    /// <summary>
+    /// Hydrate the dedup records from <see cref="IndexFileName"/> in the target
+    /// folder. A missing or corrupt index starts empty — dedup then degrades
+    /// to the save-time checks, never blocks receiving. Every entry is
+    /// validated defensively: the file lives in a user-writable folder.
+    /// </summary>
+    private void LoadIndex()
+    {
+        try
+        {
+            string path = Path.Combine(_dir, IndexFileName);
+            if (!File.Exists(path))
+            {
+                return;
+            }
+            using JsonDocument doc = JsonDocument.Parse(File.ReadAllText(path));
+            if (!doc.RootElement.TryGetProperty("entries", out JsonElement entries) ||
+                entries.ValueKind != JsonValueKind.Array)
+            {
+                return;
+            }
+            foreach (JsonElement el in entries.EnumerateArray())
+            {
+                if (ParseEntry(el) is { } entry)
+                {
+                    AddEntry(entry);
+                }
+            }
+            EvictOverflow();
+        }
+        catch
+        {
+            // Corrupt/unreadable index mid-parse — drop partial state.
+            _entries.Clear();
+            _transferIdentity.Clear();
+            _byTriple.Clear();
+            _saved.Clear();
+        }
+    }
+
+    private static IndexEntry? ParseEntry(JsonElement el)
+    {
+        try
+        {
+            string? identity = el.GetProperty("identity").GetString();
+            string? digest = el.GetProperty("digest").GetString();
+            string? kind = el.GetProperty("kind").GetString();
+            string? savedName = el.GetProperty("savedName").GetString();
+            string? name = el.GetProperty("name").GetString();
+            long size = el.GetProperty("size").GetInt64();
+            uint? crc32 =
+                el.TryGetProperty("crc32", out JsonElement c) &&
+                c.ValueKind == JsonValueKind.Number
+                    ? c.GetUInt32()
+                    : null;
+            long updatedAt =
+                el.TryGetProperty("updatedAt", out JsonElement u) &&
+                u.ValueKind == JsonValueKind.Number
+                    ? u.GetInt64()
+                    : 0;
+            if (identity is not { Length: 32 } || identity.Any(ch => !Uri.IsHexDigit(ch)))
+            {
+                return null;
+            }
+            if (digest is not { Length: 64 } || digest.Any(ch => !Uri.IsHexDigit(ch)))
+            {
+                return null;
+            }
+            if (kind is not ("file" or "bundle"))
+            {
+                return null;
+            }
+            // Records must stay inside the target folder: plain relative names
+            // only — reject anything path-shaped.
+            if (string.IsNullOrEmpty(savedName) ||
+                Path.GetFileName(savedName) != savedName)
+            {
+                return null;
+            }
+            if (name is null || size <= 0)
+            {
+                return null;
+            }
+            return new IndexEntry(
+                identity, digest, kind, savedName, name, size, crc32, updatedAt);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private void AddEntry(IndexEntry entry)
+    {
+        _entries.RemoveAll(e => e.Identity == entry.Identity);
+        _entries.Add(entry);
+        _transferIdentity[entry.Identity] = entry.Digest;
+        _saved[entry.Digest] = new SavedRecord(
+            Path.Combine(_dir, entry.SavedName), entry.Kind == "bundle");
+        if (entry.Crc32 is uint crc)
+        {
+            _byTriple[new TripleKey(entry.Name, entry.Size, crc)] = entry.Digest;
+        }
+    }
+
+    private void EvictOverflow()
+    {
+        while (_entries.Count > MaxIndexEntries)
+        {
+            int oldest = 0;
+            for (int i = 1; i < _entries.Count; i++)
+            {
+                if (_entries[i].UpdatedAt < _entries[oldest].UpdatedAt)
+                {
+                    oldest = i;
+                }
+            }
+            IndexEntry victim = _entries[oldest];
+            _entries.RemoveAt(oldest);
+            _transferIdentity.Remove(victim.Identity);
+            if (victim.Crc32 is uint crc)
+            {
+                _byTriple.Remove(new TripleKey(victim.Name, victim.Size, crc));
+            }
+            // _saved keeps the digest record: it costs nothing and is always
+            // re-verified against the folder's actual bytes before use.
+        }
+    }
+
+    /// <summary>
+    /// Persist the dedup records atomically (temp + flush-to-disk + rename).
+    /// Best-effort: the folder may be read-only or a removable drive that was
+    /// unplugged — a failed write never fails the save; in-memory dedup keeps
+    /// working for the rest of the run.
+    /// </summary>
+    private void PersistIndex()
+    {
+        try
+        {
+            var payload = new
+            {
+                version = 1,
+                entries = _entries.Select(e => new
+                {
+                    identity = e.Identity,
+                    digest = e.Digest,
+                    kind = e.Kind,
+                    savedName = e.SavedName,
+                    name = e.Name,
+                    size = e.Size,
+                    crc32 = e.Crc32,
+                    updatedAt = e.UpdatedAt,
+                }).ToArray(),
+            };
+            WriteAtomic(
+                Path.Combine(_dir, IndexFileName),
+                JsonSerializer.SerializeToUtf8Bytes(payload));
+        }
+        catch
+        {
+            // Best-effort — see the doc above.
         }
     }
 

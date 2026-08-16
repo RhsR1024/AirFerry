@@ -42,10 +42,13 @@
     <PackageReference Include="DirectShowLib.Standard" Version="1.0.0" />
     <!-- MVVM source generators (ObservableObject, RelayCommand). -->
     <PackageReference Include="CommunityToolkit.Mvvm" Version="8.2.2" />
-    <!-- Fluent Design UI (lepo.co WPF-UI): themed controls, light/dark theme
-         dictionaries, FluentWindow chrome, symbol icons. Win10-compatible
-         (Mica backdrop degrades gracefully; we use WindowBackdropType=None). -->
-    <PackageReference Include="WPF-UI" Version="4.3.0" />
+    <!-- HandyControl themed controls: skin dictionaries (light/dark swapped at
+         runtime), hc:Window chrome with caption buttons, hc:Card, themed
+         MessageBox. The AirFerry brand palette is layered on top in
+         Themes/AirFerry.xaml (accent #2563EB + WPF-UI-era brush key aliases).
+         No icon font ships with the library — glyphs use the system Segoe MDL2
+         Assets font via the GlyphIcon style. Win10-compatible (no Mica). -->
+    <PackageReference Include="HandyControl" Version="3.5.1" />
   </ItemGroup>
 
   <ItemGroup>

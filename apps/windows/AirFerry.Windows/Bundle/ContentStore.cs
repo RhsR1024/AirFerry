@@ -2,7 +2,6 @@ using System.IO;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using AirFerry.Windows.ViewModels;
 
 namespace AirFerry.Windows.Bundle;
 
@@ -255,13 +254,18 @@ public static class ContentStore
         }
     }
 
+    /// <summary>Legacy archive directory, retained only for one-time migration.</summary>
+    private static string LegacyReceivedDir =>
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+            "AirFerry", "received");
+
     /// <summary>Import legacy Documents/AirFerry/received once if store is empty.</summary>
     public static void MigrateLegacyReceivedIfNeeded()
     {
         lock (Gate)
         {
             if (LoadIndex().Count > 0) return;
-            string legacy = ScanViewModel.ReceivedDir;
+            string legacy = LegacyReceivedDir;
             if (!Directory.Exists(legacy)) return;
             foreach (string f in Directory.EnumerateFiles(legacy, "*", SearchOption.AllDirectories))
             {

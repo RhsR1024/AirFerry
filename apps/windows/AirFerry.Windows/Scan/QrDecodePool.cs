@@ -197,8 +197,11 @@ public sealed class QrDecodePool : IDisposable
                     FlushPending(pending);
                 }
             }
-            catch
+            catch (Exception ex)
             {
+                // A persistently failing native decode used to vanish here with
+                // no trace; keep the batch-drop behavior but leave a breadcrumb.
+                System.Diagnostics.Debug.WriteLine($"[QrDecodePool] decode/flush failed: {ex}");
                 pending.Clear();
             }
             finally

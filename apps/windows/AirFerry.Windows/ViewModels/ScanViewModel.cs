@@ -56,11 +56,29 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     private const int PreviewFps = 15;
     private const int RateWindowSeconds = 3;
     private const int RateMinMilliseconds = 500;
-    private string? _resumeRootId;
-    /// <summary>Disk-backed assembler for a descriptor-v5 large transfer (null = none).</summary>
-    private AirFerry.Windows.Bundle.SegmentAssembler? _segAssembler;
     /// <summary>Continuous-receive folder sink (null = single-receive mode).</summary>
     private AirFerry.Windows.Bundle.ContinuousSaver? _continuousSaver;
+    /// <summary>
+    /// Continuous mode: frames of a pre-scan-skipped transfer are dropped at
+    /// the header level so a looping sender cannot re-lock the fresh receiver.
+    /// </summary>
+    private ulong _ignoreSessionLo;
+    private ulong _ignoreSessionHi;
+    private bool _ignoreSessionActive;
+    /// <summary>
+    /// Timestamp of the last accepted symbol. A different-session descriptor
+    /// may only take over the receiver after the current stream has gone
+    /// silent for this long — guards against thrash when two senders are
+    /// visible at once while still letting a sender switch be picked up.
+    /// </summary>
+    private long _lastAcceptedTimestamp;
+    private static readonly long RelockSilenceTicks = (long)(1.5 * Stopwatch.Frequency);
+    /// <summary>Re-lock request set by OnDecoded (under IngestLock) when a
+    /// different-session descriptor arrives during silence; serviced by
+    /// RefreshProgress on the UI cadence to keep the lock order uniform.</summary>
+    private long _relockPending;
+    /// <summary>Session whose pre-scan duplicate checks already ran (once per receiver).</summary>
+    private ReceiverSession? _preScanCheckedSession;
 
     private sealed record AssembledPayload(
         byte[] Bytes,
@@ -78,15 +96,6 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         ulong FileSize,
         uint SymbolSize,
         int EstimatedTotalSymbols);
-
-    public ScanViewModel(string? resumeRootId = null)
-    {
-        if (resumeRootId is null) return;
-        string normalized = resumeRootId.Trim().ToLowerInvariant();
-        if (normalized.Length != 32 || normalized.Any(c => !Uri.IsHexDigit(c)))
-            throw new ArgumentException("待恢复任务 ID 无效", nameof(resumeRootId));
-        _resumeRootId = normalized;
-    }
 
     /// <summary>The frame source chosen in the device-select page.</summary>
     [ObservableProperty]
@@ -203,11 +212,6 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     }
 
 
-    /// <summary>Legacy archive directory, retained only for one-time migration.</summary>
-    public static string ReceivedDir =>
-        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
-            "AirFerry", "received");
-
     /// <summary>Temp dir for staging recovered bytes before archive.</summary>
     private static string TempDir => Path.Combine(Path.GetTempPath(), "AirFerry");
 
@@ -229,11 +233,6 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             }
         }
         Interlocked.Increment(ref _sessionEpoch);
-        // 清掉上一次传输残留的分段装配器，避免新一轮扫描读到旧任务的状态文案
-        // （分段账本本身落盘持久，段数据由 SegmentAssembler.Open→Resume 恢复，
-        // 置空引用不丢段）。注意：_resumeRootId 由构造函数在 StartScan 之前注入，
-        // 且本方法下方与 HandleSegmentedTransfer 都依赖它过滤目标传输，不能在此清空。
-        _segAssembler = null;
         SelectedSource = source;
         IsComplete = false;
         IsRecovering = false;
@@ -243,6 +242,10 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         LossRatioText = "0.0%";
         ResetLiveMetrics();
         RecoveryStageText = string.Empty;
+        _ignoreSessionActive = false;
+        _preScanCheckedSession = null;
+        Volatile.Write(ref _lastAcceptedTimestamp, 0);
+        Volatile.Write(ref _relockPending, 0);
 
         try
         {
@@ -280,9 +283,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             _producerThread.Start();
 
             IsScanning = true;
-            StatusText = _resumeRootId is null
-                ? $"正在扫描… 视频源: {source.DisplayName}"
-                : $"正在继续任务 {_resumeRootId[..8]}…，其他文件会被忽略";
+            StatusText = $"正在扫描… 视频源: {source.DisplayName}";
         }
         catch (Exception ex)
         {
@@ -565,6 +566,40 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         {
             return false;
         }
+        if (ContinuousMode)
+        {
+            FrameHeader? parsed = FrameHeader.Parse(payload);
+            if (parsed is { } h)
+            {
+                // Frames of a transfer already skipped as a pre-scan duplicate
+                // never reach the native session — a looping sender must not
+                // occupy the receiver (or the UI) again.
+                if (_ignoreSessionActive &&
+                    h.SessionIdLo == _ignoreSessionLo &&
+                    h.SessionIdHi == _ignoreSessionHi)
+                {
+                    return false;
+                }
+                // The sender switched files: once a session has accepted
+                // symbols, ReceiverSession's own mismatch re-init never fires,
+                // which used to strand the receiver on a dead transfer until
+                // the user stopped and restarted the scan. In continuous mode
+                // a descriptor for a DIFFERENT session requests a re-lock once
+                // the current stream has been silent briefly. The swap itself
+                // runs on the UI refresh cadence — performing it here would
+                // take _lifecycleGate while already holding the pool's
+                // IngestLock, the inverse of every other swap path's lock
+                // order (AB-BA deadlock with a concurrent StopScan-side swap).
+                if (h.IsDescriptor && session.IsInitialized &&
+                    !session.MatchesLocked(h.SessionIdLo, h.SessionIdHi) &&
+                    Stopwatch.GetTimestamp() - Volatile.Read(ref _lastAcceptedTimestamp)
+                        > RelockSilenceTicks)
+                {
+                    Volatile.Write(ref _relockPending, 1);
+                    return false;
+                }
+            }
+        }
         IngestStatus? status = session.Ingest(payload);
         if (status is null)
         {
@@ -572,6 +607,10 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         }
         IngestStatus s = status.Value;
         int epoch = Volatile.Read(ref _sessionEpoch);
+        if (s.Accepted)
+        {
+            Volatile.Write(ref _lastAcceptedTimestamp, Stopwatch.GetTimestamp());
+        }
 
         if (s.Complete)
         {
@@ -615,7 +654,9 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         {
             if (epoch != Volatile.Read(ref _sessionEpoch) ||
                 !ReferenceEquals(session, _session) ||
-                !ReferenceEquals(pool, _pool))
+                !ReferenceEquals(pool, _pool) ||
+                // a recovery may already own the pipeline
+                _recoveryCoreTask is not null)
             {
                 return;
             }
@@ -632,15 +673,13 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         }
         catch (Exception ex)
         {
-            bool reset = ResetReceiverAfterRecoveryFailure(session, pool, epoch);
+            ResetReceiverAfterRecoveryFailure(session, pool, epoch);
             if (epoch == Volatile.Read(ref _sessionEpoch))
             {
                 IsComplete = false;
                 IsRecovering = false;
                 RecoveryStageText = string.Empty;
-                StatusText = reset
-                    ? $"当前分段校验失败，可重新扫码: {ex.Message}"
-                    : $"恢复失败: {ex.Message}";
+                StatusText = $"恢复失败: {ex.Message}";
             }
             return;
         }
@@ -655,41 +694,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             }
         }
 
-        if (epoch != Volatile.Read(ref _sessionEpoch))
-        {
-            return;
-        }
-
-        IsRecovering = false;
-        RecoveryStageText = string.Empty;
-        if (outcome.Result is null && outcome.ContinuousReport is null)
-        {
-            // A large-transfer segment was stored but the transfer is not yet
-            // complete — keep scanning for the remaining segments.
-            if (_segAssembler is not null)
-            {
-                IsComplete = false;
-                StatusText = _segAssembler.IsComplete()
-                    ? "正在合并分段…"
-                    : $"分段 {_segAssembler.ReceivedCount()}/{_segAssembler.SegmentCount()} 已收，继续扫描下一段…";
-                return;
-            }
-            IsComplete = false;
-            StatusText = _resumeRootId is null
-                ? "组装失败"
-                : $"等待任务 {_resumeRootId[..8]}… 的分段，其他文件已忽略";
-            return;
-        }
-        if (saver is not null && outcome.ContinuousReport is not null)
-        {
-            // Continuous mode: record the folder save, re-arm a fresh receiver
-            // and keep scanning — no navigation, no teardown.
-            RecordContinuousOutcome(saver, outcome.ContinuousReport);
-            ContinueNextTransfer(session, pool, epoch);
-            return;
-        }
-        StatusText = "接收完成";
-        TransferCompleted?.Invoke(outcome.Result!);
+        HandleRecoveryOutcome(session, pool, epoch, saver, outcome);
     }
 
     private RecoveryOutcome RecoverAndStageCore(
@@ -697,18 +702,6 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         AirFerry.Windows.Bundle.ContinuousSaver? saver)
     {
         pool.IngestStopped = true;
-
-        // descriptor-v5 large transfer: store this segment into the disk-backed
-        // assembler and return once every segment has arrived.
-        if (pool.RunExclusive(() => session.IsSegmented()))
-        {
-            return HandleSegmentedTransfer(session, pool, saver);
-        }
-        if (_resumeRootId is not null)
-        {
-            SwapReceiverForNextSegment(session, pool);
-            return RecoveryOutcome.None();
-        }
 
         // Take one coherent native snapshot under the ingest lock. No metadata
         // getter is allowed to outlive or race disposal of the native handle.
@@ -726,19 +719,100 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         });
         if (payload is null)
         {
-            SwapReceiverForNextSegment(session, pool);
+            return RecoveryOutcome.None();
+        }
+
+        // AF2: classify from the Manifest entry table (kind 2 = UTF8_TEXT,
+        // multiple non-directory entries = bundle, else single file).
+        IReadOnlyList<ReceiverSession.ManifestEntryDto> entries = Array.Empty<ReceiverSession.ManifestEntryDto>();
+        try
+        {
+            entries = pool.RunExclusive(() => session.GetSnapshot().Entries)
+                .Where(e => e.Kind != 3).ToList();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Session torn down mid-recovery; nothing to stage.
             return RecoveryOutcome.None();
         }
 
         ulong receivedCrc = Crc32.Compute(payload.Bytes);
-        ClassifiedPayload classified = ClassifyRecovered(
-            payload.Bytes, payload.DisplayName, payload.OriginalSize);
+        ClassifiedPayload classified = ClassifyAf2Recovered(
+            payload.Bytes, entries, payload.DisplayName);
         if (saver is not null)
         {
             return RecoveryOutcome.Continuous(TrySaveContinuous(saver, classified));
         }
         return RecoveryOutcome.Single(StageClassified(
             classified, payload.ExpectedCrc, payload.CrcKnown, receivedCrc));
+    }
+
+    /// <summary>
+    /// Classify an assembled AF2 Canonical Content Stream using the Manifest
+    /// entry table — no wire-magic sniffing. Slicing is bounds-checked; an
+    /// out-of-range entry falls back to empty bytes for that member rather
+    /// than throwing.
+    /// </summary>
+    private static ClassifiedPayload ClassifyAf2Recovered(
+        byte[] stream,
+        IReadOnlyList<ReceiverSession.ManifestEntryDto> entries,
+        string displayName)
+    {
+        static byte[] Slice(byte[] s, ReceiverSession.ManifestEntryDto e)
+        {
+            long off = (long)e.Offset;
+            long len = (long)e.Size;
+            if (off < 0 || len < 0 || off + len > s.LongLength)
+            {
+                return Array.Empty<byte>();
+            }
+            byte[] outBuf = new byte[len];
+            Array.Copy(s, off, outBuf, 0, len);
+            return outBuf;
+        }
+
+        // Single UTF8_TEXT entry → the text UI (or a .txt file when oversized
+        // / invalid UTF-8).
+        if (entries.Count == 1 && entries[0].Kind == 2)
+        {
+            byte[] bytes = Slice(stream, entries[0]);
+            string name = string.IsNullOrEmpty(entries[0].Path)
+                ? "文字消息.txt"
+                : entries[0].Path;
+            return FileNameUtil.DecodeUtf8Strict(bytes) is { } text
+                ? new ClassifiedPayload(RecoveredKind.EtText, name, (ulong)bytes.LongLength, bytes, text, null)
+                : new ClassifiedPayload(RecoveredKind.SingleFile, name, (ulong)bytes.LongLength, bytes, null, null);
+        }
+
+        // Multiple entries → bundle, one member per entry.
+        if (entries.Count > 1)
+        {
+            var files = entries
+                .Select(e => new BundleFile(e.Path, Slice(stream, e)))
+                .ToList();
+            return new ClassifiedPayload(
+                RecoveredKind.Bundle, displayName, (ulong)stream.LongLength, stream, null, files);
+        }
+
+        // Single file entry (or an empty-entry defensive fallback).
+        if (entries.Count == 1)
+        {
+            byte[] bytes = Slice(stream, entries[0]);
+            string name = string.IsNullOrEmpty(entries[0].Path)
+                ? (string.IsNullOrEmpty(displayName) ? "received_file" : displayName)
+                : entries[0].Path;
+            if (FileNameUtil.IsTextLikeName(name) && FileNameUtil.FitsTextUi(bytes.LongLength))
+            {
+                return FileNameUtil.DecodeUtf8Strict(bytes) is { } text
+                    ? new ClassifiedPayload(RecoveredKind.TextLikeFile, name, (ulong)bytes.LongLength, bytes, text, null)
+                    : new ClassifiedPayload(RecoveredKind.SingleFile, name, (ulong)bytes.LongLength, bytes, null, null);
+            }
+            return new ClassifiedPayload(RecoveredKind.SingleFile, name, (ulong)bytes.LongLength, bytes, null, null);
+        }
+
+        // No manifest entries (defensive): treat the whole stream as one file.
+        return new ClassifiedPayload(
+            RecoveredKind.SingleFile, displayName, (ulong)stream.LongLength, stream, null, null);
     }
 
     private enum RecoveredKind { EtText, Bundle, TextLikeFile, SingleFile }
@@ -752,68 +826,12 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         IReadOnlyList<BundleFile>? BundleFiles);
 
     /// <summary>Recovery pipeline outcome: a staged store result, or a
-    /// continuous-folder save report, or neither (a segment was stored — keep
-    /// scanning for the rest of the transfer).</summary>
+    /// continuous-folder save report, or neither (nothing stageable).</summary>
     private sealed record RecoveryOutcome(RecoveryResult? Result, ContinuousSaveReport? ContinuousReport)
     {
         public static RecoveryOutcome None() => new(null, null);
         public static RecoveryOutcome Single(RecoveryResult result) => new(result, null);
         public static RecoveryOutcome Continuous(ContinuousSaveReport report) => new(null, report);
-    }
-
-    /// <summary>
-    /// Classify assembled bytes into one of the four recovery shapes. Shared
-    /// by the plain and segmented paths so the two cascades cannot drift; the
-    /// mutating steps (ETTEXT magic strip, .txt name normalization) are
-    /// applied here, once.
-    /// </summary>
-    private static ClassifiedPayload ClassifyRecovered(
-        byte[] bytes, string displayName, ulong originalSize)
-    {
-        if (TextParser.IsText(bytes))
-        {
-            // ETTEXTv1 payloads start with the 8-byte wire magic. Strip it up
-            // front so EVERY downstream path — the text UI, the continuous
-            // folder save and the oversized→file fallback alike — sees the
-            // message text, never the protocol header (the fallback used to
-            // stage a file that literally began with the "ETTEXTv1" bytes).
-            // Checked BEFORE the bundle branch: the two magics never collide
-            // ("ETTEXTv1" vs "ETBUNDL1").
-            bytes = bytes[TextParser.Magic.Length..];
-            originalSize = (ulong)bytes.LongLength;
-            if (string.IsNullOrEmpty(displayName) || !displayName.Contains('.'))
-            {
-                displayName = string.IsNullOrEmpty(displayName)
-                    ? "文字消息.txt"
-                    : displayName + ".txt";
-            }
-            // Text UI when it fits the cap; oversized or invalid-UTF-8 text →
-            // an ordinary .txt file.
-            return FileNameUtil.DecodeUtf8Strict(bytes) is { } text
-                ? new ClassifiedPayload(RecoveredKind.EtText, displayName, originalSize, bytes, text, null)
-                : new ClassifiedPayload(RecoveredKind.SingleFile, displayName, originalSize, bytes, null, null);
-        }
-        if (BundleParser.IsBundle(bytes))
-        {
-            AirFerry.Windows.Bundle.Bundle? bundle = BundleParser.Parse(bytes);
-            // Parse failure falls through to single-file handling with the
-            // container bytes (same fallback the bundle branch always had).
-            return bundle is not null && bundle.Files.Count > 0
-                ? new ClassifiedPayload(RecoveredKind.Bundle, displayName, originalSize, bytes, null, bundle.Files)
-                : new ClassifiedPayload(RecoveredKind.SingleFile, displayName, originalSize, bytes, null, null);
-        }
-        if (FileNameUtil.IsTextLikeName(
-                string.IsNullOrEmpty(displayName) ? "received_file" : displayName)
-            && FileNameUtil.FitsTextUi(bytes.LongLength))
-        {
-            // Single text-like document (readme.md, notes.json, …): the
-            // copy/share UI only when the payload is valid UTF-8 and small
-            // enough; otherwise an ordinary file.
-            return FileNameUtil.DecodeUtf8Strict(bytes) is { } text
-                ? new ClassifiedPayload(RecoveredKind.TextLikeFile, displayName, originalSize, bytes, text, null)
-                : new ClassifiedPayload(RecoveredKind.SingleFile, displayName, originalSize, bytes, null, null);
-        }
-        return new ClassifiedPayload(RecoveredKind.SingleFile, displayName, originalSize, bytes, null, null);
     }
 
     /// <summary>Stage a classified payload into the ContentStore (single-receive mode).</summary>
@@ -861,258 +879,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         }
     }
 
-    /// <summary>
-    /// Move an already-verified decompressed file (&gt;256 MiB segmented path)
-    /// into the continuous folder, deduplicating by the root SHA-256 the
-    /// native decompression already verified.
-    /// </summary>
-    private ContinuousSaveReport TryMoveContinuous(
-        AirFerry.Windows.Bundle.ContinuousSaver saver,
-        string displayName, string sourcePath, string sha256Hex)
-    {
-        try
-        {
-            return saver.MoveVerifiedFile(displayName, sourcePath, sha256Hex);
-        }
-        catch (Exception ex)
-        {
-            return ContinuousSaveReport.Failed(displayName, ex.Message);
-        }
-    }
-
-    /// <summary>
-    /// Store one recovered descriptor-v5 segment into the disk-backed assembler.
-    /// Returns a completed outcome only once every segment of the root
-    /// transfer has arrived and been merged; otherwise None (the receiver keeps
-    /// scanning for the next segment).
-    /// </summary>
-    private RecoveryOutcome HandleSegmentedTransfer(
-        ReceiverSession session, QrDecodePool pool,
-        AirFerry.Windows.Bundle.ContinuousSaver? saver)
-    {
-        // Take a coherent native snapshot under the ingest lock: metadata +
-        // assembled **compressed** bytes for this segment (no decompression —
-        // the whole compressed stream is decompressed once at archive time).
-        SegmentPayload? seg = pool.RunExclusive<SegmentPayload?>(() =>
-        {
-            byte[]? bytes = session.AssembleRaw();
-            if (bytes is null || bytes.Length == 0) return null;
-            return new SegmentPayload(
-                bytes,
-                session.SegmentIndex(),
-                session.SegmentCount(),
-                session.RootOriginalSize(),
-                session.RootSessionIdLo(),
-                session.RootSessionIdHi(),
-                session.FileName(),
-                session.CompressedSize(),
-                session.OriginalOffset(),
-                session.RawSha256(),
-                session.RootSha256(),
-                session.Crc32(),
-                session.Crc32Known(),
-                session.Compression(),
-                session.OriginalSize());
-        });
-        if (seg is null)
-        {
-            SwapReceiverForNextSegment(session, pool);
-            return RecoveryOutcome.None();
-        }
-
-        int index = (int)seg.SegmentIndex;
-        int count = (int)seg.SegmentCount;
-        ulong rootSize = seg.RootOriginalSize; // whole **compressed** stream size
-        ulong lo = seg.RootLo;
-        ulong hi = seg.RootHi;
-        string rootId = $"{hi:x16}{lo:x16}";
-        string displayName = string.IsNullOrEmpty(seg.FileName) ? "received_file" : seg.FileName;
-        ulong decompressedSize = seg.DecompressedSize;
-
-        byte[] segBytes = seg.Bytes;
-        if (count is <= 0 or > AirFerry.Windows.Bundle.SegmentAssembler.MaxSegmentCount)
-            throw new InvalidDataException("分段数量超出安全上限");
-        if (rootSize == 0 || rootSize > (ulong)long.MaxValue)
-            throw new InvalidDataException("压缩流大小无效");
-        if (index < 0 || index >= count ||
-            seg.OriginalOffset != checked((ulong)index *
-                (ulong)AirFerry.Windows.Bundle.SegmentAssembler.SegmentRawBytes))
-            throw new InvalidDataException("分段索引或偏移无效");
-        ulong expectedCount = checked((rootSize - 1) /
-            (ulong)AirFerry.Windows.Bundle.SegmentAssembler.SegmentRawBytes + 1);
-        if ((ulong)count != expectedCount)
-            throw new InvalidDataException("分段数量与压缩流大小不一致");
-        ulong expectedLength = Math.Min(
-            (ulong)AirFerry.Windows.Bundle.SegmentAssembler.SegmentRawBytes,
-            rootSize - seg.OriginalOffset);
-        if (seg.OriginalSize == 0 || seg.OriginalSize != expectedLength ||
-            seg.OriginalSize != (ulong)segBytes.LongLength)
-            throw new InvalidDataException("分段实际长度与描述符不一致");
-        if (seg.RawSha256.Length != 32)
-            throw new InvalidDataException("分段描述符缺少 SHA-256");
-        if (seg.RootSha256.Length != 32)
-            throw new InvalidDataException("分段描述符缺少整文件 SHA-256");
-        if (decompressedSize == 0 || decompressedSize > (ulong)long.MaxValue)
-            throw new InvalidDataException("原始文件大小无效");
-        if (_resumeRootId is not null &&
-            !string.Equals(rootId, _resumeRootId, StringComparison.Ordinal))
-        {
-            SwapReceiverForNextSegment(session, pool);
-            return RecoveryOutcome.None();
-        }
-
-        // Reuse the active root so a long, sequential transfer does not reopen
-        // the ledger and re-hash every earlier ~32 MiB segment for each child.
-        // Interleaved roots still open their own identity-bound assembler.
-        var asm = _segAssembler is not null
-                  && _segAssembler.Matches(
-                      lo, hi, count, (long)rootSize, seg.RootSha256, displayName)
-            ? _segAssembler
-            : AirFerry.Windows.Bundle.SegmentAssembler.Open(
-                lo, hi, count, (long)rootSize, (long)decompressedSize,
-                seg.Compression, (uint)seg.ExpectedCrc, seg.CrcKnown,
-                seg.RootSha256, displayName);
-        _segAssembler = asm;
-
-        // Crash recovery: all segments may already be durable while history
-        // promotion was interrupted. Promotion is deliberately idempotent.
-        if (asm.IsComplete())
-            return ArchiveSegmentedTransfer(asm, displayName, decompressedSize, saver);
-
-        // A failure leaves all earlier verified segments untouched. The outer
-        // recovery boundary swaps in a fresh child receiver so this segment can
-        // be scanned again immediately.
-        bool stored = asm.StoreSegment(index, segBytes, seg.RawSha256);
-        if (!stored)
-        {
-            UpdateSegmentedProgress(asm);
-            SwapReceiverForNextSegment(session, pool);
-            return RecoveryOutcome.None();
-        }
-
-        if (!asm.IsComplete())
-        {
-            UpdateSegmentedProgress(asm);
-            SwapReceiverForNextSegment(session, pool);
-            return RecoveryOutcome.None();
-        }
-
-        return ArchiveSegmentedTransfer(asm, displayName, decompressedSize, saver);
-    }
-
-    private RecoveryOutcome ArchiveSegmentedTransfer(
-        AirFerry.Windows.Bundle.SegmentAssembler asm,
-        string displayName,
-        ulong decompressedSize,
-        AirFerry.Windows.Bundle.ContinuousSaver? saver)
-    {
-        // Concatenate the compressed segments and stream-decompress exactly once
-        // to a temp file. The native call already verified the decompressed
-        // length + CRC32 (when known) + root SHA-256 over the decompressed bytes.
-        string decompressedPath = asm.Finish()
-            ?? throw new InvalidDataException(
-                "分段账本已完成，但解压或完整性校验失败");
-        ulong expectedCrc = asm.Crc32();
-        bool crcKnown = asm.Crc32Known();
-
-        RecoveryOutcome outcome;
-        long length = new FileInfo(decompressedPath).Length;
-        // Text / bundle detection needs the bytes in memory. Anything larger
-        // than the legacy whole-transfer ceiling is a single file by
-        // construction, so skip the in-memory dispatch — ≤256 MiB goes through
-        // the shared classifier, larger files stream straight to their sink
-        // (ContentStore blob or continuous folder). This is what lets
-        // > 256 MiB files be recovered.
-        if (length <= 256L * 1024 * 1024)
-        {
-            byte[] original = File.ReadAllBytes(decompressedPath);
-            ulong receivedCrc = Crc32.Compute(original);
-            ClassifiedPayload classified = ClassifyRecovered(
-                original, displayName, (ulong)original.LongLength);
-            outcome = saver is not null
-                ? RecoveryOutcome.Continuous(TrySaveContinuous(saver, classified))
-                : RecoveryOutcome.Single(StageClassified(
-                    classified, expectedCrc, crcKnown, receivedCrc));
-        }
-        else
-        {
-            string finalName = string.IsNullOrEmpty(displayName) ? "received_file" : displayName;
-            if (saver is not null)
-            {
-                // Move the verified temp file straight into the continuous
-                // folder; on a duplicate the ledger's own directory cleanup
-                // (CommitArchived below) removes it.
-                outcome = RecoveryOutcome.Continuous(
-                    TryMoveContinuous(saver, finalName, decompressedPath, asm.RootSha256Hex));
-            }
-            else
-            {
-                // Very large single file: stream/atomically-move the decompressed
-                // temp file into ContentStore without holding it in memory.
-                // 注意：expectedSize 校验的是**解压产物**长度，必须传解压后大小
-                // （调用方的压缩流 rootSize 只用于分段账本，语义勿混——Android 同名
-                // 函数的误导性参数名正是当初移植出错的根源）。
-                ContentStore.PutResult put = ContentStore.PutFile(
-                    finalName, decompressedPath,
-                    crcHex: crcKnown ? expectedCrc.ToString("x") : "unknown",
-                    crcUnknown: !crcKnown, kind: "file",
-                    expectedSha256Hex: asm.RootSha256Hex,
-                    expectedSize: (long)decompressedSize,
-                    // 稳定条目 ID：入库后若索引发布被中断（崩溃/断电），重试时按
-                    // 同 ID 去重，不产生重复历史条目（镜像 Android ScanActivity）。
-                    stableEntryId: "segment-" + asm.RootSessionIdHex);
-                outcome = RecoveryOutcome.Single(new RecoveryResult(
-                    SingleFilePath: put.Path,
-                    SingleFileSize: decompressedSize,
-                    ExpectedCrc32: crcKnown ? expectedCrc : null,
-                    Crc32Known: crcKnown,
-                    ReceivedCrc32: null,
-                    Bundle: null,
-                    BundleDir: null,
-                    DisplayName: finalName));
-            }
-        }
-
-        // A FAILED continuous save (disk full, folder removed, permissions)
-        // must NOT commit the ledger: CommitArchived deletes the received
-        // segments, the decompressed temp and the resume record — with them
-        // gone the transfer could never be retried. Keep everything; the
-        // idempotent promotion path (asm.IsComplete() above) retries on the
-        // next replayed stream or via the history page's 继续恢复.
-        if (outcome.ContinuousReport is { Status: ContinuousSaveStatus.Failed })
-        {
-            return outcome;
-        }
-
-        asm.CommitArchived();
-        _segAssembler = null;
-        _resumeRootId = null;
-        return outcome;
-    }
-
-    private sealed record SegmentPayload(
-        byte[] Bytes,
-        uint SegmentIndex,
-        uint SegmentCount,
-        ulong RootOriginalSize,
-        ulong RootLo,
-        ulong RootHi,
-        string FileName,
-        ulong OriginalSize,
-        ulong OriginalOffset,
-        byte[] RawSha256,
-        byte[] RootSha256,
-        ulong ExpectedCrc,
-        bool CrcKnown,
-        byte Compression,
-        ulong DecompressedSize);
-
-    private void UpdateSegmentedProgress(AirFerry.Windows.Bundle.SegmentAssembler asm)
-    {
-        StatusText = $"分段 {asm.ReceivedCount()}/{asm.SegmentCount()} 已收，继续扫描下一段…";
-    }
-
-    /// <summary>Swap to a fresh receiver for the next segment.</summary>
+    /// <summary>Swap in a fresh receiver (re-arm for the next transfer).</summary>
     private void SwapReceiverForNextSegment(ReceiverSession session, QrDecodePool pool)
     {
         lock (_lifecycleGate)
@@ -1128,6 +895,149 @@ public partial class ScanViewModel : ObservableObject, IDisposable
                 return true;
             });
         }
+    }
+
+    /// <summary>
+    /// Continuous mode: a different-session descriptor arrived while the
+    /// current stream was silent (sender switched files). Performed on the UI
+    /// refresh cadence — NOT from OnDecoded, which runs under the pool's
+    /// IngestLock and must not reach for _lifecycleGate (inverse lock order
+    /// vs every other swap path). The fresh receiver lazy-locks on the next
+    /// descriptor (they recur every 17 frames, so the takeover is
+    /// imperceptible); the abandoned partial is worthless (its sender is
+    /// gone).
+    /// </summary>
+    private void RelockStaleReceiverIfRequested(ReceiverSession session, QrDecodePool pool)
+    {
+        if (Volatile.Read(ref _relockPending) != 1)
+        {
+            return;
+        }
+        Volatile.Write(ref _relockPending, 0);
+        if (!session.IsInitialized ||
+            Stopwatch.GetTimestamp() - Volatile.Read(ref _lastAcceptedTimestamp)
+                <= RelockSilenceTicks)
+        {
+            return; // the old stream came back to life — keep it
+        }
+        FileSummaryText = "发送端已切换文件，正在接收新传输…";
+        SwapReceiverForNextSegment(session, pool);
+    }
+
+    /// <summary>
+    /// The stable identity of the session's transfer: Content ID or Transfer ID
+    /// from the AF2 Root / Manifest snapshot when confirmed, falling back to
+    /// the session id. Callers must hold the ingest lock.
+    /// </summary>
+    private static string TransferIdentityOf(ReceiverSession session)
+    {
+        var snap = session.GetSnapshot();
+        if (snap.MetaConfirmed)
+        {
+            if (!string.IsNullOrEmpty(snap.ContentIdHex)) return snap.ContentIdHex;
+            if (!string.IsNullOrEmpty(snap.TransferIdHex)) return snap.TransferIdHex;
+        }
+        return session.SessionIdHex();
+    }
+
+    /// <summary>
+    /// Descriptor facts for the pre-scan duplicate check / identity recording:
+    /// identity (session/content/transfer id), name, decompressed size.
+    /// Callers must hold the ingest lock.
+    /// </summary>
+    private static AirFerry.Windows.Bundle.TransferProbe TransferProbeOf(
+        ReceiverSession session)
+    {
+        var snap = session.GetSnapshot();
+        return new AirFerry.Windows.Bundle.TransferProbe(
+            TransferIdentityOf(session),
+            session.FileName(),
+            (long)snap.TotalRawSize,
+            null,
+            null);
+    }
+
+    /// <summary>
+    /// Continuous mode: the descriptor just confirmed a transfer that was
+    /// already saved (and whose folder copy is still intact) — skip receiving
+    /// it entirely, record the skip and re-arm for the next file.
+    /// Runs on the UI refresh cadence.
+    /// </summary>
+    private void SkipDuplicatedTransferAtDescriptor(
+        ReceiverSession session, QrDecodePool pool, string identity)
+    {
+        bool segmented = pool.RunExclusive(() => session.IsSegmented());
+        string name = pool.RunExclusive(() => session.FileName());
+        name = string.IsNullOrEmpty(name) ? "未命名文件" : name;
+        ContinuousSkippedCount++;
+        ContinuousItems.Insert(0, new ContinuousReceivedItem(
+            DateTime.Now.ToString("HH:mm:ss"),
+            name,
+            string.Empty,
+            ContinuousItemStatus.Skipped));
+        while (ContinuousItems.Count > 50)
+        {
+            ContinuousItems.RemoveAt(ContinuousItems.Count - 1);
+        }
+        StatusText = $"重复，已跳过: {name}（秒判，无需扫描）";
+        FileSummaryText = "等待下一份文件…";
+        Progress = 0;
+        if (!segmented)
+        {
+            (ulong Lo, ulong Hi) locked = pool.RunExclusive(() =>
+            {
+                session.TryGetLockedSessionId(out ulong lo, out ulong hi);
+                return (lo, hi);
+            });
+            _ignoreSessionLo = locked.Lo;
+            _ignoreSessionHi = locked.Hi;
+            _ignoreSessionActive = true;
+        }
+        SwapReceiverForNextSegment(session, pool);
+    }
+
+    /// <summary>
+    /// Shared tail of the recovery entry point (normal completion): publish
+    /// the outcome, remember the transfer identity for pre-scan dedup, then
+    /// re-arm for the next transfer
+    /// (continuous) or hand the result to the view (single mode). Runs on the
+    /// dispatcher thread.
+    /// </summary>
+    private void HandleRecoveryOutcome(
+        ReceiverSession session, QrDecodePool pool, int epoch,
+        AirFerry.Windows.Bundle.ContinuousSaver? saver, RecoveryOutcome outcome)
+    {
+        if (epoch != Volatile.Read(ref _sessionEpoch))
+        {
+            return;
+        }
+
+        IsRecovering = false;
+        RecoveryStageText = string.Empty;
+        if (outcome.Result is null && outcome.ContinuousReport is null)
+        {
+            IsComplete = false;
+            StatusText = "组装失败";
+            return;
+        }
+        if (saver is not null && outcome.ContinuousReport is not null)
+        {
+            if (outcome.ContinuousReport.Status != ContinuousSaveStatus.Failed)
+            {
+                // Remember the transfer identity so a replay of this transfer
+                // is skipped at its descriptor next time (pre-scan dedup).
+                saver.MarkTransfer(
+                    pool.RunExclusive(() => TransferProbeOf(session)),
+                    outcome.ContinuousReport);
+            }
+            // Continuous mode: record the folder save, re-arm a fresh receiver
+            // and keep scanning — no navigation, no teardown.
+            RecordContinuousOutcome(saver, outcome.ContinuousReport);
+            ContinueNextTransfer(session, pool, epoch);
+            return;
+        }
+        StatusText = "接收完成";
+        TransferCompleted?.Invoke(outcome.Result!);
     }
 
     private bool ResetReceiverAfterRecoveryFailure(
@@ -1211,9 +1121,8 @@ public partial class ScanViewModel : ObservableObject, IDisposable
 
     /// <summary>
     /// Continuous mode's "receive the next file" step: re-arm a fresh receiver
-    /// (the exact swap the segmented path performs between segments — the
-    /// producer thread, decode pool and capture device keep running) and reset
-    /// the per-transfer UI so the next descriptor starts from zero.
+    /// (the producer thread, decode pool and capture device keep running) and
+    /// reset the per-transfer UI so the next descriptor starts from zero.
     /// </summary>
     private void ContinueNextTransfer(ReceiverSession session, QrDecodePool pool, int epoch)
     {
@@ -1341,6 +1250,13 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         {
             return;
         }
+        // Service a pending sender-switch re-lock (continuous mode). Runs on
+        // the UI thread holding no locks — the same context as every other
+        // swap call site, so the lifecycle/ingest lock order stays uniform.
+        if (ContinuousMode)
+        {
+            RelockStaleReceiverIfRequested(session, pool);
+        }
 
         LiveSnapshot live = pool.RunExclusive(() =>
         {
@@ -1360,6 +1276,28 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             return;
         }
         ProgressSnapshot p = live.Progress.Value;
+        // Pre-scan duplicate check runs exactly once per receiver session,
+        // the moment a descriptor is confirmed — before any meaningful data
+        // ingest: the continuous-mode whole-transfer identity skip.
+        if (p.MetaConfirmed && !p.Complete &&
+            !ReferenceEquals(session, _preScanCheckedSession))
+        {
+            _preScanCheckedSession = session;
+            // Continuous mode pre-scan dedup: the moment a descriptor is
+            // confirmed the transfer identity is already known (content-derived
+            // session id) — if this run already saved it AND the folder copy
+            // still verifies intact, skip the whole receive instead of
+            // re-scanning.
+            if (ContinuousMode && _continuousSaver is not null)
+            {
+                var probe = pool.RunExclusive(() => TransferProbeOf(session));
+                if (_continuousSaver.ShouldSkipTransfer(probe))
+                {
+                    SkipDuplicatedTransferAtDescriptor(session, pool, probe.Identity);
+                    return;
+                }
+            }
+        }
         UpdateRates(now, pool.DecodedSymbols, p.ReceivedSymbols, live.SymbolSize, p.Complete);
         UpdateFileSummary(live, p);
 
@@ -1386,7 +1324,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         if (!IsRecovering)
         {
             StatusText = p.Complete
-                ? "✓ 文件恢复完成"
+                ? "文件恢复完成"
                 : !p.MetaConfirmed && p.ReceivedSymbols > 0
                     ? $"正在同步…已缓存 {p.ReceivedSymbols} 个符号"
                     : p.TotalSymbols == 0
@@ -1503,15 +1441,13 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     {
         string bundleId = Guid.NewGuid().ToString("N");
         string bundleTitle = $"发送_{DateTime.Now:MMdd_HHmmss}";
-        string? first = null;
-        foreach (BundleFile f in files)
-        {
-            var put = ContentStore.PutBytes(
-                f.Name, f.Data, kind: "file",
-                bundleId: bundleId, bundleTitle: bundleTitle);
-            first ??= put.Path;
-        }
-        return first ?? ContentStore.RootDir;
+        // One batched index write instead of one full index rewrite per entry
+        // (PutBytes rewrites index.json for every call → O(n²) for a bundle).
+        IReadOnlyList<ContentStore.PutResult> results = ContentStore.PutBytesBatch(
+            files.Select(f => new ContentStore.PutBytesRequest(
+                f.Name, f.Data, Kind: "file",
+                BundleId: bundleId, BundleTitle: bundleTitle)).ToList());
+        return results.Count > 0 ? results[0].Path : ContentStore.RootDir;
     }
 
     public void Dispose()

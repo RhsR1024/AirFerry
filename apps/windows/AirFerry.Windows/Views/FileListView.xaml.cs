@@ -5,7 +5,6 @@ using System.Windows;
 using System.Windows.Controls;
 using AirFerry.Windows.Bundle;
 using AirFerry.Windows.Models;
-using AirFerry.Windows.Scan;
 using AirFerry.Windows.Services;
 
 namespace AirFerry.Windows.Views;
@@ -18,32 +17,18 @@ namespace AirFerry.Windows.Views;
 public partial class FileListView : Page
 {
     private readonly ObservableCollection<FileEntry> _entries = [];
-    private readonly ObservableCollection<TaskEntry> _tasks = [];
 
     public FileListView()
     {
         InitializeComponent();
         FilesListView.ItemsSource = _entries;
-        TasksListView.ItemsSource = _tasks;
         Loaded += (_, _) => Refresh();
     }
 
     private void Refresh()
     {
         _entries.Clear();
-        _tasks.Clear();
         PathHint.Text = $"位置: {ContentStore.RootDir}";
-        foreach (SegmentAssembler.TaskInfo task in SegmentAssembler.ListTasks())
-        {
-            _tasks.Add(new TaskEntry(
-                task.RootSessionIdHex,
-                task.FileName,
-                $"{task.ReceivedCount}/{task.SegmentCount} · 缺 {FormatMissingSegments(task)}",
-                FormatSize((ulong)task.RootOriginalSize),
-                task.RootLo,
-                task.RootHi));
-        }
-        TasksPanel.Visibility = _tasks.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
         IReadOnlyList<ContentStore.Entry> entries;
         try
         {
@@ -52,12 +37,12 @@ public partial class FileListView : Page
         }
         catch (InvalidDataException ex)
         {
-            ClearButton.IsEnabled = _tasks.Count > 0;
+            ClearButton.IsEnabled = false;
             PathHint.Text = ex.Message;
             _ = UiMessages.ErrorAsync(ex.Message);
             return;
         }
-        ClearButton.IsEnabled = entries.Count > 0 || _tasks.Count > 0;
+        ClearButton.IsEnabled = entries.Count > 0;
         foreach (ContentStore.Entry item in entries.OrderByDescending(e => e.CreatedAt))
         {
             string path = ContentStore.BlobPath(item.Hash);
@@ -125,8 +110,8 @@ public partial class FileListView : Page
     private async void ClearAll_Click(object sender, RoutedEventArgs e)
     {
         if (!await UiMessages.ConfirmAsync(
-                "确定清空所有已接收文件和待恢复任务？此操作不可撤销。",
-                primaryText: "清空", danger: true))
+                "确定清空所有已接收文件？此操作不可撤销。",
+                danger: true))
         {
             return;
         }
@@ -141,32 +126,6 @@ public partial class FileListView : Page
         }
     }
 
-    private void ContinueTask_Click(object sender, RoutedEventArgs e)
-    {
-        if (sender is not Button { DataContext: TaskEntry task }) return;
-        // Device selection remains explicit; after choosing the camera the
-        // scanner accepts only this root and reopens its durable bitmap when a
-        // matching segment is shown. No already-verified segment is rewritten.
-        NavigationService?.Navigate(new DeviceSelectView(task.RootSessionIdHex));
-    }
-
-    private async void DeleteTask_Click(object sender, RoutedEventArgs e)
-    {
-        if (sender is not Button { DataContext: TaskEntry task }) return;
-        if (!await UiMessages.ConfirmAsync($"删除「{task.DisplayName}」的待恢复分段？",
-                primaryText: "删除", danger: true))
-            return;
-        try
-        {
-            SegmentAssembler.Discard(task.RootLo, task.RootHi);
-            Refresh();
-        }
-        catch (Exception ex)
-        {
-            await UiMessages.ErrorAsync($"删除任务失败: {ex.Message}");
-        }
-    }
-
     private void Back_Click(object sender, RoutedEventArgs e) => NavigationService?.GoBack();
 
     private static string FormatSize(ulong bytes) => bytes switch
@@ -176,24 +135,6 @@ public partial class FileListView : Page
         < 1024UL * 1024 * 1024 => $"{bytes / (1024.0 * 1024):F1} MB",
         _ => $"{bytes / (1024.0 * 1024 * 1024):F2} GB",
     };
-
-    private static string FormatMissingSegments(SegmentAssembler.TaskInfo task)
-    {
-        var have = task.ReceivedIndices.ToHashSet();
-        var ranges = new List<string>();
-        bool omitted = false;
-        for (int i = 0; i < task.SegmentCount; i++)
-        {
-            if (have.Contains(i)) continue;
-            int start = i;
-            while (i + 1 < task.SegmentCount && !have.Contains(i + 1)) i++;
-            if (ranges.Count < 4)
-                ranges.Add(start == i ? $"{start + 1}" : $"{start + 1}–{i + 1}");
-            else
-                omitted = true;
-        }
-        return ranges.Count == 0 ? "无" : string.Join("、", ranges) + (omitted ? " 等" : "");
-    }
 
     private static RecoveryResult BuildResult(
         FileEntry entry, ulong size, ulong receivedCrc, string? text)
@@ -223,12 +164,4 @@ public partial class FileListView : Page
         string Kind,
         string CrcHex,
         bool CrcUnknown);
-
-    public sealed record TaskEntry(
-        string RootSessionIdHex,
-        string DisplayName,
-        string ProgressText,
-        string SizeText,
-        ulong RootLo,
-        ulong RootHi);
 }
