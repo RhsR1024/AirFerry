@@ -10,19 +10,24 @@
 //! (≤ 2 total); SYMBOLs for unknown object ids are dropped with ZERO caching;
 //! completed objects ignore repeated META/SYMBOL cheaply; session mismatch
 //! debounce follows v1 (3 consistent foreign-Transfer ROOTs to re-lock; data
-//! frames never trigger a re-lock).
+//! frames never trigger a re-lock; T is bound at lock time only, so a foreign
+//! ROOT with a different T can still re-lock). A same-transfer ROOT with a new
+//! `manifest_object_id` switches the Broadcast Instance: ledger kept,
+//! unfinished decoders dropped, T re-bound (§6).
 //!
 //! Integrity chain enforced here: ① frame CRC (frame.rs) → ② record boundary
 //! checks (root/meta/manifest) → ③ OTI gate BEFORE building any decoder →
 //! ④ object_id + encoded_hash binding (META-time and byte-time) → ⑤ bounded
-//! decompression with exact length → ⑥ chunk hash against the Manifest table.
+//! decompression with exact length → ⑥ chunk hash against the Manifest table
+//! → ⑦ manifest hash + content id against ROOT → ⑧⑨ entry hashes + Content ID
+//! recomputation in [`verify_final_stream`] before hosts publish.
 
 use crate::chunk::decode_chunk;
 use crate::frame::{Af2Frame, FrameType};
 use crate::id::hash;
 use crate::manifest::Manifest;
 use crate::meta::{ObjectMetaRecord, CODEC_RAW};
-use crate::id::{ROLE_CHUNK, ROLE_MANIFEST};
+use crate::id::{content_id, EntryIdInput, KIND_DIRECTORY, KIND_UTF8_TEXT, ROLE_CHUNK, ROLE_MANIFEST};
 use crate::root::RootRecord;
 use raptorq::ObjectTransmissionInformation;
 use raptorq_core::{Decoder, ObjectMeta, SourceBlockMeta, Symbol};
@@ -40,6 +45,11 @@ pub enum IngestEvent {
     Relocked,
     /// A META passed the object_id binding; a decoder was built.
     MetaBound { role: u8, object_index: u32 },
+    /// A ROOT for the SAME transfer with identical semantic fields but a new
+    /// `manifest_object_id` (re-broadcast with a new T / new encoding): the
+    /// ledger (completed chunks) is kept, unfinished decoders were dropped,
+    /// and the T was re-bound to the new Broadcast Instance.
+    InstanceSwitched,
     /// META failed the object_id binding (spoofed / mixed instance).
     MetaRejected,
     /// A symbol entered a live decoder.
@@ -63,6 +73,23 @@ pub enum Af2ReceiverError {
     ManifestHashMismatch,
     #[error("receiver: chunk encoded_hash mismatch")]
     ChunkEncodedHashMismatch,
+    #[error("receiver: resume failed: {0}")]
+    Resume(String),
+}
+
+/// Finalization failures for [`Af2Receiver::verify_final_stream`] (§13 ⑧⑨).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum FinalizeError {
+    #[error("finalize: ROOT/Manifest not ready")]
+    NotReady,
+    #[error("finalize: stream length {got} != total_raw_size {want}")]
+    Length { want: u64, got: u64 },
+    #[error("finalize: entry {index} content hash mismatch")]
+    EntryHash { index: usize },
+    #[error("finalize: entry {index} (UTF8_TEXT) is not valid UTF-8")]
+    NotUtf8 { index: usize },
+    #[error("finalize: recomputed content id != ROOT content id")]
+    ContentId,
 }
 
 /// Session-mismatch debounce: 3 consistent foreign ROOTs re-lock (v1 lesson).
@@ -179,6 +206,14 @@ impl Af2Receiver {
         }
     }
 
+    /// §11: drop a previously-completed chunk from the ledger so a later
+    /// epoch can re-supply it. Used when post-manifest re-verification fails
+    /// (a chunk whose META raw_hash was self-consistent but contradicts the
+    /// Manifest table). Returns whether the index was in the ledger.
+    pub fn invalidate_chunk(&mut self, index: u32) -> bool {
+        self.chunk_done.remove(&index)
+    }
+
     /// The wire symbol size T observed from the first accepted frame
     /// (0 before any frame is accepted).
     pub fn symbol_size(&self) -> usize {
@@ -186,22 +221,76 @@ impl Af2Receiver {
     }
 
     /// Ingest one raw QR payload. Never panics on hostile input.
+    ///
+    /// T binding rule (§5): the payload-area size T is only frozen when a
+    /// transfer is LOCKED (first legal ROOT / resume). Data frames (META /
+    /// SYMBOL) for an unlocked receiver are dropped without caching, and a
+    /// foreign ROOT arriving with a different T can still trigger the 3-ROOT
+    /// re-lock — a stray T from another broadcast must never wedge the
+    /// session permanently.
     pub fn ingest(&mut self, frame_bytes: &[u8]) -> Result<IngestEvent, Af2ReceiverError> {
         let frame = match Af2Frame::from_bytes(frame_bytes) {
             Ok(f) => f,
             Err(_) => return Ok(IngestEvent::Dropped),
         };
-        if self.t == 0 {
-            self.t = frame.t;
-        } else if self.t != frame.t {
-            // T must be constant within a Broadcast Instance.
-            return Ok(IngestEvent::Dropped);
-        }
         match frame.frame_type {
             FrameType::Root => self.on_root(frame),
-            FrameType::ObjectMeta => self.on_meta(frame),
-            FrameType::Symbol => self.on_symbol(frame),
+            FrameType::ObjectMeta | FrameType::Symbol => {
+                if self.root.is_none() {
+                    // No legal ROOT yet: build NO decoder, cache NO symbol (§6).
+                    return Ok(IngestEvent::Dropped);
+                }
+                debug_assert!(self.t != 0, "t is bound at lock time");
+                if frame.t != self.t {
+                    // T must be constant within a Broadcast Instance.
+                    return Ok(IngestEvent::Dropped);
+                }
+                match frame.frame_type {
+                    FrameType::ObjectMeta => self.on_meta(frame),
+                    FrameType::Symbol => self.on_symbol(frame),
+                    FrameType::Root => unreachable!(),
+                }
+            }
         }
+    }
+
+    /// Rebuild a locked receiver from a persisted ROOT frame plus the ledger's
+    /// completed-chunk bitmap (§12 resume). The ROOT frame re-runs the full
+    /// parse + id-binding path, so a tampered ledger cannot inject a fake
+    /// transfer. Unfinished decoders are NOT restored (chunk-level resume
+    /// only, per §1.2 non-goals); the sender's next epoch re-supplies symbols.
+    ///
+    /// Returns the number of completed indices actually applied (out-of-range
+    /// indices are ignored) so the caller's ledger cannot over-count.
+    pub fn resume(
+        &mut self,
+        root_frame_bytes: &[u8],
+        completed: &[u32],
+    ) -> Result<usize, Af2ReceiverError> {
+        if self.root.is_some() {
+            return Err(Af2ReceiverError::Resume(
+                "receiver already locked; resume before ingesting".into(),
+            ));
+        }
+        let frame = Af2Frame::from_bytes(root_frame_bytes)
+            .map_err(|e| Af2ReceiverError::Resume(e.to_string()))?;
+        if frame.frame_type != FrameType::Root {
+            return Err(Af2ReceiverError::Resume("stored frame is not a ROOT".into()));
+        }
+        let ev = self.on_root(frame)?;
+        if !matches!(ev, IngestEvent::RootLocked) {
+            return Err(Af2ReceiverError::Resume(format!(
+                "stored ROOT did not lock cleanly: {ev:?}"
+            )));
+        }
+        let chunk_count = self.root.as_ref().map(|r| r.chunk_count).unwrap_or(0);
+        let mut applied = 0usize;
+        for &index in completed {
+            if index < chunk_count && self.chunk_done.insert(index) {
+                applied += 1;
+            }
+        }
+        Ok(applied)
     }
 
     fn on_root(&mut self, frame: Af2Frame) -> Result<IngestEvent, Af2ReceiverError> {
@@ -210,13 +299,16 @@ impl Af2Receiver {
             Err(_) => return Ok(IngestEvent::Dropped),
         };
         let transfer = record.transfer();
+        // The ROOT header must carry its own transfer id — a spoofed id is
+        // dropped on EVERY path (lock, duplicate, foreign), not just lock.
+        if frame.object_id != transfer {
+            return Ok(IngestEvent::Dropped);
+        }
         match &self.root {
             None => {
                 // No legal ROOT yet: build NO decoder, cache NO symbol (§6).
-                if frame.object_id != transfer {
-                    return Ok(IngestEvent::Dropped); // spoofed id
-                }
                 self.root = Some(record);
+                self.t = frame.t;
                 self.mismatch_streak = 0;
                 self.mismatch_transfer = None;
                 Ok(IngestEvent::RootLocked)
@@ -224,24 +316,40 @@ impl Af2Receiver {
             Some(current) => {
                 if current.transfer() == transfer {
                     // Same transfer: semantic fields must be identical; a
-                    // changed manifest_object_id is a legal re-broadcast (new T).
+                    // changed manifest_object_id is a legal re-broadcast (§6).
                     let consistent = current.content_id == record.content_id
                         && current.manifest_hash == record.manifest_hash
                         && current.total_raw_size == record.total_raw_size
                         && current.entry_count == record.entry_count
                         && current.chunk_count == record.chunk_count
                         && current.chunk_raw_size == record.chunk_raw_size;
-                    if consistent {
-                        self.mismatch_streak = 0;
-                        Ok(IngestEvent::Dropped) // duplicate ROOT
-                    } else {
-                        // Conflicting frame for the SAME transfer id: drop + count.
-                        Ok(IngestEvent::Dropped)
+                    if !consistent {
+                        // Conflicting frame for the SAME transfer id: drop.
+                        return Ok(IngestEvent::Dropped);
                     }
+                    if current.manifest_object_id != record.manifest_object_id {
+                        // New Broadcast Instance of the SAME transfer (sender
+                        // restarted with a new T / new encoding). Keep the
+                        // ledger (chunk_done), drop every unfinished decoder —
+                        // their object ids can never appear again — and rebind
+                        // T. A verified Manifest stays valid: it is bound to
+                        // manifest_hash, which is part of the semantics that
+                        // just matched.
+                        self.root = Some(record);
+                        self.t = frame.t;
+                        self.manifest_decoder = None;
+                        self.manifest_meta = None;
+                        self.chunk_decoder = None;
+                        self.mismatch_streak = 0;
+                        return Ok(IngestEvent::InstanceSwitched);
+                    }
+                    Ok(IngestEvent::Dropped) // duplicate ROOT
                 } else {
                     // Foreign transfer: debounce; only ≥3 consistent ones
                     // re-lock. A *different* foreign transfer resets the
                     // streak — alternating streams must not evict the lock.
+                    // (A foreign ROOT with a different T still counts: the
+                    // re-lock resets T, so a stale T can never wedge us.)
                     if self.mismatch_transfer != Some(transfer) {
                         self.mismatch_streak = 0;
                         self.mismatch_transfer = Some(transfer);
@@ -316,7 +424,7 @@ impl Af2Receiver {
                 // every symbol (length inequality) while the frozen META makes
                 // later ones look like duplicates — a wedged session that only
                 // a 3-ROOT relock can break. Reject the META instead.
-                if usize::from(meta.symbol_size) != self.t {
+                if (meta.symbol_size as usize) != self.t {
                     return Ok(IngestEvent::MetaRejected);
                 }
                 let decoder =
@@ -347,7 +455,7 @@ impl Af2Receiver {
                 // ③ OTI gate (encoded chunk ≤ 32 MiB wire ceiling).
                 let meta = object_meta_from_oti(&record.oti, 32 << 20)?;
                 // Same T cross-check as the manifest branch (see above).
-                if usize::from(meta.symbol_size) != self.t {
+                if (meta.symbol_size as usize) != self.t {
                     return Ok(IngestEvent::MetaRejected);
                 }
                 let decoder =
@@ -498,7 +606,14 @@ impl Af2Receiver {
         }
         // Full manifest parse + validation (paths, stream chain, content id).
         match Manifest::parse(&encoded) {
-            Ok((m, _)) => {
+            Ok((m, manifest_cid)) => {
+                // §7 cross-check: the Manifest's carried content id must equal
+                // the ROOT's (manifest_hash already bound the bytes to ROOT;
+                // this binds the announced identity as well).
+                if manifest_cid != root.content_id {
+                    self.manifest_meta = None;
+                    return Ok(IngestEvent::ChunkRejected);
+                }
                 self.manifest = Some(m);
                 self.manifest_done = true;
                 self.manifest_decoder = None;
@@ -509,6 +624,16 @@ impl Af2Receiver {
                 Ok(IngestEvent::ChunkRejected)
             }
         }
+    }
+
+    /// Final integrity gate (§13 ⑧⑨): verify a fully reassembled Canonical
+    /// Content Stream — per-entry hashes, strict UTF-8 for UTF8_TEXT entries,
+    /// exact total length, and a fresh Content ID recomputation against ROOT.
+    /// Hosts MUST run this before materializing/publishing files.
+    pub fn verify_final_stream(&self, stream: &[u8]) -> Result<(), FinalizeError> {
+        let root = self.root.as_ref().ok_or(FinalizeError::NotReady)?;
+        let manifest = self.manifest.as_ref().ok_or(FinalizeError::NotReady)?;
+        verify_stream(root, manifest, stream)
     }
 
     fn finish_chunk(
@@ -565,6 +690,64 @@ impl Af2Receiver {
     }
 }
 
+/// Standalone §13 ⑧⑨ verification: entry hashes → UTF8_TEXT strictness →
+/// exact stream length → Content ID recomputation. Shared by
+/// [`Af2Receiver::verify_final_stream`] and the cross-end FFI surfaces so the
+/// final gate has exactly one implementation.
+pub fn verify_stream(
+    root: &RootRecord,
+    manifest: &Manifest,
+    stream: &[u8],
+) -> Result<(), FinalizeError> {
+    if u64::try_from(stream.len()).unwrap_or(u64::MAX) != root.total_raw_size {
+        return Err(FinalizeError::Length {
+            want: root.total_raw_size,
+            got: stream.len() as u64,
+        });
+    }
+    for (index, e) in manifest.entries.iter().enumerate() {
+        if e.kind == KIND_DIRECTORY {
+            continue;
+        }
+        // Checked arithmetic before slicing (wasm32 usize is 32-bit).
+        let start = usize::try_from(e.content_offset).map_err(|_| FinalizeError::Length {
+            want: root.total_raw_size,
+            got: stream.len() as u64,
+        })?;
+        let end = start.checked_add(usize::try_from(e.content_size).map_err(|_| {
+            FinalizeError::Length {
+                want: root.total_raw_size,
+                got: stream.len() as u64,
+            }
+        })?).ok_or(FinalizeError::Length {
+            want: root.total_raw_size,
+            got: stream.len() as u64,
+        })?;
+        if end > stream.len() || hash(&stream[start..end]) != e.content_hash {
+            return Err(FinalizeError::EntryHash { index });
+        }
+        if e.kind == KIND_UTF8_TEXT && core::str::from_utf8(&stream[start..end]).is_err() {
+            return Err(FinalizeError::NotUtf8 { index });
+        }
+    }
+    let recomputed = content_id(
+        &manifest
+            .entries
+            .iter()
+            .map(|e| EntryIdInput {
+                kind: e.kind,
+                path: &e.path,
+                size: if e.kind == KIND_DIRECTORY { 0 } else { e.content_size },
+                entry_hash: e.content_hash,
+            })
+            .collect::<Vec<_>>(),
+    );
+    if recomputed != root.content_id {
+        return Err(FinalizeError::ContentId);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -607,10 +790,9 @@ mod tests {
         (meta, symbols)
     }
 
-    fn build_broadcast(data: &[u8], chunk_raw_size: u32) -> Broadcast {
-        let t = 1024usize;
+    fn build_broadcast(data: &[u8], chunk_raw_size: u32, t: usize) -> Broadcast {
         let manifest = build_manifest(
-            [(KIND_UTF8_TEXT, "hello.bin", data)],
+            [(crate::id::KIND_FILE, "hello.bin", data)],
             chunk_raw_size,
         )
         .unwrap();
@@ -776,7 +958,7 @@ mod tests {
     #[test]
     fn end_to_end_receive_with_loss_reorder_and_dupes() {
         let data: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
-        let bc = build_broadcast(&data, 1 << 20); // one chunk
+        let bc = build_broadcast(&data, 1 << 20, 1024); // one chunk
         let mut rx = Af2Receiver::new();
 
         assert_eq!(rx.ingest(&bc.root_frame).unwrap(), IngestEvent::RootLocked);
@@ -828,7 +1010,7 @@ mod tests {
     #[test]
     fn meta_object_id_binding_rejects_spoofed_frames() {
         let data = vec![9u8; 2000];
-        let bc = build_broadcast(&data, 1 << 20);
+        let bc = build_broadcast(&data, 1 << 20, 1024);
         let mut rx = Af2Receiver::new();
         let _ = rx.ingest(&bc.root_frame).unwrap();
         // Tamper the META's frame object id: recomputation must catch it.
@@ -847,8 +1029,8 @@ mod tests {
     #[test]
     fn mismatch_relock_requires_three_consistent_roots() {
         let data = vec![1u8; 1000];
-        let bc = build_broadcast(&data, 1 << 20);
-        let other = build_broadcast(&vec![2u8; 1000], 1 << 20);
+        let bc = build_broadcast(&data, 1 << 20, 1024);
+        let other = build_broadcast(&vec![2u8; 1000], 1 << 20, 1024);
         let mut rx = Af2Receiver::new();
         let _ = rx.ingest(&bc.root_frame).unwrap();
         assert_eq!(
@@ -890,9 +1072,9 @@ mod tests {
 
     #[test]
     fn alternating_foreign_roots_do_not_relock() {
-        let bc = build_broadcast(&vec![1u8; 1000], 1 << 20);
-        let other1 = build_broadcast(&vec![2u8; 1000], 1 << 20);
-        let other2 = build_broadcast(&vec![3u8; 1000], 1 << 20);
+        let bc = build_broadcast(&vec![1u8; 1000], 1 << 20, 1024);
+        let other1 = build_broadcast(&vec![2u8; 1000], 1 << 20, 1024);
+        let other2 = build_broadcast(&vec![3u8; 1000], 1 << 20, 1024);
         let mut rx = Af2Receiver::new();
         let _ = rx.ingest(&bc.root_frame).unwrap();
         // Two foreign streams alternating forever: each new one resets the
@@ -908,7 +1090,7 @@ mod tests {
 
     #[test]
     fn manifest_verify_failure_unfreezes_and_allows_rebind() {
-        let bc = build_broadcast(&vec![7u8; 4000], 1 << 20);
+        let bc = build_broadcast(&vec![7u8; 4000], 1 << 20, 1024);
         // Corrupt EVERY manifest symbol (source + repair, CRCs fixed up) so
         // the decoder is guaranteed to complete on wrong bytes — good repair
         // symbols would otherwise heal a single corrupted source symbol.
@@ -950,7 +1132,7 @@ mod tests {
 
     #[test]
     fn manifest_meta_with_nonzero_object_index_is_dropped() {
-        let bc = build_broadcast(&vec![5u8; 1000], 1 << 20);
+        let bc = build_broadcast(&vec![5u8; 1000], 1 << 20, 1024);
         let mut rx = Af2Receiver::new();
         let _ = rx.ingest(&bc.root_frame).unwrap();
         // Self-consistent MANIFEST record (binding recomputation passes)
@@ -987,5 +1169,216 @@ mod tests {
         .to_bytes()
         .unwrap();
         assert_eq!(rx.ingest(&frame).unwrap(), IngestEvent::Dropped);
+    }
+
+    #[test]
+    fn instance_switch_accepts_new_broadcast_instance() {
+        // §6: a same-transfer re-broadcast with a new T yields a new
+        // manifest_object_id (OTI is part of the object id). The receiver must
+        // accept the new instance, keep the chunk ledger, drop unfinished
+        // decoders, and re-bind T — not wedge on the frozen first META.
+        let data = vec![4u8; 3000];
+        let bc_t1024 = build_broadcast(&data, 1 << 20, 1024);
+        let bc_t2048 = build_broadcast(&data, 1 << 20, 2048);
+        assert_eq!(
+            bc_t1024.tid, bc_t2048.tid,
+            "same manifest + chunk size ⇒ same transfer id"
+        );
+        let mut rx = Af2Receiver::new();
+        assert_eq!(rx.ingest(&bc_t1024.root_frame).unwrap(), IngestEvent::RootLocked);
+        assert_eq!(rx.symbol_size(), 1024);
+        // Old-instance META binds first and freezes.
+        assert!(matches!(
+            rx.ingest(&bc_t1024.manifest_meta_frame).unwrap(),
+            IngestEvent::MetaBound { .. }
+        ));
+        // The new instance's ROOT switches (same semantics, new manifest oid).
+        assert_eq!(
+            rx.ingest(&bc_t2048.root_frame).unwrap(),
+            IngestEvent::InstanceSwitched
+        );
+        assert_eq!(rx.symbol_size(), 2048);
+        // Old-T frames are now dropped; new-instance META binds cleanly.
+        assert_eq!(
+            rx.ingest(&bc_t1024.manifest_meta_frame).unwrap(),
+            IngestEvent::Dropped
+        );
+        assert!(matches!(
+            rx.ingest(&bc_t2048.manifest_meta_frame).unwrap(),
+            IngestEvent::MetaBound { .. }
+        ));
+        let mut ready = false;
+        for f in &bc_t2048.manifest_symbol_frames {
+            if matches!(rx.ingest(f).unwrap(), IngestEvent::ManifestReady) {
+                ready = true;
+            }
+        }
+        assert!(ready, "manifest must decode from the new instance");
+    }
+
+    #[test]
+    fn foreign_root_with_different_t_can_relock() {
+        // A receiver locked at T=1024 must still be able to re-lock onto a
+        // foreign transfer broadcasting at another T (e.g. the adjacent
+        // sender changed settings). The T filter may not gate ROOT frames.
+        let bc = build_broadcast(&vec![1u8; 1000], 1 << 20, 1024);
+        let other = build_broadcast(&vec![2u8; 1000], 1 << 20, 2048);
+        let mut rx = Af2Receiver::new();
+        assert_eq!(rx.ingest(&bc.root_frame).unwrap(), IngestEvent::RootLocked);
+        assert!(matches!(
+            rx.ingest(&other.root_frame).unwrap(),
+            IngestEvent::RootMismatch { .. }
+        ));
+        assert!(matches!(
+            rx.ingest(&other.root_frame).unwrap(),
+            IngestEvent::RootMismatch { .. }
+        ));
+        assert_eq!(rx.ingest(&other.root_frame).unwrap(), IngestEvent::Relocked);
+        assert_eq!(rx.ingest(&other.root_frame).unwrap(), IngestEvent::RootLocked);
+        assert_eq!(rx.symbol_size(), 2048, "T re-binds at the new lock");
+    }
+
+    #[test]
+    fn stray_foreign_t_frame_before_lock_does_not_wedge() {
+        // The very first decoded frame may be a stray symbol from a DIFFERENT
+        // broadcast (another T). Locking T onto it must be impossible: T is
+        // only bound at ROOT lock.
+        let bc = build_broadcast(&vec![1u8; 1000], 1 << 20, 1024);
+        let other = build_broadcast(&vec![2u8; 1000], 1 << 20, 2048);
+        let mut rx = Af2Receiver::new();
+        assert_eq!(
+            rx.ingest(&other.manifest_symbol_frames[0]).unwrap(),
+            IngestEvent::Dropped
+        );
+        assert_eq!(rx.ingest(&bc.root_frame).unwrap(), IngestEvent::RootLocked);
+        assert_eq!(rx.symbol_size(), 1024);
+    }
+
+    #[test]
+    fn resume_restores_ledger_and_lock() {
+        let data: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
+        let bc = build_broadcast(&data, 1 << 20, 1024);
+        let mut rx = Af2Receiver::new();
+        assert_eq!(rx.resume(&bc.root_frame, &[0, 7]).expect("resume"), 1, "out-of-range index ignored");
+        assert_eq!(rx.symbol_size(), 1024, "T bound from the stored ROOT");
+        // The ledger's completed chunk is ignored cheaply on replay.
+        assert_eq!(
+            rx.ingest(&bc.chunk_meta_frames[0]).unwrap(),
+            IngestEvent::Dropped
+        );
+        // The manifest still decodes and binds.
+        assert!(matches!(
+            rx.ingest(&bc.manifest_meta_frame).unwrap(),
+            IngestEvent::MetaBound { .. }
+        ));
+        let mut ready = false;
+        for f in &bc.manifest_symbol_frames {
+            if matches!(rx.ingest(f).unwrap(), IngestEvent::ManifestReady) {
+                ready = true;
+            }
+        }
+        assert!(ready);
+        // Resuming into a live session is refused.
+        assert!(rx.resume(&bc.root_frame, &[0]).is_err());
+        // Resuming with a non-ROOT stored frame is refused.
+        let mut rx2 = Af2Receiver::new();
+        assert!(rx2.resume(&bc.manifest_meta_frame, &[]).is_err());
+    }
+
+    #[test]
+    fn verify_final_stream_end_to_end() {
+        // Full receive → reassemble → §13 ⑧⑨ gate passes; any tamper fails.
+        // build_broadcast tags the entry UTF8_TEXT, so the payload must be
+        // valid UTF-8 for the clean pass (ASCII here).
+        let data: Vec<u8> = (0..5000u32).map(|i| b'a' + (i % 26) as u8).collect();
+        let bc = build_broadcast(&data, 1 << 20, 1024);
+        let mut rx = Af2Receiver::new();
+        rx.ingest(&bc.root_frame).unwrap();
+        rx.ingest(&bc.manifest_meta_frame).unwrap();
+        for f in &bc.manifest_symbol_frames {
+            rx.ingest(f).unwrap();
+        }
+        rx.ingest(&bc.chunk_meta_frames[0]).unwrap();
+        for f in &bc.chunk_symbol_frames {
+            rx.ingest(f).unwrap();
+        }
+        // verify_final_stream needs root+manifest only; pass the exact stream.
+        rx.verify_final_stream(&data).expect("clean stream must verify");
+        let mut tampered = data.clone();
+        tampered[0] ^= 0xFF;
+        assert_eq!(
+            rx.verify_final_stream(&tampered),
+            Err(FinalizeError::EntryHash { index: 0 })
+        );
+        let short = data[..data.len() - 1].to_vec();
+        assert!(matches!(
+            rx.verify_final_stream(&short),
+            Err(FinalizeError::Length { .. })
+        ));
+    }
+
+    #[test]
+    fn verify_stream_rejects_bad_utf8_text_and_wrong_content_id() {
+        use crate::manifest::ManifestEntry;
+        let bad = [0xFFu8, 0xFE, 0x01, 0x02]; // invalid UTF-8
+        let m = Manifest {
+            entries: vec![ManifestEntry {
+                kind: KIND_UTF8_TEXT,
+                path: "t.txt".into(),
+                content_offset: 0,
+                content_size: bad.len() as u64,
+                content_hash: hash(&bad),
+                extensions: vec![],
+            }],
+            chunk_count: 1,
+            chunk_raw_size: 1 << 20,
+            total_raw_size: bad.len() as u64,
+            chunk_hashes: vec![hash(&bad)],
+            extensions: vec![],
+        };
+        let inputs = vec![EntryIdInput {
+            kind: KIND_UTF8_TEXT,
+            path: "t.txt",
+            size: bad.len() as u64,
+            entry_hash: hash(&bad),
+        }];
+        let root = RootRecord {
+            content_id: content_id(&inputs),
+            manifest_object_id: [0; 16],
+            manifest_hash: [0; 32],
+            total_raw_size: bad.len() as u64,
+            entry_count: 1,
+            chunk_count: 1,
+            chunk_raw_size: 1 << 20,
+            extensions: vec![],
+        };
+        assert_eq!(
+            verify_stream(&root, &m, &bad),
+            Err(FinalizeError::NotUtf8 { index: 0 })
+        );
+        // Valid UTF-8 payload but ROOT announcing a different content id → ⑨ fails.
+        let good_data = b"clean-text-content";
+        let m_good = Manifest {
+            entries: vec![ManifestEntry {
+                kind: KIND_UTF8_TEXT,
+                path: "t.txt".into(),
+                content_offset: 0,
+                content_size: good_data.len() as u64,
+                content_hash: hash(good_data),
+                extensions: vec![],
+            }],
+            chunk_count: 1,
+            chunk_raw_size: 1 << 20,
+            total_raw_size: good_data.len() as u64,
+            chunk_hashes: vec![hash(good_data)],
+            extensions: vec![],
+        };
+        let mut wrong = root.clone();
+        wrong.total_raw_size = good_data.len() as u64;
+        wrong.content_id = [0x77; 32];
+        assert_eq!(
+            verify_stream(&wrong, &m_good, good_data),
+            Err(FinalizeError::ContentId)
+        );
     }
 }

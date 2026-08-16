@@ -73,16 +73,17 @@ pub enum RootError {
     ChunkCountTooLarge(u32),
     #[error("root: total_raw_size {0} exceeds 4 TiB")]
     TotalTooLarge(u64),
+    #[error("root: total_raw_size must be ≥ 1 (empty canonical stream is unrepresentable: RaptorQ cannot encode F=0)")]
+    EmptyTransfer,
     #[error("root: {0}")]
     Tlv(#[from] crate::tlv::TlvError),
 }
 
+/// `chunk_count = ceil(total_raw_size / chunk_raw_size)` (SPEC §6). The
+/// canonical stream must be non-empty (`total_raw_size ≥ 1` is enforced by
+/// encode/parse), so the ceil is always ≥ 1 on any legal ROOT.
 pub fn expected_chunk_count(total_raw_size: u64, chunk_raw_size: u32) -> u32 {
-    if total_raw_size == 0 {
-        1 // An empty manifest still has one (empty) canonical chunk per spec
-    } else {
-        u32::try_from(total_raw_size.div_ceil(u64::from(chunk_raw_size))).unwrap_or(u32::MAX)
-    }
+    u32::try_from(total_raw_size.div_ceil(u64::from(chunk_raw_size))).unwrap_or(u32::MAX)
 }
 
 impl RootRecord {
@@ -92,6 +93,9 @@ impl RootRecord {
         }
         if !CHUNK_SIZES.contains(&self.chunk_raw_size) {
             return Err(RootError::BadChunkSize(self.chunk_raw_size));
+        }
+        if self.total_raw_size == 0 {
+            return Err(RootError::EmptyTransfer);
         }
         if self.total_raw_size > MAX_TOTAL_RAW_SIZE {
             return Err(RootError::TotalTooLarge(self.total_raw_size));
@@ -228,6 +232,10 @@ mod tests {
         let mut r = sample();
         r.entry_count = 0;
         assert!(matches!(r.encode(), Err(RootError::BadEntryCount(0))));
+        let mut r = sample();
+        r.total_raw_size = 0;
+        r.chunk_count = 0; // keep the ceil formula happy; the empty check fires first
+        assert!(matches!(r.encode(), Err(RootError::EmptyTransfer)));
         // tampered magic
         let mut bytes = sample().encode().unwrap();
         bytes[0] = b'X';

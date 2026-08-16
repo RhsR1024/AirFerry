@@ -66,6 +66,8 @@ pub enum ManifestError {
     ChunkCountMismatch { count: u32, expected: u32 },
     #[error("manifest: chunk_raw_size {0:#x} not legal")]
     BadChunkSize(u32),
+    #[error("manifest: total_raw_size must be ≥ 1 (empty canonical stream is unrepresentable)")]
+    EmptyStream,
     #[error("manifest: exceeds 16 MiB cap ({0} bytes)")]
     TooLarge(usize),
     #[error("manifest: entry {index}: {reason}")]
@@ -161,6 +163,9 @@ impl Manifest {
         }
         if !crate::root::CHUNK_SIZES.contains(&self.chunk_raw_size) {
             return Err(ManifestError::BadChunkSize(self.chunk_raw_size));
+        }
+        if self.total_raw_size == 0 {
+            return Err(ManifestError::EmptyStream);
         }
         let expected_chunks =
             crate::root::expected_chunk_count(self.total_raw_size, self.chunk_raw_size);
@@ -483,6 +488,14 @@ pub fn build_manifest<'a>(
                 reason: "directory entry must carry empty content",
             });
         }
+        if kind == KIND_UTF8_TEXT && core::str::from_utf8(content).is_err() {
+            // Fail at the sender instead of a guaranteed §13 ⑧ rejection at
+            // every receiver after a full transfer.
+            return Err(ManifestError::BadEntry {
+                index: entries.len(),
+                reason: "UTF8_TEXT entry content is not valid UTF-8",
+            });
+        }
         let (offset, size, chash) = if kind == KIND_DIRECTORY {
             (0, 0, empty_hash())
         } else {
@@ -501,6 +514,9 @@ pub fn build_manifest<'a>(
         });
     }
     let total = stream.len() as u64;
+    if total == 0 {
+        return Err(ManifestError::EmptyStream);
+    }
     let chunk_count = crate::root::expected_chunk_count(total, chunk_raw_size);
     let mut chunk_hashes = Vec::with_capacity(chunk_count as usize);
     // u64 offsets: see sender.rs — usize math wraps on wasm32 for >4 GiB
@@ -580,6 +596,21 @@ mod tests {
         }
         assert!(validate_path("dir/好文件.txt").is_ok());
         assert!(validate_path(&("a/".repeat(200) + "leaf.txt")).is_ok());
+    }
+
+    #[test]
+    fn rejects_empty_canonical_stream() {
+        // SPEC §6: total_raw_size ≥ 1 — an all-empty item set (or a single
+        // empty file) cannot be represented on the wire.
+        assert!(matches!(
+            build_manifest([(KIND_UTF8_TEXT, "empty.txt", b"" as &[u8])], 1 << 20),
+            Err(ManifestError::EmptyStream)
+        ));
+        let mut m = sample();
+        m.total_raw_size = 0;
+        m.chunk_count = 0;
+        m.chunk_hashes.clear();
+        assert!(matches!(m.encode(), Err(ManifestError::EmptyStream)));
     }
 
     #[test]
