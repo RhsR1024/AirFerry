@@ -9,7 +9,7 @@ AirFerry 是一个完全离线的光学文件传输系统。发送端（浏览�
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │              发送端 (Browser Extension / Web)                     │
-│  Chrome/Edge/Firefox · MV2 & MV3 · Plasmo + React + TS           │
+│  Chrome/Edge/Firefox · MV2 & MV3 · Vite + React + TS             │
 │  网页端 Vite 复用同一份 sender 源码                                │
 │                                                                  │
 │  统一列表（文件 + 文字）→ 显式「发送」→ [三算法选优压缩] → [Rust/WASM] │
@@ -70,38 +70,113 @@ core/
 ### 发送端
 
 ```
-统一 pending 列表（File + 文字 content）
-  │ 用户点「发送」才进入 worker
-  ├─ 恰好 1 条文字、0 文件 → ETTEXTv1（processText）
-  ├─ 否则文字物化为命名 .txt + 文件 → ≥2 则 ETBUNDL1
-  ├─ 三算法选优压缩 (Raw / Zstd Lv1 / Xz Lv9)，70% early-exit
-  ├─ 整段压缩一次；压缩流 > ~32 MiB → 按 ~32 MiB 切压缩流段（文件/包/文字均可）
-  ├─ 零填充到 symbol_size 整数倍
-  ├─ RaptorQ 编码（RFC 6330 自动分源块）
-  └─ 源符号一遍 → 持续新鲜修复符号；每 17 帧插描述符（首帧即描述符，多码布局下轮转码位）
-         Frame → QR 编码 → Canvas（单码或 4 码 tile）
+        ┌────────────────────────────┐
+        │ 统一 pending 列表           │  添加文件（全页拖放/点选/文件夹，追加）
+        │ PendingItem[]              │  添加文字（弹窗 → 命名 .txt + content）
+        └────┬───────────────────────┘
+             │ 用户点「发送」（此前不压缩、不跳页）
+             ▼
+     ┌───────┴────────┐
+     │ 1×text 且无文件 │ 否则（文件和/或 ≥1 文字）
+     ▼                ▼
+ processText      文字→File(.txt) + 文件
+ ETTEXTv1         ≥2 → buildBundle(ETBUNDL1)
+     │                │ 1 项 → 单文件路径
+     └───────┬────────┘
+             ▼
+                ┌────────────────────┐
+                │ 三算法选优压缩      │  Raw / Zstd Lv1 / Xz Lv9
+                │ preparePayload     │  70% Zstd early-exit
+                │ (compress.worker)  │
+                └────┬───────────────┘
+                     │ 整段压缩一次；压缩流 > ~32 MiB → 按 ~32 MiB 切压缩流段
+                     ▼
+              ┌──────────────┐
+              │ 零填充对齐    │  T = symbol_size（浏览器默认 1400）
+              │ → N×T 字节   │
+              └────┬─────────┘
+                   ▼
+        ┌─────────────────────┐
+        │ RaptorQ 编码         │  Encoder::with_defaults
+        └────┬────────────────┘
+             ▼
+   ┌──────────────────────────────┐
+   │ 发射策略 (sender::next_frame) │
+   │ ① 源符号跨块轮询一遍          │
+   │ ② 持续新鲜修复符号（ESI↑）    │
+   └────┬─────────────────────────┘
+        ▼
+    ┌──────────────────┐     每 17 帧 / 首帧
+    │ 帧封装           │ ◄─── 描述符帧
+    │ Header+Payload   │
+    │ +Footer+CRC×2    │
+    └────┬─────────────┘
+         │ (60+T+4) 字节帧
+         ▼
+   ┌──────────────┐
+   │ QR 编码       │  min_version_for（1464B → V27 125×125）
+   └────┬─────────┘
+        ▼
+  ┌──────────────┐
+  │ Canvas 渲染   │  next_qr_scratch/view + drawMatrix + putImageData
+  │ 单码 or 4码   │  默认 multiQr=4；fps 默认 60
+  └──────┬───────┘
+         ▼
+    屏幕二维码视频流 ▶ ▶ ▶
 ```
 
-> **持续新鲜修复符号**：源符号发完后持续产生从未见过的修复符号，进度近似线性；每块 ESI 达 2²⁴ 时明确停止，避免回绕或 panic。
+> **持续新鲜修复符号**：源符号发完后持续产生从未见过的修复符号，进度近似线性；每块 ESI 达 2²⁴ 时明确停止，避免回绕或 panic。`redundancy_pct` 仅 UI 估算。
 
 ### 接收端
 
 ```
-摄像头 / 采集卡 / [Windows] 屏幕区域·窗口捕获 (~60fps)
-  │
-  ├─ 生产者将 Gray 池化拷贝一次入队 → 2–6 worker 并行 ZXing-C++
-  ├─ Android：v1.1.3 调度/JNI；Windows：等价 C#/C ABI 模式
-  ├─ Windows 同一采集句柄节流 BGR24 快照 → WPF 预览（UI 不读设备）
-  ├─ 串行 ingest（锁）：帧校验 → 去重 → RaptorQ
-  └─ assemble + 解压后分流：
-       ⓪ descriptor-v5 → 逐段 SHA 校验 + 磁盘/IndexedDB 账本；原生端流式解压写盘（bounded RAM）
-       ① ETTEXTv1 → ReceiveText（复制/分享/存盘）
-       ② ETBUNDL1 → 拆包；文本类扩展名可点进 ReceiveText
-       ③ 单文件 + TextLike 扩展名 + 严格 UTF-8 → ReceiveText
-       ④ 否则 → 普通文件详情
+              屏幕二维码视频流 ▶ ▶ ▶
+                       │
+                       ▼
+            ┌───────────────────┐
+            │ 摄像头 / 采集卡    │  Android: ImageAnalysis @ ~60fps, 1920×1080
+            │                   │  Windows: OpenCvSharp DirectShow
+            └────┬──────────────┘
+                 ├── Windows: 同一次读取按 15fps 池化快照 → WPF 预览
+                 ▼
+          ┌────────────────────────┐
+          │ 池化 Gray 一次拷贝→队列 │  满则丢最新（喷泉码）
+          └────┬───────────────────┘
+               ▼
+        ┌──────────────────────────────┐
+        │ 2–6 解码 worker（并行）        │  Android v1.1.3 JNI / Windows 等价 C#/C ABI 模式
+        └────┬─────────────────────────┘
+             ▼
+        ┌──────────────────────────┐
+        │ 串行 ingest（锁）         │  原生句柄非线程安全
+        │ magic + CRC×2            │
+        └────┬─────────────────────┘
+             ▼
+       描述符 / 数据符号 → RaptorQ → assemble + 解压（descriptor-v5 → 逐段 SHA 校验 + 磁盘/IndexedDB 账本；原生端流式解压写盘，bounded RAM）
+             ▼
+         ┌──────────────────────────────────────┐
+         │ ① ETTEXTv1? → ReceiveText            │
+         │ ② ETBUNDL1? → 拆包；.txt 等可点复制   │
+         │ ③ TextLike 文件名 + 严格 UTF-8?       │
+         │      → ReceiveText                   │
+         │ ④ 否则 → 单文件详情 / 分享 / 存盘     │
+         └──────────────────────────────────────┘
 ```
 
-> **并行解码池**：采集与解码解耦；QR 识别可并行，但原生 receiver 句柄非线程安全，ingest 必须串行。进度 UI 从一致快照展示接收进度、3 秒窗口速率和有效吞吐；不再展示容易误判的逐二维码活跃/暂停状态。详见 [data-flow.md](data-flow.md)。
+> **并行解码池 / 解码摄入分离**：采集与解码解耦；QR 识别可并行，但原生 receiver 句柄非线程安全，ingest 必须串行。完成时先停止摄入再 `assemble()`；会话切换和进度快照都在 ingest 锁内完成。Android 的 worker/批摄入/全帧与 ROI 状态机及 JNI 识别逻辑固定为 v1.1.3；Windows 用 C#/C ABI 镜像相同 worker 数、队列容量、4 符号批摄入、miss 状态机和 TryHarder/TryInvert 选项。进度 UI 从一致快照展示接收进度、3 秒窗口速率和有效吞吐；不再展示容易误判的逐二维码活跃/暂停状态。
+
+### 进度反馈流
+
+```
+解码 worker → (ingest 锁) → ReceiverSession.ingest(frame)
+        │
+        ▼
+   Progress { decoded_symbols, total_symbols, received_symbols,
+              decoded_fraction, loss_ratio, ... }
+        │
+        ▼ (JSON / 位域，UI 节流 ~7Hz)
+   进度条 + 3 秒窗口解码速率 + 有效吞吐 + 文件大小
+```
 
 ## 容错设计
 
@@ -125,31 +200,34 @@ core/
 | 参数 | 值 | 说明 |
 |------|-----|------|
 | Symbol Size (T) | 浏览器默认 **1400** / 核心库默认 **1024** | 每帧载荷；收端从帧头自适应 |
-| 速度预设 | 512 / 896 / 1008 / **1400（默认）** / 1904 / 2400 | 均为 8 字节倍数；见 [qr-frame-format.md](qr-frame-format.md) |
-| QR Version | 动态最小 | **1464B 帧 → V27 (125×125)**；1088B → V23 |
+| 速度预设 | 512 / 896 / 1008 / **1400（默认）** / 1904 / 2400 | 均为 8 字节倍数；见 [SPEC.md](SPEC.md) |
+| QR Version | 动态最小 | **1430B 帧 → V27 (125×125)**；1088B → V23 |
 | QR 纠错 | L | 最大化容量 |
 | 4 码并行 | 默认 4 | 同帧 tile 4 符号 |
 | 默认冗余率 | 5% | 仅 UI 时长估算 |
-| 描述符间隔 | 17 帧 | 首帧即描述符；与 2/4 多码布局互质，轮转全部物理码位 |
+| 描述符间隔 | ~17/31 帧 | 周期轮转 ROOT 与 OBJECT_META |
 | 帧率 | 15 / 20 / 30 / 45 / 60（默认）/ 90 / 120 / 0=无限制 | `types.ts` + Params UI |
 | 接收采集（Android） | ~60fps | **ImageAnalysis 1920×1080** |
 | 亚像素抖动 | 默认关 | ±1px 打散摩尔纹 |
 
-## 多文件 / 混发
+## 性能基准（实测）
 
-- 2–4096 项（文件和/或文字 `.txt`）→ `ETBUNDL1` 单容器，一条压缩 + 一条 RaptorQ 流；原生内容库批量提交历史索引，避免逐文件 O(n²) 重写。
-- 单文件不打包（向后兼容）。
-- 单条纯文字 → `ETTEXTv1`（descriptor 文件名 = 选择页用户命名，默认 `文字消息.txt`）。
-- 格式见 [protocol.md](protocol.md)、[SPEC.md](SPEC.md)。
+- **Rust 核心不是瓶颈**：WASM 接收端 ingest 约 1000 MiB/s（~100 万符号/秒）；8 MB 文件完整恢复约 7.3 ms。
+- **光学信道才是瓶颈**：默认 1400B 符号、60 fps 下理论上限约 78 KiB/s（单码）/ 308 KiB/s（四码）；核心算力富余约 4000 倍。接收端实际瓶颈在摄像头采集帧率与 ZXing 解码，不在 Rust 核心。
+
+## 多文件与混发
+
+- 1–4096 项（文件、文字、目录）统一由 AF2 Manifest 描述与分块，结构化传输。
+- 格式与位级契约详见 [SPEC.md](SPEC.md)。
 
 ## 4 码并行模式
 
-默认 `multiQr=4`。详见 [qr-frame-format.md](qr-frame-format.md#4-码并行模式)。
+默认 `multiQr=4`，同屏渲染 4 个并行 QR 码，提升光学吞吐量。
 
 ## 速度预设与帧率
 
-六档 symbol 预设 + 独立 fps（含 120、无限制）。`redundancy_pct` 仅估算用。详见 [qr-frame-format.md](qr-frame-format.md)。
+六档 symbol 预设（T = 512..2400）+ 独立 fps。详见 [SPEC.md](SPEC.md)。
 
 ## 亚像素抖动
 
-`ditherJitter` 默认关。详见 [qr-frame-format.md](qr-frame-format.md#亚像素抖动-dither)。
+`ditherJitter` 默认关（±1px 打散摩尔纹）。

@@ -110,91 +110,85 @@ pub struct FileMeta {
 
 ## WASM 绑定（浏览器）
 
+> 以下签名以 `apps/web/wasm-pkg/transfer_engine.d.ts` 为准（AF2 快照化接口）。发送端经 `SenderBuilderWasm` 收拢条目后构建会话，接收端经 `ReceiverSessionWasm`+`snapshot_json` 恢复。旧 v1 接口（`SenderSessionWasm` 构造参数压缩负载、`receiverFileName` 等逐字段 getter）已移除。
+
 ```typescript
-// SenderSessionWasm（发送端）
+// SenderBuilderWasm（发送端：收拢条目 → 构建会话）
+class SenderBuilderWasm {
+  constructor()
+  add_entry(kind: number, path: string, content: Uint8Array): void
+  // kind: 1=文件, 2=UTF-8 文字, 3=目录
+  build(symbol_size: number, chunk_raw_size: number, redundancy_pct: number): SenderSessionWasm
+}
+
+// SenderSessionWasm（发送端帧流）
 class SenderSessionWasm {
-  constructor(
-    compressedPayload: Uint8Array,
-    sessionIdLo: bigint,
-    sessionIdHi: bigint,
-    redundancyPct: number,
-    symbolSize: number,
-    filename: string,
-    originalFileSize: bigint,
-    crc32: number,
-    compression: number          // 0=None, 1=Zstd, 2=XZ
-  )
-  next_frame(): Uint8Array        // 帧字节
-  stats_json(): string           // {bytes, frames, elapsed_ms, fps, throughput_bps}
-  session_id_lo(): bigint
-  session_id_hi(): bigint
-  total_symbols(): number
-  num_blocks(): number
+  next_qr_scratch(count: number): number // 预分配 scratch；热路径跨帧复用
+  qr_scratch_view(): Uint8Array          // 借用当帧矩阵（下一次 next_qr_scratch 即失效，勿缓存）
+  stats_json(): string                   // {bytes, frames, elapsed_ms, fps, throughput_bps}
+  content_id_hex(): string
+  transfer_id_hex(): string
+}
+
+// Sha256Wasm（独立哈希）
+class Sha256Wasm {
+  constructor()
+  update(bytes: Uint8Array): void
+  digest(): Uint8Array
 }
 
 // QR 编码（独立函数）
-function encode_qr(frameBytes: Uint8Array, outSide: Uint32Array): Uint8Array
-// 返回扁平模块网格（1=深色, 0=浅色），outSide[0] = 边长
+function encode_qr(frame_bytes: Uint8Array, out_side: Uint32Array): Uint8Array
+// 返回扁平模块网格（1=深色, 0=浅色），out_side[0] = 边长
 
-// ReceiverSessionWasm（接收端，网页接收端用）
+// ReceiverSessionWasm（接收端，网页接收端用，AF2 状态机）
 class ReceiverSessionWasm {
-  // 方式一（推荐）：从首个描述符帧构造。内部校验完整帧 CRC + descriptor flag，
-  // 锁定 session id，摄入描述符使 meta 立即 confirmed。坏帧/非描述符/敌意
-  // payload 返回 Error —— JS 侧据此丢弃首个描述符前的数据帧，并重试下一个描述符。
-  static from_descriptor(frameBytes: Uint8Array): ReceiverSessionWasm
+  constructor()
 
-  // 方式二：缓存引导（与 JNI receiverCreate / C ABI airferry_receiver_create 一致）。
-  // data frames 缓存直到首个校验过的描述符到来。sid_lo/hi 为 128 位 session id 的低/高 64 位。
-  constructor(sessionIdLo: bigint, sessionIdHi: bigint)
+  // 摄入一帧解码后的 QR 原始字节（26B header + payload + 4B CRC）。返回事件码：
+  //   0=Dropped 1=RootLocked 2=RootMismatch 3=Relocked 4=MetaBound
+  //   5=MetaRejected 6=SymbolAccepted 7=ManifestReady 8=ChunkReady 9=ChunkRejected
+  ingest(frame_bytes: Uint8Array): number
 
-  // 摄入一帧解码后的 QR 原始字节（header+payload+footer）。返回 packed u64：
-  //   bit0 complete | bit1 accepted | bits8..23 session_mismatch_streak | bits32..63 received_symbols
-  // 位布局与 JNI receiverIngest / C ABI airferry_receiver_ingest 完全一致（三端共享 ingest_status::pack）。
-  // received_symbols == 0xFFFFFFFF（INGEST_ERROR）= 帧被拒（CRC/长度校验失败）。
-  ingest(frameBytes: Uint8Array): bigint
+  // 单 JSON 快照（ReceiverSnapshotV2）：schema_version / meta_confirmed /
+  // transfer_id_hex / content_id_hex / total_raw_size / entry_count / chunk_count /
+  // chunk_raw_size / symbol_size / entries[]。替代旧逐字段 getter。
+  snapshot_json(): string
 
-  progress_json(): string   // 同 JNI receiverProgressJson 的 JSON 字段
-  is_complete(): boolean
-
-  // 元数据（对齐 JNI receiverFileName/FileSize/Crc32/Crc32Known）
-  session_id_lo(): bigint
-  session_id_hi(): bigint
-  file_name(): string       // 空字符串直到描述符到来
-  original_size(): bigint   // 解压后原文件大小
-  compressed_size(): bigint // 传输载荷大小
-  compressed_size_known(): boolean
-  compression(): number     // 0=None,1=Zstd,2=Xz —— JS 侧据此选解压器
-  crc32(): number           // 注意 JS 侧用 >>> 0 读无符号（0xDEADBEEF 超有符号 32 位）
-  crc32_known(): boolean
-  meta_confirmed(): boolean
-
-  // 只重组不解压。返回传输字节（compressed_size_known 时截断到 compressed_size）。
-  // compression==NONE 时即原文件；Zstd/Xz 时 JS 侧用 @foxglove/wasm-zstd / lzma-wasm 解压
-  // 后校验长度==original_size、CRC32（crc32_known 时）。未完成返回空 Uint8Array。
-  assemble_raw(): Uint8Array
+  // 最近就绪的 chunk（ManifestReady/ChunkReady 后取）：
+  last_chunk_index(): number
+  last_chunk_bytes(): Uint8Array
 }
 ```
 
-> **WASM 接收端不内置解压**：wasm32 构建下 `qr-protocol` 的 zstd/xz C 库无法编译，
-> `decompress_with_limit` 对 `COMPRESSION_ZSTD`/`COMPRESSION_XZ` **fail-closed**（返回 Err），
-> 仅 `COMPRESSION_NONE` 原样返回。因此网页接收端走 `assemble_raw` + JS 侧自解压，
-> 不调用会触发解压的 `assemble_result`。发送端压缩仍在 worker 内用 JS 侧 zstd/xz 完成，两端 on-wire 格式一致。
+> **WASM 接收端不内置解压**：AF2 下每个 chunk 经 Rust RaptorQ 恢复后由核心按
+> chunk 元数据解压（`chunk_raw_size` 定界），接收 worker 只消费 `last_chunk_bytes`
+> 的已解压字节，不再自选解压器。发送端压缩由 Rust 核心在单趟流水线内完成。
 
-> **构造参数来源**：`compressedPayload` / `sessionId` / `crc32` / `compression` 由 `src/workers/compress.worker.ts` 离线产出（避免同步 WASM 卡住 UI）。主线程仅在用户点「发送」后 postMessage（均带 `jobId` = 当前 epoch）：
-> - `{ jobId, text, name? }` → `processText`：包 `ETTEXTv1` 魔数后压缩（**仅**列表里恰好 1 条文字时）；`name` 经 `normalizeDraftFilename` 写入 descriptor 并参与 session 派生（缺省 `文字消息.txt`）
-> - `{ jobId, files }` → `processFiles`：0/1 文件原样；≥2 → `bundle.ts` ETBUNDL1；混发时文字已物化为命名 `.txt` File
-> - `{ type: "wasm-init", zstd?: ArrayBuffer \| null }`：主线程**始终**发送（失败时 `zstd: null`），worker 标记 ready；无 zstd 时 `preparePayload` 回退 raw，**不得**永久挂起队列
+> **构造参数来源**：条目由 `src/workers/compress.worker.ts`（AF2 file-preparation
+> worker）离线读取产出 `PreparedItem[]`（`{ kind, path, content }`），主线程点「发送」
+> 后 `postMessage`（带 `jobId` = 当前 epoch）：
+> - `{ jobId, text, name? }` → 单条文字：`kind=KIND_UTF8_TEXT(2)`，path 用选择页命名（缺省 `文字消息.txt`）
+> - `{ jobId, files }` → 文件列表：逐文件读取，重名自动加 ` (N)` 后缀；`kind=KIND_FILE(1)`
+> - `{ type: "wasm-init", zstd?: ArrayBuffer | null }`：主线程始终发送，worker 标记 ready
 > - 过期 `jobId` 的 progress/`done`/`error` 在 worker 与主线程双侧丢弃（改列表/回选择页 bump epoch）
-> 然后 `compress.ts` 三算法选优 → CRC → `session.ts` 派生会话 ID。详见 [protocol.md](protocol.md)、[data-flow.md](data-flow.md)。
+> 然后 `options.tsx` 用 `SenderBuilderWasm.add_entry` + `build(symbol_size, chunk_raw_size, redundancy_pct)`
+> 构建会话。详见 [SPEC.md](SPEC.md) 与 [architecture.md](architecture.md#数据流)。
 
 ## JNI 绑定（Android）
 
 ```kotlin
 object NativeBridge {
+    const val NATIVE_ABI_VERSION = 2   // 2: 快照化 FFI（receiverSnapshotJson 取代逐字段 getter）
+
+    /** 启动期握手：断言 nativeAbiVersion() >= NATIVE_ABI_VERSION，否则进入 ErrorScreen。 */
+    external fun nativeAbiVersion(): Int
+
+    /** 创建接收会话；返回不透明指针（Long）。 */
     external fun receiverCreate(
         sessionIdLo: Long, sessionIdHi: Long,
         totalBlocks: Int, totalSymbols: Int, symbolSize: Int
-    ): Long  // handle（不透明指针）
+    ): Long
 
     // 摄入一帧；返回 packed Long：完成/接受/mismatch/已收符号数，位布局见 SPEC.md
     external fun receiverIngest(handle: Long, frameBytes: ByteArray): Long
@@ -203,15 +197,18 @@ object NativeBridge {
     external fun receiverProgressJson(handle: Long): ByteArray?
 
     external fun receiverIsComplete(handle: Long): Int
+
+    // 单 JSON 接收快照（ReceiverSnapshotV1）：文件名/大小/CRC/压缩标签、
+    // 会话 ID 与分段元数据一次取全，替代旧 16 个逐字段 getter
+    external fun receiverSnapshotJson(handle: Long): String?
+
     external fun receiverAssembleBytes(handle: Long): ByteArray?
     external fun receiverLastAssembleError(handle: Long): String
-    external fun receiverDestroy(handle: Long)
 
-    // 文件元数据（来自描述符帧）
-    external fun receiverFileName(handle: Long): String
-    external fun receiverFileSize(handle: Long): Long
-    external fun receiverCrc32(handle: Long): Long   // 无符号 32 位装入 Long
-    external fun receiverCrc32Known(handle: Long): Int
+    // 按索引重组 chunk 字节（多文件经 entries + 逐 chunk 还原）
+    external fun receiverAssembleChunk(handle: Long, index: Int): ByteArray?
+
+    external fun receiverDestroy(handle: Long)
 }
 
 object ZxingDecoder {
@@ -221,7 +218,10 @@ object ZxingDecoder {
 }
 ```
 
-> **线程模型**：`receiverIngest`/`receiverAssembleBytes` 等操作同一原生句柄，**非线程安全**。Android 侧用一把 ingest 锁串行化所有调用，ZXing 解码则在多个 worker 上并行（见 [data-flow.md](data-flow.md)）。
+> **线程模型**：`receiverIngest`/`receiverAssembleBytes` 等操作同一原生句柄，**非线程安全**。Android 侧用一把 ingest 锁串行化所有调用，ZXing 解码则在多个 worker 上并行（见 [architecture.md](architecture.md#数据流)）。
+
+> **快照消费模式**：UI 以约 7Hz 拉取 `receiverSnapshotJson`（原子、单 JSON）；恢复期按
+> `entries` + `receiverAssembleChunk` 逐 chunk 落盘，不再解析字节级容器。
 
 ### 进度 JSON 格式
 

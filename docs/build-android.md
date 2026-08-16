@@ -198,8 +198,7 @@ apps/scanner/
         │   │   ├── QrStreamAnalyzer.kt   # CameraX 分析器（生产者）
         │   │   ├── QrDecodePool.kt       # 并行解码池 + 串行 JNI 摄入
 │   │   ├── ReceiverSessionManager.kt
-│   │   ├── BundleParser.kt       # ETBUNDL1 多文件容器解析
-│   │   ├── TextParser.kt         # ETTEXTv1
+│   │   ├── ContentStore.kt       # 内容库存储（entries 索引 + blob 引用计数）
 │   │   ├── TextLike.kt           # 文本类扩展名启发式 + 严格 UTF-8
 │   │   └── FileNameUtil.kt       # 接收文件命名（去重 / 目录）
 │   └── ui/
