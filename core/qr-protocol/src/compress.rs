@@ -583,7 +583,7 @@ mod tests {
     #[test]
     fn clamped_zstd_decoder_accepts_legitimate_streams() {
         for (level, len) in [(1, 1 << 20), (3, 300_000), (DEFAULT_LEVEL, 40_000)] {
-            let data: Vec<u8> = (0..len).map(|i| (i * 31 & 0xff) as u8).collect();
+            let data: Vec<u8> = (0..len).map(|i| ((i * 31) & 0xff) as u8).collect();
             let z = compress(&data, level).unwrap();
             assert_eq!(
                 decompress_with_limit(&z, COMPRESSION_ZSTD, data.len()).unwrap(),
