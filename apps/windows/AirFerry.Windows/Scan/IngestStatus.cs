@@ -15,7 +15,9 @@ public readonly record struct IngestStatus(
     bool Complete,
     bool Accepted,
     int MismatchStreak,
-    int ReceivedSymbols)
+    int ReceivedSymbols,
+    bool ManifestReady = false,
+    bool ChunkReady = false)
 {
     /// <summary>
     /// Decode a packed status word, or <see langword="null"/> on the error
@@ -32,8 +34,10 @@ public readonly record struct IngestStatus(
 
         bool complete = (word & 1u) != 0u;
         bool accepted = ((word >> 1) & 1u) != 0u;
+        bool manifestReady = ((word >> 2) & 1u) != 0u;
+        bool chunkReady = ((word >> 3) & 1u) != 0u;
         int streak = (int)((word >> 8) & 0xFFFFu);
         int received = (int)receivedField;
-        return new IngestStatus(complete, accepted, streak, received);
+        return new IngestStatus(complete, accepted, streak, received, manifestReady, chunkReady);
     }
 }

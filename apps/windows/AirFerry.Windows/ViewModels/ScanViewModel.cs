@@ -41,6 +41,14 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     private IFrameSource? _capture;
     private QrDecodePool? _pool;
     private ReceiverSession? _session;
+    /// <summary>
+    /// On-disk staging for completed chunks (bounded-memory ledger): chunks are
+    /// spilled + evicted on the ingest thread as they complete; recovery reads
+    /// the canonical stream straight from the file. Null until the first
+    /// ChunkReady. Touched on the pool's serialized ingest path and the
+    /// lifecycle swap paths that run under the same ingest lock.
+    /// </summary>
+    private ChunkSpillStore? _chunkSpill;
     private Thread? _producerThread;
     private volatile bool _producerRunning;
     private bool _disposed;
@@ -255,6 +263,8 @@ public partial class ScanViewModel : ObservableObject, IDisposable
                 throw new InvalidOperationException(
                     $"二维码解码库 ABI 不兼容（期望 1，实际 {zxingAbi}）");
             }
+            _chunkSpill?.Discard();
+            _chunkSpill = null;
             _session = new ReceiverSession();
             Interlocked.Exchange(ref _recoveryStarted, 0);
             _capture = FrameSourceFactory.Create(source);
@@ -299,6 +309,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         QrDecodePool? pool;
         IFrameSource? capture;
         ReceiverSession? session;
+        ChunkSpillStore? spill;
         Task<RecoveryOutcome>? recoveryTask;
         Task cleanup;
         lock (_lifecycleGate)
@@ -323,6 +334,8 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             _capture = null;
             session = _session;
             _session = null;
+            spill = _chunkSpill;
+            _chunkSpill = null;
             recoveryTask = _recoveryCoreTask;
             if (producer is null && pool is null && capture is null &&
                 session is null && recoveryTask is null)
@@ -335,7 +348,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
                 // gate. A simultaneous StopScan then observes it and cannot
                 // detach/dispose a second copy of this pipeline.
                 cleanup = Task.Run(() => CleanupDetachedPipeline(
-                    producer, pool, capture, session, recoveryTask));
+                    producer, pool, capture, session, spill, recoveryTask));
                 _deferredCleanupTask = cleanup;
             }
         }
@@ -394,6 +407,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         QrDecodePool? pool,
         IFrameSource? capture,
         ReceiverSession? session,
+        ChunkSpillStore? spill,
         Task<RecoveryOutcome>? recoveryTask)
     {
         // Producer owns ReadGray/SnapshotBgr. It must exit before capture.Dispose.
@@ -428,11 +442,18 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         {
             try
             {
-                session?.Dispose();
+                spill?.Discard();
             }
             finally
             {
-                capture?.Dispose();
+                try
+                {
+                    session?.Dispose();
+                }
+                finally
+                {
+                    capture?.Dispose();
+                }
             }
         }
     }
@@ -584,13 +605,13 @@ public partial class ScanViewModel : ObservableObject, IDisposable
                 // symbols, ReceiverSession's own mismatch re-init never fires,
                 // which used to strand the receiver on a dead transfer until
                 // the user stopped and restarted the scan. In continuous mode
-                // a descriptor for a DIFFERENT session requests a re-lock once
-                // the current stream has been silent briefly. The swap itself
+                // a ROOT/META frame for a DIFFERENT session requests a re-lock
+                // once the current stream has been silent briefly. The swap itself
                 // runs on the UI refresh cadence — performing it here would
                 // take _lifecycleGate while already holding the pool's
                 // IngestLock, the inverse of every other swap path's lock
                 // order (AB-BA deadlock with a concurrent StopScan-side swap).
-                if (h.IsDescriptor && session.IsInitialized &&
+                if (h.IsMetaOrRoot && session.IsInitialized &&
                     !session.MatchesLocked(h.SessionIdLo, h.SessionIdHi) &&
                     Stopwatch.GetTimestamp() - Volatile.Read(ref _lastAcceptedTimestamp)
                         > RelockSilenceTicks)
@@ -610,6 +631,33 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         if (s.Accepted)
         {
             Volatile.Write(ref _lastAcceptedTimestamp, Stopwatch.GetTimestamp());
+        }
+
+        // Bounded-memory ledger: spill the chunk this frame completed to disk
+        // and evict it from native memory, so peak native usage stays O(chunk)
+        // instead of O(whole object). The serialized ingest thread drains it —
+        // no extra synchronization.
+        if (s.Accepted && s.ReceivedSymbols == 0)
+        {
+            // Relock (or first lock): a foreign Transfer owns the session now,
+            // so the old spill's bytes belong to nobody.
+            _chunkSpill?.Discard();
+            _chunkSpill = null;
+        }
+        if (s.ChunkReady)
+        {
+            try
+            {
+                ChunkSpillStore spill = _chunkSpill ??= new ChunkSpillStore(
+                    TempDir, session.GetSnapshot().TransferIdHex);
+                session.DrainLastChunk(spill.Write);
+            }
+            catch (Exception ex)
+            {
+                // A spilled-over disc / deleted temp dir must never kill the
+                // ingest path — the native copy stays resident instead.
+                System.Diagnostics.Debug.WriteLine($"chunk spill failed: {ex.Message}");
+            }
         }
 
         if (s.Complete)
@@ -697,6 +745,31 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         HandleRecoveryOutcome(session, pool, epoch, saver, outcome);
     }
 
+    /// <summary>
+    /// Whole canonical stream for recovery: prefer the on-disk chunk spill
+    /// (chunks were pwritten + evicted as they completed, so native memory
+    /// stayed bounded during reception); fall back to the native in-memory
+    /// assemble. Callers hold the ingest lock.
+    /// </summary>
+    private byte[]? ReadRecoveredStream(ReceiverSession session)
+    {
+        ChunkSpillStore? spill = _chunkSpill;
+        ulong total = session.GetSnapshot().TotalRawSize;
+        if (spill is not null && total > 0)
+        {
+            byte[]? fromFile = spill.ReadAll(total);
+            if (fromFile is not null)
+            {
+                // Consumed: staging may still fail, but the failure path resets
+                // the whole receiver anyway, so no retry needs this file.
+                spill.Discard();
+                _chunkSpill = null;
+                return fromFile;
+            }
+        }
+        return session.Assemble();
+    }
+
     private RecoveryOutcome RecoverAndStageCore(
         ReceiverSession session, QrDecodePool pool,
         AirFerry.Windows.Bundle.ContinuousSaver? saver)
@@ -707,7 +780,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         // getter is allowed to outlive or race disposal of the native handle.
         AssembledPayload? payload = pool.RunExclusive<AssembledPayload?>(() =>
         {
-            byte[]? bytes = session.Assemble();
+            byte[]? bytes = ReadRecoveredStream(session);
             return bytes is null || bytes.Length == 0
                 ? null
                 : new AssembledPayload(
@@ -841,7 +914,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         return c.Kind switch
         {
             RecoveredKind.EtText =>
-                StageEtText(c.Text!, c.DisplayName, expectedCrc, crcKnown, receivedCrc),
+                StageText(c.Text!, c.DisplayName, expectedCrc, crcKnown, receivedCrc),
             RecoveredKind.Bundle =>
                 StageBundle(c.BundleFiles!, expectedCrc, crcKnown, receivedCrc)
                 ?? StageSingleFile(c.Bytes, c.DisplayName, c.OriginalSize,
@@ -889,6 +962,8 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             pool.RunExclusive<bool>(() =>
             {
                 session.Destroy();
+                _chunkSpill?.Discard();
+                _chunkSpill = null;
                 _session = new ReceiverSession();
                 Interlocked.Exchange(ref _recoveryStarted, 0);
                 pool.IngestStopped = false;
@@ -941,7 +1016,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>
-    /// Descriptor facts for the pre-scan duplicate check / identity recording:
+    /// Transfer identity facts for the pre-scan duplicate check / identity recording:
     /// identity (session/content/transfer id), name, decompressed size.
     /// Callers must hold the ingest lock.
     /// </summary>
@@ -1052,6 +1127,8 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             pool.RunExclusive<bool>(() =>
             {
                 session.Destroy();
+                _chunkSpill?.Discard();
+                _chunkSpill = null;
                 _session = new ReceiverSession();
                 Interlocked.Exchange(ref _recoveryStarted, 0);
                 pool.IngestStopped = false;
@@ -1157,13 +1234,13 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>
-    /// Stage a pure ETTEXTv1 message: store UTF-8 body under the descriptor
-    /// filename (user-chosen on sender; default "文字消息.txt").
+    /// Stage a pure UTF8_TEXT manifest entry: store UTF-8 body under the
+    /// entry name (user-chosen on sender; default "文字消息.txt").
     /// </summary>
-    private RecoveryResult StageEtText(string text, string displayName,
+    private RecoveryResult StageText(string text, string displayName,
         ulong expectedCrc, bool crcKnown, ulong receivedCrc)
     {
-        // Store the UTF-8 body (without magic), while retaining transport CRC
+        // Store the UTF-8 body, while retaining transport CRC
         // fields so corruption is not hidden by recomputing a different hash.
         string finalName = string.IsNullOrEmpty(displayName)
             ? "文字消息.txt"

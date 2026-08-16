@@ -55,7 +55,7 @@ internal static class NativeBridge
 
     /// <summary>
     /// Create a cache-only receiver. No object metadata is built yet — data
-    /// frames are buffered until the first validated descriptor frame supplies
+    /// frames are buffered until the first validated ROOT/META frame supplies
     /// the authoritative OTI. Split the 128-bit session id into low/high
     /// 64-bit halves (host order), matching the Rust contract.
     /// </summary>
@@ -136,6 +136,24 @@ internal static class NativeBridge
     public static extern int ReceiverAssembleChunk(IntPtr handle, uint index, out IntPtr outBuf, out nuint outLen);
 
     /// <summary>
+    /// Index of the chunk completed by the most recent ChunkReady frame, or -1.
+    /// Persist it via <see cref="ReceiverAssembleChunk"/> and release it via
+    /// <see cref="ReceiverForgetChunk"/> to keep native memory bounded by one
+    /// chunk instead of the whole object.
+    /// </summary>
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl,
+        EntryPoint = "airferry_receiver_last_chunk_index")]
+    public static extern int ReceiverLastChunkIndex(IntPtr handle);
+
+    /// <summary>
+    /// Release a persisted chunk from native memory (eviction). Returns 1 when
+    /// the chunk was resident. Completion tracking is unaffected.
+    /// </summary>
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl,
+        EntryPoint = "airferry_receiver_forget_chunk")]
+    public static extern int ReceiverForgetChunk(IntPtr handle, uint index);
+
+    /// <summary>
     /// Decompress a byte buffer by tag (0=None,1=Zstd,2=Xz), bounded by
     /// <paramref name="maxOutput"/> bytes. Returns 1 on success (buffer freed
     /// with <see cref="BufferFree"/>), 0 on failure.
@@ -196,11 +214,11 @@ internal static class NativeBridge
     public static extern nuint ReceiverProgressJson(IntPtr handle, byte[]? outBuf, nuint cap);
 
     /// <summary>
-    /// Single-JSON receiver snapshot (<c>ReceiverSnapshotV1</c>): every
-    /// descriptor-derived field (file name/sizes/CRC/compression tag, session
-    /// id, and the descriptor-v5 segment metadata) in ONE atomic call,
-    /// replacing the former 16 per-field getters. Returns a Rust-allocated
-    /// NUL-terminated UTF-8 string — free it with <see cref="FreeString"/>,
+    /// Single-JSON receiver snapshot (<c>ReceiverSnapshotV2</c>): every
+    /// recovered-transfer field the AF2 schema exposes (name/sizes/CRC/codec,
+    /// session id, manifest/chunk metadata) in ONE atomic call, replacing the
+    /// former 16 per-field getters. Returns a Rust-allocated NUL-terminated
+    /// UTF-8 string — free it with <see cref="FreeString"/>,
     /// never with your own <c>free</c>.
     /// </summary>
     [DllImport(LibName, CallingConvention = CallingConvention.Cdecl,

@@ -7,23 +7,23 @@ namespace AirFerry.Windows.Scan;
 /// <summary>
 /// High-level receiver session manager — the Windows equivalent of Android's
 /// <c>ReceiverSessionManager.kt</c>. Wraps the Rust C ABI and drives the same
-/// state machine: lazy-init from the first descriptor frame, then a forced
+/// state machine: lazy-init from the first ROOT/META frame, then a forced
 /// re-init if the session-mismatch streak climbs without ever accepting a
 /// symbol.
 /// </summary>
 /// <remarks>
 /// <para>
-/// The native receiver is <b>only</b> initialized from a descriptor frame
-/// (<see cref="FrameHeader.FlagDescriptor"/>). Ordinary data frames are
-/// silently dropped until a descriptor arrives. This prevents a corrupted
+/// The native receiver is <b>only</b> initialized from a ROOT or OBJECT_META
+/// frame (<see cref="FrameHeader.IsMetaOrRoot"/>). Ordinary data frames are
+/// silently dropped until a metadata frame arrives. This prevents a corrupted
 /// first QR decode (which only passes magic+version but may carry a garbage
 /// session_id) from permanently locking out every subsequent correct frame.
 /// </para>
 /// <para>
 /// Once initialized, a persistent session-mismatch streak with zero accepted
-/// symbols triggers a forced re-init from the next descriptor that arrives —
-/// covering the edge-case where the first descriptor itself was corrupted but
-/// a later one is clean.
+/// symbols triggers a forced re-init from the next metadata frame that
+/// arrives — covering the edge-case where the first metadata frame itself was
+/// corrupted but a later one is clean.
 /// </para>
 /// <para>
 /// Every access to the native handle is serialized by this wrapper. Callers may
@@ -71,17 +71,17 @@ public sealed class ReceiverSession : IDisposable
             _estimatedTotalSymbols = (int)h.TotalSymbols;
         }
 
-        bool isDescriptor = h.IsDescriptor;
+        bool isMetaOrRoot = h.IsMetaOrRoot;
 
-        // --- Lazy init: only from descriptor frames ---
-        // Until a descriptor arrives the authoritative OTI is unknown; feeding
-        // data frames to a guessed decoder (the old path) corrupted multi-block
-        // recovery. Drop them silently and wait.
+        // --- Lazy init: only from ROOT/META frames ---
+        // Until a metadata frame arrives the authoritative OTI is unknown;
+        // feeding data frames to a guessed decoder (the old path) corrupted
+        // multi-block recovery. Drop them silently and wait.
         if (!_initialized)
         {
-            if (!isDescriptor)
+            if (!isMetaOrRoot)
             {
-                return null; // wait for a descriptor
+                return null; // wait for a ROOT/META frame
             }
             CreateReceiver(h);
             if (!_initialized)
@@ -92,9 +92,9 @@ public sealed class ReceiverSession : IDisposable
 
         // --- Session-mismatch re-init ---
         // If the streak is high and we never accepted anything, the first
-        // descriptor was likely corrupt → destroy and re-init on the next
-        // descriptor (the next Ingest call re-enters the lazy-init block above).
-        if (_initialized && !isDescriptor && _mismatchStreak >= 3 && !_everAccepted)
+        // metadata frame was likely corrupt → destroy and re-init on the next
+        // metadata frame (the next Ingest call re-enters the lazy-init block above).
+        if (_initialized && !isMetaOrRoot && _mismatchStreak >= 3 && !_everAccepted)
         {
             Destroy();
             return null;
@@ -180,12 +180,12 @@ public sealed class ReceiverSession : IDisposable
         }
     }
 
-    // ── descriptor snapshot (ReceiverSnapshotV1) ─────────────────────────────
+    // ── AF2 snapshot (ReceiverSnapshotV2) ────────────────────────────────────
     //
     // The former 16 per-field P/Invoke getters were folded into ONE
     // `airferry_receiver_snapshot_json` call (native ABI v2). The public
     // per-field methods below keep their shapes so callers are unchanged, but
-    // read a cached snapshot: descriptor-derived fields are immutable once
+    // read a cached snapshot: snapshot fields are immutable once
     // `meta_confirmed` is true, so the cache refreshes only until confirmation
     // and freezes afterwards — one P/Invoke + one JSON parse per session
     // instead of 16 per UI refresh.
@@ -344,6 +344,56 @@ public sealed class ReceiverSession : IDisposable
                 NativeBridge.BufferFree(buf, len);
             }
         }
+    }
+
+    /// <summary>
+    /// AF2 carries no whole-stream CRC32 on the wire (integrity is BLAKE3
+    /// per chunk / manifest), so this is always "unknown" — kept for the
+    /// recovery pipeline's v1-shaped AssembledPayload contract.
+    /// </summary>
+    public ulong Crc32() => 0UL;
+
+    /// <summary>See <see cref="Crc32"/> — always false under AF2.</summary>
+    public bool Crc32Known() => false;
+
+    /// <summary>
+    /// Index of the chunk completed by the most recent ChunkReady frame, or -1.
+    /// </summary>
+    public int LastChunkIndex()
+    {
+        lock (_gate)
+        {
+            if (!_initialized || _handle == IntPtr.Zero) return -1;
+            return NativeBridge.ReceiverLastChunkIndex(_handle);
+        }
+    }
+
+    /// <summary>Release a persisted chunk from native memory (eviction).</summary>
+    public bool ForgetChunk(uint index)
+    {
+        lock (_gate)
+        {
+            if (!_initialized || _handle == IntPtr.Zero) return false;
+            return NativeBridge.ReceiverForgetChunk(_handle, index) != 0;
+        }
+    }
+
+    /// <summary>
+    /// Drain the chunk completed by the frame just ingested: hand it to
+    /// <paramref name="sink"/> and evict it from native memory (bounded-memory
+    /// ledger). Call on the ingest thread right after Ingest reported
+    /// ChunkReady. The gate Monitor is reentrant, so the nested
+    /// snapshot/chunk calls under the same gate are safe.
+    /// </summary>
+    public void DrainLastChunk(Action<int, int, byte[]> sink)
+    {
+        int index = LastChunkIndex();
+        if (index < 0) return;
+        byte[]? bytes = AssembleChunk((uint)index);
+        if (bytes is null) return;
+        int chunkRawSize = unchecked((int)GetSnapshot().ChunkRawSize);
+        sink(index, chunkRawSize, bytes);
+        ForgetChunk((uint)index);
     }
 
     /// <summary>This object's transmitted payload length.</summary>
