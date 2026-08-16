@@ -302,8 +302,9 @@ class ReceiveBundleActivity : ComponentActivity() {
 
     /**
      * Open a bundle entry as a text message (copy / share / save .txt).
-     * Used for sender-side "添加文字" items materialised as named .txt files
-     * inside ETBUNDL1 — no ETTEXTv1 magic on the wire for mixed batches.
+     * Used for sender-side "添加文字" items materialised as named .txt entries
+     * in the AF2 Manifest (kind = FILE; UTF8_TEXT kind is only used for lone
+     * text transfers, so mixed batches never carry pure-text entries).
      */
     private fun openAsText(info: FileInfo) {
         val src = File(info.filePath)

@@ -10,12 +10,10 @@ interface Props {
   displayName: string
   /** Total original byte count of the transfer unit. */
   originalSize: number
-  /** Whether the payload is a multi-file bundle. */
+  /** Whether the payload is a multi-file bundle (multiple Manifest entries). */
   isBundle: boolean
-  /** Pure ETTEXTv1 text transfer (receiver copy/share UI). */
+  /** Pure text transfer (single UTF8_TEXT manifest entry; receiver copy/share UI). */
   isText: boolean
-  /** Total segment count for a segmented large transfer (1 when non-segmented). */
-  segmentCount?: number
   config: TransferConfig
   onChange: (patch: Partial<TransferConfig>) => void
   onStart: () => void
@@ -55,19 +53,15 @@ export function ParamsPage({
   originalSize,
   isBundle,
   isText,
-  segmentCount = 1,
   config,
   onChange,
   onStart,
   initializing
 }: Props) {
-  const isSegmented = segmentCount > 1
-
   // Pre-transfer ETA estimate (before encoder init). Chunk compression is
   // transparent in AF2 (per-chunk, decided by Rust), so estimate from the
   // original size — there is no meaningful "compressed size" to show here.
-  const perSegmentBytes = isSegmented ? originalSize / segmentCount : originalSize
-  const totalSymbols = Math.ceil(perSegmentBytes / config.symbolSize)
+  const totalSymbols = Math.ceil(originalSize / config.symbolSize)
   const totalFrames = Math.ceil(totalSymbols * (1 + config.redundancyPct / 100))
   const effectiveFps = config.fps > 0 ? config.fps : 60 // conservative display-refresh estimate
   const estimatedSeconds = totalFrames / effectiveFps
@@ -109,18 +103,12 @@ export function ParamsPage({
             <td>原始大小</td>
             <td>{formatBytes(originalSize)}</td>
           </tr>
-          {isSegmented && (
-            <tr>
-              <td>分段</td>
-              <td>{segmentCount} 段 × ~32 MiB（压缩流切段，接收端自动合并）</td>
-            </tr>
-          )}
           <tr>
-            <td>{isSegmented ? "每段预计帧数" : "预计帧数"}</td>
+            <td>预计帧数</td>
             <td>{totalFrames.toLocaleString()}</td>
           </tr>
           <tr>
-            <td>{isSegmented ? "每段预计时间" : "预计传输时间"}</td>
+            <td>预计传输时间</td>
             <td>
               <strong>{formatDuration(estimatedSeconds)}</strong>
               <span className="muted"> ({config.fps > 0 ? config.fps + "fps" : "跟随屏幕刷新"}, {config.redundancyPct}% 冗余)</span>

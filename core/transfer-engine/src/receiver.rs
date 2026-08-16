@@ -212,8 +212,4 @@ impl ReceiverSession {
         }
         Some(out)
     }
-
-    pub fn last_assemble_error(&self) -> Option<&str> {
-        None
-    }
 }

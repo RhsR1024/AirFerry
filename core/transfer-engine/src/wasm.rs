@@ -20,9 +20,6 @@ const QR_SCRATCH_BYTES: usize =
     4 + (MAX_SCRATCH_TILES * (4 + MAX_QR_SIDE_MODULES * MAX_QR_SIDE_MODULES));
 
 #[wasm_bindgen]
-pub fn _start() {}
-
-#[wasm_bindgen]
 pub struct Sha256Wasm {
     hasher: sha2::Sha256,
 }

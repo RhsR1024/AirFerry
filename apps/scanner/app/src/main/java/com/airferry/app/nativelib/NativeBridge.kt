@@ -71,9 +71,6 @@ object NativeBridge {
      */
     external fun receiverAssembleBytes(handle: Long): ByteArray?
 
-    /** Non-empty when the last assemble failed after decode completed (e.g. decompress). */
-    external fun receiverLastAssembleError(handle: Long): String
-
     /** Reassemble chunk `index` bytes. */
     external fun receiverAssembleChunk(handle: Long, index: Int): ByteArray?
 

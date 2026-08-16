@@ -55,16 +55,16 @@ public sealed record ContinuousSaveReport(
 /// Single-threaded by design: the recovery pipeline runs one save at a time.
 /// </summary>
 /// <summary>
-/// Descriptor facts of one incoming transfer — all known the moment its
-/// descriptor is confirmed, and the input to the pre-scan duplicate check.
+/// Identity facts of one incoming transfer — all known once its ROOT/META is
+/// confirmed, and the input to the pre-scan duplicate check.
 /// </summary>
-/// <param name="Identity">Content-derived session id, or the root id of a
-/// segmented transfer (same across all its segments).</param>
-/// <param name="Name">Descriptor file name.</param>
-/// <param name="Size">Decompressed original size.</param>
-/// <param name="Crc32">CRC32 over the whole original, null when unknown.</param>
-/// <param name="RootSha256Hex">Whole-file SHA-256 (segmented descriptor-v5
-/// only), lowercase hex; null otherwise.</param>
+/// <param name="Identity">Content-derived Content/Transfer id (whichever the
+/// snapshot exposes first), or the session id before META is confirmed.</param>
+/// <param name="Name">File name from the manifest snapshot.</param>
+/// <param name="Size">Total raw (decompressed) content size.</param>
+/// <param name="Crc32">Legacy v1 CRC32, unused in AF2 (always null).</param>
+/// <param name="RootSha256Hex">Legacy v1 segment root hash, unused in AF2
+/// (always null).</param>
 public sealed record TransferProbe(
     string Identity, string Name, long Size, uint? Crc32, string? RootSha256Hex);
 

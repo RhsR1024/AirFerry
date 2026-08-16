@@ -18,7 +18,8 @@ namespace AirFerry.Windows.Views;
 /// <c>ReceiveBundleActivity</c>: lists each unpacked file with name + size,
 /// offers "save all" / "open folder" / "rescan". Double-click (or Enter) on a
 /// .txt entry opens <see cref="ReceiveTextView"/> so mixed-batch text can be
-/// copied (sender materialises "添加文字" as named .txt inside ETBUNDL1).
+/// copied (sender materialises "添加文字" as a named .txt FILE entry in the
+/// AF2 Manifest).
 /// </summary>
 public partial class ReceiveBundleView : Page
 {

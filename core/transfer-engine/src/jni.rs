@@ -297,24 +297,6 @@ fn null_byte_array(env: &mut JNIEnv) -> jni::sys::jbyteArray {
 // All consumed through the single `receiverSnapshotJson` snapshot above; the
 // per-field accessors were removed with AIRFERRY_NATIVE_ABI_VERSION 2.
 
-/// Last [`ReceiverSession::assemble_result`] error message, or empty if none.
-#[no_mangle]
-pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverLastAssembleError(
-    env: JNIEnv,
-    _class: JClass,
-    handle: jlong,
-) -> jni::sys::jstring {
-    if handle == 0 {
-        return std::ptr::null_mut();
-    }
-    let session = unsafe { &*(handle as *const ReceiverSession) };
-    let msg = session.last_assemble_error().unwrap_or("");
-    match env.new_string(msg) {
-        Ok(s) => s.into_raw(),
-        Err(_) => std::ptr::null_mut(),
-    }
-}
-
 fn progress_json(p: &Progress) -> String {
     format!(
         r#"{{"decoded_symbols":{},"total_symbols":{},"symbol_size":{},"received_symbols":{},"frames_seen":{},"frames_duplicate":{},"frames_corrupt":{},"decoded_blocks":{},"total_blocks":{},"decoded_fraction":{:.4},"loss_ratio":{:.4},"complete":{},"meta_confirmed":{},"session_mismatch_streak":{}}}"#,
