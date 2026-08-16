@@ -16,11 +16,11 @@
 //! - bit  1      : `accepted` (1 if this frame contributed a new symbol)
 //! - bit  2      : `manifest_ready` (1 on the frame that completed the manifest)
 //! - bit  3      : `chunk_ready` (1 on the frame that completed a chunk —
-//!                 fetch it with `receiver_assemble_chunk(last_chunk_index)`
-//!                 then release it with `receiver_forget_chunk`)
+//!   fetch it with `receiver_assemble_chunk(last_chunk_index)`
+//!   then release it with `receiver_forget_chunk`)
 //! - bits 8..23  : `session_mismatch_streak` (0..=0xFFFF, clamped)
 //! - bits 32..63 : `received_symbols` (low 32 bits; real transfers stay well
-//!                 below 2^32)
+//!   below 2^32)
 //!
 //! `received_symbols == u32::MAX` (i.e. bits 32..63 all set, flags clear) is
 //! reserved as the [`INGEST_ERROR`] sentinel — a real transfer never reaches it.

@@ -19,6 +19,10 @@ qr-protocol.workspace = true
 af2.workspace = true
 sha2.workspace = true
 
+[dev-dependencies]
+# ReceiverSession §11 eviction test crafts a hostile chunk object (encoder side).
+raptorq = "2.0"
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # Pin the wasm-bindgen family to versions BEFORE 0.2.93 / js-sys 0.3.70.
 # wasm-bindgen 0.2.93 enabled the reference-types proposal (`externref` value

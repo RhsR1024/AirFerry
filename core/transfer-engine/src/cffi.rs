@@ -454,6 +454,70 @@ pub unsafe extern "C" fn airferry_receiver_snapshot_json(
     }
 }
 
+/// Verify a staged raw chunk against the ROOT-bound Manifest chunk table (§11).
+/// Returns 1 on match, 0 on mismatch / manifest not ready yet.
+#[no_mangle]
+pub unsafe extern "C" fn airferry_receiver_verify_chunk(
+    handle: *const ReceiverSession,
+    index: u32,
+    raw_ptr: *const u8,
+    raw_len: usize,
+) -> i32 {
+    if handle.is_null() || (raw_ptr.is_null() && raw_len != 0) {
+        return 0;
+    }
+    let session = unsafe { &*handle };
+    let slice = if raw_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(raw_ptr, raw_len) }
+    };
+    if session.verify_chunk(index, slice) { 1 } else { 0 }
+}
+
+/// Run §13 ⑧⑨ integrity chain over the reassembled canonical stream.
+/// Returns 1 on success, 0 on any verification failure.
+#[no_mangle]
+pub unsafe extern "C" fn airferry_receiver_verify_final_stream(
+    handle: *const ReceiverSession,
+    stream_ptr: *const u8,
+    stream_len: usize,
+) -> i32 {
+    if handle.is_null() || (stream_ptr.is_null() && stream_len != 0) {
+        return 0;
+    }
+    let session = unsafe { &*handle };
+    let slice = if stream_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(stream_ptr, stream_len) }
+    };
+    if session.verify_final_stream(slice) { 1 } else { 0 }
+}
+
+/// Restore receiver from stored ROOT frame bytes + completed chunk indices (§12 resume).
+/// Returns 1 on success, 0 on error.
+#[no_mangle]
+pub unsafe extern "C" fn airferry_receiver_resume(
+    handle: *mut ReceiverSession,
+    root_ptr: *const u8,
+    root_len: usize,
+    completed_ptr: *const u32,
+    completed_len: usize,
+) -> i32 {
+    if handle.is_null() || root_ptr.is_null() || (completed_ptr.is_null() && completed_len != 0) {
+        return 0;
+    }
+    let session = unsafe { &mut *handle };
+    let root_bytes = unsafe { std::slice::from_raw_parts(root_ptr, root_len) };
+    let completed = if completed_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(completed_ptr, completed_len) }
+    };
+    if session.resume(root_bytes, completed) { 1 } else { 0 }
+}
+
 /// Free a string returned by [`airferry_receiver_snapshot_json`].
 /// Passing null is a no-op.
 ///

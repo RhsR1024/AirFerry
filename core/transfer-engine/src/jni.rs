@@ -58,16 +58,12 @@ pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverCrea
     _class: JClass,
     session_id_lo: jlong,
     session_id_hi: jlong,
-    _total_blocks: jint,
-    _total_symbols: jint,
-    _symbol_size: jint,
 ) -> jlong {
     let sid: u128 = ((session_id_hi as u64 as u128) << 64) | (session_id_lo as u64 as u128);
-    // Cache-only bootstrap: do NOT build a decoder from these caller-supplied
-    // totals (a guessed early layout, and `derive_meta_from_totals`'s OTI build
-    // can itself assert on large values). Data frames are buffered until the
-    // first *validated* descriptor frame supplies the authoritative, sanity-
-    // checked OTI (see ReceiverSession::ingest), which builds the real decoder.
+    // Cache-only bootstrap: do NOT build a decoder from guessed caller totals.
+    // Data frames are buffered until the first *validated* descriptor frame
+    // supplies the authoritative, sanity-checked OTI (see ReceiverSession::ingest),
+    // which builds the real decoder.
     let session = ReceiverSession::new_pending(sid);
     Box::into_raw(Box::new(session)) as jlong
 }
@@ -288,6 +284,78 @@ pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverForg
     }
     let session = unsafe { &mut *(handle as *mut ReceiverSession) };
     session.forget_chunk(index as u32) as jni::sys::jboolean
+}
+
+/// Verify a staged raw chunk against the ROOT-bound Manifest chunk table (§11).
+#[no_mangle]
+pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverVerifyChunk(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    index: jint,
+    raw_bytes: jni::sys::jbyteArray,
+) -> jni::sys::jboolean {
+    if handle == 0 || raw_bytes.is_null() {
+        return false as jni::sys::jboolean;
+    }
+    let session = unsafe { &*(handle as *const ReceiverSession) };
+    let bytes = match unsafe { env.get_array_elements(&jni::objects::JByteArray::from_raw(raw_bytes), jni::objects::ReleaseMode::NoCopyBack) } {
+        Ok(elems) => elems,
+        Err(_) => return false as jni::sys::jboolean,
+    };
+    let slice = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u8, bytes.len()) };
+    session.verify_chunk(index as u32, slice) as jni::sys::jboolean
+}
+
+/// Run §13 ⑧⑨ integrity chain over the reassembled canonical stream.
+#[no_mangle]
+pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverVerifyFinalStream(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    stream_bytes: jni::sys::jbyteArray,
+) -> jni::sys::jboolean {
+    if handle == 0 || stream_bytes.is_null() {
+        return false as jni::sys::jboolean;
+    }
+    let session = unsafe { &*(handle as *const ReceiverSession) };
+    let bytes = match unsafe { env.get_array_elements(&jni::objects::JByteArray::from_raw(stream_bytes), jni::objects::ReleaseMode::NoCopyBack) } {
+        Ok(elems) => elems,
+        Err(_) => return false as jni::sys::jboolean,
+    };
+    let slice = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u8, bytes.len()) };
+    session.verify_final_stream(slice) as jni::sys::jboolean
+}
+
+/// Restore receiver from stored ROOT frame bytes + completed chunk indices (§12 resume).
+#[no_mangle]
+pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverResume(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    root_frame_bytes: jni::sys::jbyteArray,
+    completed_indices: jni::sys::jintArray,
+) -> jni::sys::jboolean {
+    if handle == 0 || root_frame_bytes.is_null() || completed_indices.is_null() {
+        return false as jni::sys::jboolean;
+    }
+    let session = unsafe { &mut *(handle as *mut ReceiverSession) };
+    let r_bytes = match unsafe { env.get_array_elements(&jni::objects::JByteArray::from_raw(root_frame_bytes), jni::objects::ReleaseMode::NoCopyBack) } {
+        Ok(elems) => elems,
+        Err(_) => return false as jni::sys::jboolean,
+    };
+    let r_slice = unsafe { std::slice::from_raw_parts(r_bytes.as_ptr() as *const u8, r_bytes.len()) };
+    let c_elems = match unsafe { env.get_array_elements(&jni::objects::JIntArray::from_raw(completed_indices), jni::objects::ReleaseMode::NoCopyBack) } {
+        Ok(elems) => elems,
+        Err(_) => return false as jni::sys::jboolean,
+    };
+    let completed_u32: Vec<u32> = unsafe {
+        std::slice::from_raw_parts(c_elems.as_ptr(), c_elems.len())
+            .iter()
+            .map(|&x| x as u32)
+            .collect()
+    };
+    session.resume(r_slice, &completed_u32) as jni::sys::jboolean
 }
 
 /// Single-JSON receiver snapshot (`ReceiverSnapshotV2`, see

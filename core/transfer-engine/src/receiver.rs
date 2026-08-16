@@ -86,12 +86,26 @@ impl ReceiverSession {
             Ok(IngestEvent::MetaBound { .. }) => {
                 pack(self.is_complete(), true, false, false, 0, self.received_symbols)
             }
+            Ok(IngestEvent::InstanceSwitched) => {
+                // New Broadcast Instance of the SAME transfer: the chunk ledger
+                // (completed_chunks / completed_count) stays valid — canonical
+                // chunks are identical across instances. last_chunk survives so
+                // a host that has not drained it yet still can.
+                pack(self.is_complete(), true, false, false, 0, self.received_symbols)
+            }
             Ok(IngestEvent::SymbolAccepted) => {
                 self.received_symbols = self.received_symbols.saturating_add(1);
                 pack(self.is_complete(), true, false, false, 0, self.received_symbols)
             }
             Ok(IngestEvent::ManifestReady) => {
                 self.received_symbols = self.received_symbols.saturating_add(1);
+                // §11: re-verify chunks that completed BEFORE the Manifest
+                // against the now-known chunk hash table; mismatched ones are
+                // evicted from the ledger (the sender's next epoch re-supplies
+                // them). Without this, a chunk whose META raw_hash was
+                // self-consistent but contradicts the Manifest would be
+                // materialized at publish time.
+                self.reverify_against_manifest();
                 pack(self.is_complete(), true, true, false, 0, self.received_symbols)
             }
             Ok(IngestEvent::ChunkReady { index, raw }) => {
@@ -138,6 +152,59 @@ impl ReceiverSession {
     /// simply returns None for released indices.
     pub fn forget_chunk(&mut self, index: u32) -> bool {
         self.completed_chunks.remove(&index).is_some()
+    }
+
+    /// Verify a staged raw chunk against the ROOT-bound Manifest table (§11).
+    pub fn verify_chunk(&self, index: u32, raw: &[u8]) -> bool {
+        self.inner.verify_chunk(index, raw)
+    }
+
+    /// Run the §13 ⑧⑨ integrity chain over the reassembled canonical stream.
+    pub fn verify_final_stream(&self, stream: &[u8]) -> bool {
+        self.inner.verify_final_stream(stream).is_ok()
+    }
+
+    /// Restore session state from stored ROOT frame bytes + completed chunk indices.
+    /// Returns false (leaving the session untouched) when the stored ROOT fails
+    /// the full parse + id-binding path.
+    pub fn resume(&mut self, root_frame_bytes: &[u8], completed: &[u32]) -> bool {
+        match self.inner.resume(root_frame_bytes, completed) {
+            Ok(accepted) => {
+                // Only indices actually inside the transfer count (af2 drops
+                // out-of-range entries silently — the ledger must not).
+                self.completed_count = accepted as u32;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// §11 re-verification pass over the resident completed chunks. Chunks the
+    /// host already released via [`forget_chunk`] are NOT resident here; hosts
+    /// re-verify those against their spill via the `verify_chunk` FFI before
+    /// publishing.
+    fn reverify_against_manifest(&mut self) {
+        let evicted: Vec<u32> = self
+            .completed_chunks
+            .iter()
+            .filter(|(index, raw)| !self.inner.verify_chunk(**index, raw))
+            .map(|(index, _)| *index)
+            .collect();
+        for index in evicted {
+            self.completed_chunks.remove(&index);
+            self.invalidate_chunk(index);
+            self.completed_count = self.completed_count.saturating_sub(1);
+            if self.last_chunk.as_ref().is_some_and(|(i, _)| *i == index) {
+                self.last_chunk = None;
+            }
+        }
+    }
+
+    /// Evict one chunk from BOTH ledgers (engine map + core chunk_done), so
+    /// the sender's next epoch can re-supply it. Also exposed for hosts that
+    /// re-verify spilled chunks via the FFI.
+    pub fn invalidate_chunk(&mut self, index: u32) -> bool {
+        self.inner.invalidate_chunk(index)
     }
 
     pub fn snapshot_json(&self) -> String {
@@ -239,5 +306,177 @@ impl ReceiverSession {
             out.extend_from_slice(chunk);
         }
         Some(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use af2::frame::{Af2Frame, FrameType};
+    use af2::id::{hash, object_id, KIND_FILE};
+    use af2::meta::{ObjectMetaRecord, FEC_ID_RAPTORQ, ROLE_CHUNK};
+    use af2::receiver::object_meta_from_oti;
+    use af2::sender::{Af2Sender, SenderConfig};
+
+    /// IngestStatus bits mirror ingest_status::pack.
+    fn bits(word: u64) -> (bool, bool, bool, bool) {
+        (
+            word & 1 != 0,                // complete
+            word >> 1 & 1 != 0,           // accepted
+            word >> 2 & 1 != 0,           // manifest_ready
+            word >> 3 & 1 != 0,           // chunk_ready
+        )
+    }
+
+    /// Craft a self-consistent CHUNK object whose raw bytes (Y) differ from
+    /// what the real Manifest's chunk table will announce (X): it passes the
+    /// META-time binding and the raw_hash check at completion time, and only
+    /// the post-manifest re-verification can catch it.
+    fn craft_foreign_chunk_frames(
+        tid: [u8; 16],
+        y: &[u8],
+        t: usize,
+    ) -> (Vec<u8>, Vec<Vec<u8>>) {
+        let (codec, encoded) = af2::chunk::encode_chunk(y);
+        let enc = raptorq::Encoder::with_defaults(&encoded, t as u16);
+        let oti = enc.get_config().serialize();
+        let meta_obj = object_meta_from_oti(&oti, 32 << 20).unwrap();
+        let encoded_hash = hash(&encoded);
+        let oid = object_id(
+            &tid,
+            ROLE_CHUNK,
+            0,
+            codec,
+            FEC_ID_RAPTORQ,
+            &meta_obj.oti_bytes,
+            &encoded_hash,
+        );
+        let record = ObjectMetaRecord {
+            role: ROLE_CHUNK,
+            transfer_id: tid,
+            object_index: 0,
+            codec_id: codec,
+            fec_id: FEC_ID_RAPTORQ,
+            oti: meta_obj.oti_bytes,
+            raw_hash: hash(y),
+            encoded_hash,
+            extensions: vec![],
+        };
+        let meta_frame = Af2Frame {
+            frame_type: FrameType::ObjectMeta,
+            object_id: oid,
+            sbn: 0,
+            esi: 0,
+            body: record.encode().unwrap(),
+            t,
+        }
+        .to_bytes()
+        .unwrap();
+        let symbols = enc
+            .get_encoded_packets(0)
+            .iter()
+            .map(|pkt| {
+                Af2Frame {
+                    frame_type: FrameType::Symbol,
+                    object_id: oid,
+                    sbn: pkt.payload_id().source_block_number(),
+                    esi: pkt.payload_id().encoding_symbol_id(),
+                    body: pkt.data().to_vec(),
+                    t,
+                }
+                .to_bytes()
+                .unwrap()
+            })
+            .collect();
+        (meta_frame, symbols)
+    }
+
+    #[test]
+    fn manifest_ready_evicts_and_resupplies_poisoned_chunk() {
+        let x = vec![0x58u8; 3000];
+        let y = vec![0x59u8; 3000];
+        let mut sender = Af2Sender::new(
+            vec![(KIND_FILE, "x.bin".to_string(), x.clone())],
+            SenderConfig::default(),
+        )
+        .unwrap();
+
+        let mut session = ReceiverSession::new();
+        // 1. Lock via the sender's first frame (bootstrap ROOT).
+        let (complete, accepted, _, _) = bits(session.ingest(&sender.next_frame().unwrap()));
+        assert!(accepted && !complete);
+
+        // 2. Complete the POISONED chunk (Y) before any manifest arrives.
+        let (meta_frame, symbols) = craft_foreign_chunk_frames(sender.transfer_id(), &y, 1024);
+        let (_, _, _, chunk_ready) = bits(session.ingest(&meta_frame));
+        assert!(!chunk_ready);
+        let mut poisoned_done = false;
+        for f in &symbols {
+            let (complete, _, _, chunk_ready) = bits(session.ingest(f));
+            if chunk_ready {
+                poisoned_done = true;
+                assert!(complete, "1/1 chunks done ⇒ complete even pre-manifest");
+                break;
+            }
+        }
+        assert!(poisoned_done);
+        assert_eq!(session.assemble_chunk(0).as_deref(), Some(y.as_slice()));
+
+        // 3. Keep feeding the real broadcast until the Manifest arrives.
+        let mut manifest_seen = false;
+        for _ in 0..4000 {
+            let (complete, _, manifest_ready, _) = bits(session.ingest(&sender.next_frame().unwrap()));
+            if manifest_ready {
+                manifest_seen = true;
+                // §11: the poisoned chunk must be evicted from BOTH ledgers.
+                assert!(!complete, "eviction must drop completion");
+                assert!(session.assemble_chunk(0).is_none());
+                break;
+            }
+        }
+        assert!(manifest_seen, "recurring manifest interleave must deliver the manifest");
+
+        // 4. The sender's next epoch re-supplies the real chunk (X) — the core
+        //    chunk_done bit was invalidated, so the META binds again.
+        let mut recovered = false;
+        for _ in 0..8000 {
+            let (complete, _, _, chunk_ready) = bits(session.ingest(&sender.next_frame().unwrap()));
+            if chunk_ready {
+                assert_eq!(session.assemble_chunk(0).as_deref(), Some(x.as_slice()));
+                assert!(complete);
+                recovered = true;
+                break;
+            }
+        }
+        assert!(recovered, "evicted chunk must be re-supplied and complete");
+
+        // 5. Final gate over the reassembled stream.
+        let stream = session.assemble_all().unwrap();
+        assert_eq!(stream, x);
+        assert!(session.verify_final_stream(&stream));
+    }
+
+    #[test]
+    fn resume_restores_completion_state() {
+        let data = vec![0x77u8; 2500];
+        let mut sender = Af2Sender::new(
+            vec![(KIND_FILE, "r.bin".to_string(), data)],
+            SenderConfig::default(),
+        )
+        .unwrap();
+        let root_frame = sender.next_frame().unwrap(); // bootstrap ROOT
+        let mut session = ReceiverSession::new();
+        assert!(session.resume(&root_frame, &[0]));
+        assert!(session.is_complete(), "ledger says 1/1");
+        assert!(
+            session.assemble_chunk(0).is_none(),
+            "resumed chunks are host-persisted, not resident"
+        );
+        // Tampered resume input is rejected wholesale.
+        let mut bad = root_frame.clone();
+        let n = bad.len();
+        bad[n - 5] ^= 0xFF;
+        let mut fresh = ReceiverSession::new();
+        assert!(!fresh.resume(&bad, &[0]));
     }
 }

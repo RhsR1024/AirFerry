@@ -4,13 +4,15 @@
 //! - [`SenderBuilderWasm`]: builds multi-entry AF2 streaming senders.
 //! - [`SenderSessionWasm`]: high-throughput QR frame generator with preallocated
 //!   scratch buffer for zero-copy Canvas rendering.
-//! - [`ReceiverSessionWasm`]: AF2 stream receiver state machine.
-//! - [`Sha256Wasm`]: BLAKE3/SHA helpers for web workers.
+//! - [`ReceiverSessionWasm`]: AF2 stream receiver session (wraps [`crate::receiver::ReceiverSession`]).
+//! - [`Sha256Wasm`]: SHA-256 helper for web workers.
+//! - [`Blake3Wasm`]: BLAKE3-256 helper for single-pass hashing in web workers.
 //! - [`encode_qr`]: direct QR matrix encoder.
 
 #![cfg(all(feature = "wasm", target_arch = "wasm32"))]
 
-use af2::{Af2Receiver, Af2Sender, IngestEvent, SenderConfig};
+use crate::receiver::ReceiverSession;
+use af2::{Af2Sender, SenderConfig};
 use wasm_bindgen::prelude::*;
 
 const MAX_UI_QR_COUNT: usize = 4;
@@ -42,6 +44,27 @@ impl Sha256Wasm {
     pub fn digest(&self) -> Vec<u8> {
         use sha2::Digest;
         self.hasher.clone().finalize().to_vec()
+    }
+}
+
+#[wasm_bindgen]
+pub struct Blake3Wasm {
+    bytes: Vec<u8>,
+}
+
+#[wasm_bindgen]
+impl Blake3Wasm {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Self {
+        Self { bytes: Vec::new() }
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.bytes.extend_from_slice(bytes);
+    }
+
+    pub fn digest(&self) -> Vec<u8> {
+        af2::id::hash(&self.bytes).to_vec()
     }
 }
 
@@ -156,8 +179,7 @@ impl SenderSessionWasm {
 
 #[wasm_bindgen]
 pub struct ReceiverSessionWasm {
-    inner: Af2Receiver,
-    last_chunk_ready: Option<(u32, Vec<u8>)>,
+    inner: ReceiverSession,
 }
 
 #[wasm_bindgen]
@@ -165,101 +187,55 @@ impl ReceiverSessionWasm {
     #[wasm_bindgen(constructor)]
     pub fn new() -> ReceiverSessionWasm {
         ReceiverSessionWasm {
-            inner: Af2Receiver::new(),
-            last_chunk_ready: None,
+            inner: ReceiverSession::new(),
         }
     }
 
-    /// Ingest a frame. Returns event code:
-    /// 0=Dropped, 1=RootLocked, 2=RootMismatch, 3=Relocked, 4=MetaBound,
-    /// 5=MetaRejected, 6=SymbolAccepted, 7=ManifestReady, 8=ChunkReady, 9=ChunkRejected.
-    pub fn ingest(&mut self, frame_bytes: &[u8]) -> u32 {
-        self.last_chunk_ready = None;
-        match self.inner.ingest(frame_bytes) {
-            Ok(IngestEvent::Dropped) => 0,
-            Ok(IngestEvent::RootLocked) => 1,
-            Ok(IngestEvent::RootMismatch { .. }) => 2,
-            Ok(IngestEvent::Relocked) => 3,
-            Ok(IngestEvent::MetaBound { .. }) => 4,
-            Ok(IngestEvent::MetaRejected) => 5,
-            Ok(IngestEvent::SymbolAccepted) => 6,
-            Ok(IngestEvent::ManifestReady) => 7,
-            Ok(IngestEvent::ChunkReady { index, raw }) => {
-                self.last_chunk_ready = Some((index, raw));
-                8
-            }
-            Ok(IngestEvent::ChunkRejected) => 9,
-            Err(_) => 0,
-        }
+    /// Ingest a frame. Returns the unified packed `u64` ingest status word as
+    /// a JavaScript `BigInt` (SPEC §16, identical to JNI and C-ABI layout).
+    pub fn ingest(&mut self, frame_bytes: &[u8]) -> u64 {
+        self.inner.ingest(frame_bytes)
     }
 
+    /// True once all chunks of the transfer have been verified and staged.
+    pub fn is_complete(&self) -> bool {
+        self.inner.is_complete()
+    }
+
+    /// Index of the chunk completed by the most recent ChunkReady frame (or 0).
     pub fn last_chunk_index(&self) -> u32 {
-        self.last_chunk_ready.as_ref().map(|(i, _)| *i).unwrap_or(0)
+        self.inner.last_completed_chunk_index().unwrap_or(0)
     }
 
-    pub fn last_chunk_bytes(&self) -> Vec<u8> {
-        self.last_chunk_ready.as_ref().map(|(_, b)| b.clone()).unwrap_or_default()
+    /// Bytes of a completed chunk currently in memory (or empty if evicted).
+    pub fn assemble_chunk(&mut self, index: u32) -> Vec<u8> {
+        self.inner.assemble_chunk(index).unwrap_or_default()
     }
 
-    /// Single-JSON receiver snapshot (`ReceiverSnapshotV2`).
+    /// Release chunk memory once persisted to host storage (OPFS / IndexedDB).
+    pub fn forget_chunk(&mut self, index: u32) -> bool {
+        self.inner.forget_chunk(index)
+    }
+
+    /// Verify a staged raw chunk against the ROOT-bound Manifest table (§11).
+    pub fn verify_chunk(&self, index: u32, raw: &[u8]) -> bool {
+        self.inner.verify_chunk(index, raw)
+    }
+
+    /// Run the final §13 ⑧⑨ integrity chain over the reassembled canonical stream.
+    pub fn verify_final_stream(&self, stream: &[u8]) -> bool {
+        self.inner.verify_final_stream(stream)
+    }
+
+    /// Restore session state from stored ROOT frame bytes + completed chunk indices.
+    pub fn resume(&mut self, root_frame_bytes: &[u8], completed: &[u32]) -> bool {
+        self.inner.resume(root_frame_bytes, completed)
+    }
+
+    /// Single-JSON receiver snapshot (`schema_version: 2`).
     pub fn snapshot_json(&self) -> String {
-        match self.inner.root() {
-            Some(r) => {
-                let mut entries_json = String::from("[");
-                if let Some(m) = self.inner.manifest() {
-                    for (i, e) in m.entries.iter().enumerate() {
-                        if i > 0 {
-                            entries_json.push(',');
-                        }
-                        entries_json.push_str(&format!(
-                            r#"{{"kind":{},"path":"{}","offset":{},"size":{}}}"#,
-                            e.kind,
-                            escape_json_str(&e.path),
-                            e.content_offset,
-                            e.content_size
-                        ));
-                    }
-                }
-                entries_json.push(']');
-                format!(
-                    concat!(
-                        r#"{{"schema_version":2,"meta_confirmed":true,"transfer_id_hex":"{}","#,
-                        r#""content_id_hex":"{}","total_raw_size":{},"entry_count":{},"#,
-                        r#""chunk_count":{},"chunk_raw_size":{},"symbol_size":{},"entries":{}}}"#
-                    ),
-                    hex_lower(&r.transfer()),
-                    hex_lower(&r.content_id),
-                    r.total_raw_size,
-                    r.entry_count,
-                    r.chunk_count,
-                    r.chunk_raw_size,
-                    self.inner.symbol_size(),
-                    entries_json,
-                )
-            }
-            None => {
-                r#"{"schema_version":2,"meta_confirmed":false,"transfer_id_hex":"","content_id_hex":"","total_raw_size":0,"entry_count":0,"chunk_count":0,"chunk_raw_size":0,"symbol_size":0,"entries":[]}"#.to_string()
-            }
-        }
+        self.inner.snapshot_json()
     }
-}
-
-fn escape_json_str(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
