@@ -421,9 +421,9 @@ export function FileSelectPage({ items, onItemsChange, onSend }: Props) {
   /** Total original bytes of the selected items (pre-compression). */
   const selectedBytes = totalSize(items)
   /**
-   * A single real file can use descriptor-v5 segmentation and therefore has no
-   * 256 MiB root-size ceiling. Text and multi-file bundles are still one
-   * RaptorQ object, so their post-decompression cap is a hard gate.
+   * A single real file is split into bounded chunks by the Rust sender, so it
+   * has no 256 MiB receiver-budget ceiling. Text and multi-file bundles that
+   * would exceed the budget still trigger an oversize confirmation first.
    */
   const handleSendClick = useCallback(() => {
     const isSegmentableSingleFile = items.length === 1 && items[0].kind === "file"

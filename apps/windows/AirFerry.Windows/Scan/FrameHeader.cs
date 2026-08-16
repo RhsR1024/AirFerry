@@ -62,5 +62,7 @@ public readonly record struct FrameHeader(
             sbn, esi, 1u, 1u, (uint)bodyLen);
     }
 
-    public bool IsDescriptor => FrameType == FrameTypeRoot || FrameType == FrameTypeObjectMeta;
+    /// True for ROOT / OBJECT_META frames (the two metadata frame types that
+    /// carry the authoritative session identity and OTI).
+    public bool IsMetaOrRoot => FrameType == FrameTypeRoot || FrameType == FrameTypeObjectMeta;
 }

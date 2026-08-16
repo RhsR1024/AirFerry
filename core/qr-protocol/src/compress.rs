@@ -550,9 +550,9 @@ mod tests {
         );
     }
 
-    /// Same clamp on the streaming-to-disk path used by Android/Windows for
-    /// descriptor-v5 segmented transfers: an oversized-window frame must fail
-    /// (and the partial output file must be cleaned up).
+    /// Same clamp on the streaming-to-disk path used by Android/Windows:
+    /// an oversized-window frame must fail (and the partial output file must
+    /// be cleaned up).
     #[test]
     fn decompress_stream_to_file_rejects_oversized_zstd_window() {
         let frame = oversized_window_frame();

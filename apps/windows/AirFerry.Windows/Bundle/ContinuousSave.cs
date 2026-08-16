@@ -156,10 +156,10 @@ public sealed class ContinuousSaver
     /// previous save AND its folder copy still verifies intact — a deleted or
     /// tampered previous copy must stay recoverable, so a stale record never
     /// blocks receiving again. Three levels, strongest first:
-    /// ① the exact transfer identity (content-derived session/root id);
-    /// ② the segmented root SHA-256 — cryptographic, catches renamed re-sends
+    /// ① the exact transfer identity (content-derived Content/Transfer id);
+    /// ② the whole-content root hash — cryptographic, catches renamed re-sends
     ///   of single-file transfers (bundle/text digests are over the container,
-    ///   not the descriptor root hash; those fall back to ① or post-scan);
+    ///   not the content root hash; those fall back to ① or post-scan);
     /// ③ the (name, size, CRC32) triple — CRC32 is NOT an authenticator, but a
     ///   same-name same-size match implies equal content in practice (~2⁻³²
     ///   accidental collision per pair); the post-scan save-time dedup remains

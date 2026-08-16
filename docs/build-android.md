@@ -60,7 +60,7 @@ EOF
 
 `ScanActivity` 启动自检在创建/销毁一个 receiver 之前，先调用
 `NativeBridge.nativeAbiVersion()` 并断言其 `>= NativeBridge.NATIVE_ABI_VERSION`
-（= `1`，对应 `AIRFERRY_NATIVE_ABI_VERSION`，描述支持 descriptor-v5 分段接收）。
+（= `2`，对应 `AIRFERRY_NATIVE_ABI_VERSION`，即 AF2 快照化 FFI 版本）。
 
 旧 `.so` 要么没有该符号（调用抛 `UnsatisfiedLinkError`）要么报更低版本——两种
 情况都会在加载相机前直接进入 `ErrorScreen`「原生库版本过旧」，而**不会**让

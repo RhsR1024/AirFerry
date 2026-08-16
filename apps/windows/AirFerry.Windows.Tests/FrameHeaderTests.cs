@@ -42,20 +42,20 @@ public class FrameHeaderTests
         Assert.Equal(256u, h.SymbolSize);
         Assert.Equal(2u, h.Sbn);
         Assert.Equal(0x010203u, h.Esi);
-        Assert.False(h.IsDescriptor);
+        Assert.False(h.IsMetaOrRoot);
     }
 
     [Fact]
-    public void Parse_DescriptorTypes_Detected()
+    public void Parse_MetaOrRootTypes_Detected()
     {
         FrameHeader root = FrameHeader.Parse(BuildHeader(frameType: FrameHeader.FrameTypeRoot)).Value;
-        Assert.True(root.IsDescriptor);
+        Assert.True(root.IsMetaOrRoot);
 
         FrameHeader meta = FrameHeader.Parse(BuildHeader(frameType: FrameHeader.FrameTypeObjectMeta)).Value;
-        Assert.True(meta.IsDescriptor);
+        Assert.True(meta.IsMetaOrRoot);
 
         FrameHeader symbol = FrameHeader.Parse(BuildHeader(frameType: FrameHeader.FrameTypeSymbol)).Value;
-        Assert.False(symbol.IsDescriptor);
+        Assert.False(symbol.IsMetaOrRoot);
     }
 
     [Fact]

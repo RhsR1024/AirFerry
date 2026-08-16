@@ -51,21 +51,21 @@ public sealed class Af2GoldenVectorTests
         Assert.Equal(FrameHeader.MagicValue, rootHeader!.Value.Magic);
         Assert.Equal(FrameHeader.ProtocolVersion, rootHeader.Value.Version);
         Assert.Equal(FrameHeader.FrameTypeRoot, rootHeader.Value.FrameType);
-        Assert.True(rootHeader.Value.IsDescriptor);
+        Assert.True(rootHeader.Value.IsMetaOrRoot);
 
         // 2. Verify OBJECT_META frame header
         var metaFrameBytes = Unhex(root.GetProperty("object_meta_frame_hex").GetString()!);
         var metaHeader = FrameHeader.Parse(metaFrameBytes);
         Assert.NotNull(metaHeader);
         Assert.Equal(FrameHeader.FrameTypeObjectMeta, metaHeader!.Value.FrameType);
-        Assert.True(metaHeader.Value.IsDescriptor);
+        Assert.True(metaHeader.Value.IsMetaOrRoot);
 
         // 3. Verify SYMBOL frame header
         var symbolFrameBytes = Unhex(root.GetProperty("symbol_frame_hex").GetString()!);
         var symbolHeader = FrameHeader.Parse(symbolFrameBytes);
         Assert.NotNull(symbolHeader);
         Assert.Equal(FrameHeader.FrameTypeSymbol, symbolHeader!.Value.FrameType);
-        Assert.False(symbolHeader.Value.IsDescriptor);
+        Assert.False(symbolHeader.Value.IsMetaOrRoot);
         Assert.Equal(1u, symbolHeader.Value.Sbn);
         Assert.Equal(42u, symbolHeader.Value.Esi);
 

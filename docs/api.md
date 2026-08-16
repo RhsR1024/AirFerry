@@ -203,7 +203,6 @@ object NativeBridge {
     external fun receiverSnapshotJson(handle: Long): String?
 
     external fun receiverAssembleBytes(handle: Long): ByteArray?
-    external fun receiverLastAssembleError(handle: Long): String
 
     // 按索引重组 chunk 字节（多文件经 entries + 逐 chunk 还原）
     external fun receiverAssembleChunk(handle: Long, index: Int): ByteArray?

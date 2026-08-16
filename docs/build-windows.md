@@ -108,7 +108,7 @@ dotnet run --project AirFerry.Windows -c Release
 ## 5. 关键依赖顺序（坑）
 
 1. **两个 native DLL 必须先于 C# 构建**：见 §4.1/§4.2。走 `build-windows.ps1` 会自动跑 cargo、CMake 与 CTest。
-2. **WPF 只能在 Windows 上构建**：`net8.0-windows` TFM 依赖 Windows SDK，无法在 macOS/Linux 上编译 C# 主项目。**协议层单元测试**（`AirFerry.Windows.Tests`）用纯 `net8.0` TFM，可在任何 OS 上跑（不依赖 P/Invoke，只测 IngestStatus 位域、FrameHeader 解析、BundleParser 等纯逻辑）。
+2. **WPF 只能在 Windows 上构建**：`net8.0-windows` TFM 依赖 Windows SDK，无法在 macOS/Linux 上编译 C# 主项目。**协议层单元测试**（`AirFerry.Windows.Tests`）用纯 `net8.0` TFM，可在任何 OS 上跑（不依赖 P/Invoke，只测 IngestStatus 位域、FrameHeader 解析、golden vectors 等纯逻辑）。
 3. **版本号同步**：改版本时同时改根 `Cargo.toml`（`[workspace.package].version`，→ 核心库）+ `apps/web/package.json` + `apps/scanner/app/build.gradle.kts` versionName（→ APK 内嵌）+ `apps/windows/AirFerry.Windows/AirFerry.Windows.csproj` `<Version>`（→ exe 内嵌）。Windows workflow 不再硬编码版本。同步一致性由 `node scripts/version.mjs check` 门禁保证（见 AGENTS.md「版本事实源」）。
 
 ---
@@ -208,7 +208,7 @@ dotnet test
 
 测试覆盖纯托管逻辑（不实际加载 P/Invoke DLL，跨平台可跑）：
 - `IngestStatusTests`：packed 位域解析（对标 Rust `cffi::tests`）
-- `FrameHeaderTests`：60B 大端帧头解析
+- `FrameHeaderTests`：26B AF2 大端帧头解析
 - `FileNameUtilTests`：文件名 sanitize + Windows 保留名处理
 - `ProgressSnapshotTests`：进度 JSON 解析
 - `PreviewFrameTests`：池化预览缓冲的所有权与幂等释放

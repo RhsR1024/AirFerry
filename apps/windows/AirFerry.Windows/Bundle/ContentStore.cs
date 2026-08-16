@@ -158,11 +158,11 @@ public static class ContentStore
                 : expectedSize ?? throw new FileNotFoundException(
                     "Assembled task file is missing", filePath);
             if (expectedSize is not null && sourceLength != expectedSize.Value)
-                throw new InvalidDataException("assembled file length differs from descriptor");
+                throw new InvalidDataException("assembled file length differs from manifest");
             string hash = sourceExists ? Sha256HexFile(filePath) : expectedHash!;
             if (expectedHash is not null &&
                 !string.Equals(hash, expectedHash, StringComparison.Ordinal))
-                throw new InvalidDataException("assembled file SHA-256 differs from descriptor");
+                throw new InvalidDataException("assembled file SHA-256 differs from manifest");
             string path = BlobPath(hash);
             bool deduped = FileMatchesHash(path, hash, sourceLength);
             if (!deduped)

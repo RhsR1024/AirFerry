@@ -26,8 +26,8 @@ AirFerry 是一个完全离线的光学文件传输系统。发送端（浏览�
 │ Web Worker / Kotlin+CameraX / C#+OpenCvSharp + ZXing 解码         │
 │                                                                  │
 │  视频流 → [并行解码池] → [串行 Rust 摄入]                          │
-│  帧解析 → RaptorQ 恢复 → 解压 → ETTEXTv1 / ETBUNDL1 / 文件       │
-│  文本类扩展名可进复制页（TextLike）                                 │
+│  帧解析 → RaptorQ 恢复 → Manifest → 按条目 kind 路由              │
+│  （UTF8_TEXT → 文本页；FILE/DIRECTORY → 文件/目录结构）             │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -35,22 +35,25 @@ AirFerry 是一个完全离线的光学文件传输系统。发送端（浏览�
 
 ```
 core/
-├── raptorq-core/      RFC 6330 RaptorQ 编解码封装（纯逻辑）
-│   ├── Encoder        分源块、生成源符号 + 按需生成新鲜修复符号
-│   └── Decoder        接收任意顺序符号、容错恢复
-├── qr-protocol/       帧格式 + 分块 + 压缩 + CRC + QR 矩阵
-│   ├── frame          60B Header + T 字节 Payload + 4B Footer
-│   ├── compress       Zstd + XZ 解压分发与输出上限
-│   ├── session        确定性会话 ID（FNV-1a 128-bit）
-│   └── qr_render      fast_qr crate → 模块矩阵（按帧长选最小版本）
-├── transfer-engine/   编排 + 状态机 + 进度 + 断点 + FFI
-│   ├── sender         帧流生成（源符号一遍 → 持续新鲜修复符号）
-│   ├── receiver       帧摄入 + 去重 + 解码 + 重组
-│   ├── descriptor     会话描述符帧（携带 OTI）
-│   ├── wasm.rs        wasm-bindgen（浏览器）
-│   ├── jni.rs         JNI（Android）
-│   └── cffi.rs        C ABI（Windows P/Invoke）
-└── zxing-decoder/     Windows 对 Android v1.1.3 模式的 ZXing-C++ 实现
+├── af2/                 AF2 协议层（帧格式、三层 ID、BLAKE3、Manifest、OTI、状态机、Playlist）
+│   ├── frame            26B Header + T 字节 Payload + 4B 单帧 CRC（ROOT/META/SYMBOL）
+│   ├── id               三层身份派生（Content / Transfer / Object ID，BLAKE3-256）
+│   ├── root / meta      会话 ROOT 与 OBJECT_META 记录（含 OTI、raw/encoded hash）
+│   ├── manifest         80B 头 + Entry Records(kind) + Chunk Hash Table + TLV
+│   ├── sender/receiver  收发状态机（源符号一遍 → 持续新鲜修复符号；
+│   │                    Idle→Locked→Decode→Ready）
+│   └── tlv              四作用域 TLV 编解码（Critical 位 fail-closed）
+├── raptorq-core/         RFC 6330 RaptorQ 编解码封装（纯逻辑）
+│   ├── Encoder          分源块、生成源符号 + 按需生成新鲜修复符号
+│   └── Decoder          接收任意顺序符号、容错恢复
+├── qr-protocol/          压缩 + CRC + QR 矩阵
+│   ├── compress         Zstd + XZ 有界编解码（严格变小才压缩）
+│   └── qr_render        fast_qr crate → 模块矩阵（按帧长选最小版本）
+├── transfer-engine/      编排 + 状态机 + 进度 + 快照 + FFI（re-export `af2`）
+│   ├── wasm.rs          wasm-bindgen（浏览器）
+│   ├── jni.rs           JNI（Android）
+│   └── cffi.rs          C ABI（Windows P/Invoke）
+└── zxing-decoder/       Windows 对 Android v1.1.3 模式的 ZXing-C++ 实现
     ├── DecodeMultiFull / DecodeMultiRegions
     └── packed payload + bbox 结果布局
 ```
@@ -79,42 +82,35 @@ core/
      ┌───────┴────────┐
      │ 1×text 且无文件 │ 否则（文件和/或 ≥1 文字）
      ▼                ▼
- processText      文字→File(.txt) + 文件
- ETTEXTv1         ≥2 → buildBundle(ETBUNDL1)
-     │                │ 1 项 → 单文件路径
+ 单一 UTF8_TEXT     文字→File(.txt) + 文件
+ 条目               ≥2 → 多条目 Manifest（AFM2）
+     │                │ 1 项 → 单文件条目
      └───────┬────────┘
              ▼
-                ┌────────────────────┐
-                │ 三算法选优压缩      │  Raw / Zstd Lv1 / Xz Lv9
-                │ preparePayload     │  70% Zstd early-exit
-                │ (compress.worker)  │
-                └────┬───────────────┘
-                     │ 整段压缩一次；压缩流 > ~32 MiB → 按 ~32 MiB 切压缩流段
-                     ▼
-              ┌──────────────┐
-              │ 零填充对齐    │  T = symbol_size（浏览器默认 1400）
-              │ → N×T 字节   │
-              └────┬─────────┘
-                   ▼
-        ┌─────────────────────┐
-        │ RaptorQ 编码         │  Encoder::with_defaults
-        └────┬────────────────┘
-             ▼
+   ┌────────────────────────────┐
+   │ 构建 AF2 Sender（AF2Sender）│  add_entry(kind, path, content)
+   │  Manifest + 定长切块        │  chunk_raw_size 默认 8 MiB（1..32 MiB）
+   └────┬───────────────────────┘
+        │ 逐 chunk 三算法选优压缩   Raw / Zstd Lv1 / Xz Lv9
+        │ （严格变小才压缩）        （compress.worker 读取 + 计算哈希）
+        ▼
+      ┌──────────────┐
+      │ RaptorQ 编码  │  OTI-only 分区推导（RFC 6330）
+      └────┬─────────┘
+           ▼
    ┌──────────────────────────────┐
-   │ 发射策略 (sender::next_frame) │
-   │ ① 源符号跨块轮询一遍          │
-   │ ② 持续新鲜修复符号（ESI↑）    │
+   │ 发射策略 (af2::sender)        │
+   │ ① Bootstrap: ROOT+META+Manifest│
+   │ ② 源符号跨块轮询一遍          │
+   │ ③ 持续新鲜修复符号（ESI↑）    │
    └────┬─────────────────────────┘
         ▼
-    ┌──────────────────┐     每 17 帧 / 首帧
-    │ 帧封装           │ ◄─── 描述符帧
-    │ Header+Payload   │
-    │ +Footer+CRC×2    │
-    └────┬─────────────┘
-         │ (60+T+4) 字节帧
+    ┌──────────────────┐     META 每 ~17 帧、ROOT 每 ~31 帧插入
+    │ 帧封装           │     （AF2 帧：26B Header + T Payload + 4B CRC）
+    └────┬─────────────┘     (26+T+4) 字节帧
          ▼
    ┌──────────────┐
-   │ QR 编码       │  min_version_for（1464B → V27 125×125）
+   │ QR 编码       │  min_version_for（1430B → V27 125×125）
    └────┬─────────┘
         ▼
   ┌──────────────┐
@@ -149,17 +145,20 @@ core/
              ▼
         ┌──────────────────────────┐
         │ 串行 ingest（锁）         │  原生句柄非线程安全
-        │ magic + CRC×2            │
+        │ magic + 帧 CRC           │
         └────┬─────────────────────┘
              ▼
-       描述符 / 数据符号 → RaptorQ → assemble + 解压（descriptor-v5 → 逐段 SHA 校验 + 磁盘/IndexedDB 账本；原生端流式解压写盘，bounded RAM）
+      ROOT/META 绑定 → RaptorQ 恢复 → Manifest 恢复 → 逐 chunk 解压
+      （每 chunk 按 encoded_hash/raw_hash 校验；磁盘/IndexedDB 账本，
+        原生端流式解压写盘，bounded RAM）
              ▼
          ┌──────────────────────────────────────┐
-         │ ① ETTEXTv1? → ReceiveText            │
-         │ ② ETBUNDL1? → 拆包；.txt 等可点复制   │
-         │ ③ TextLike 文件名 + 严格 UTF-8?       │
-         │      → ReceiveText                   │
-         │ ④ 否则 → 单文件详情 / 分享 / 存盘     │
+         │ 按 Manifest Entry.kind 路由：          │
+         │ ① UTF8_TEXT?      → ReceiveText       │
+         │ ② FILE + TextLike + 严格 UTF-8?      │
+         │      → ReceiveText（可复制）          │
+         │ ③ 多条目           → 拆包列表/目录     │
+         │ ④ 否则单文件      → 文件详情/分享/存盘 │
          └──────────────────────────────────────┘
 ```
 
@@ -185,13 +184,13 @@ core/
 | 帧丢失 | RaptorQ 喷泉码 + 持续新鲜修复符号 |
 | 帧乱序 | 符号按 (sbn, esi) 索引 |
 | 帧重复 | per-block ESI 集合去重 |
-| 帧损坏 | 双层 CRC32 丢弃 |
-| 大文件接收端重启 | 已验证完成压缩段持久化；当前未完成的 ~32 MiB 段重扫 |
-| 不同文件修订版分段混入 | 每段冻结 `root_sha256`；最终发布前流式重算完整根摘要 |
-| 存储空间不足 | 新建根任务和逐段写入前预检，并保留 64 MiB 安全余量 |
-| 成品归档中途崩溃 | 同卷原子移动 + 预期根摘要恢复；根任务派生稳定历史 ID，重试不生成重复记录 |
-| 晚加入 | 描述符帧定期广播 OTI |
-| 恶意/越界描述符 | `ObjectMeta::validate` |
+| 帧损坏 | 帧级 CRC32-IEEE 丢弃（覆盖 Header + Payload） |
+| 大文件接收端重启 | 已验证完成 chunk 持久化；未完成的 chunk 由后续新鲜修复符号重扫 |
+| 不同文件修订版混入 | Object ID 解码前绑定（含 encoded_hash）杜绝混流 |
+| 存储空间不足 | 逐 chunk 写盘前预检，并保留 64 MiB 安全余量 |
+| 成品归档中途崩溃 | 同卷原子移动 + 预期内容摘要恢复；重试不生成重复记录 |
+| 晚加入 | ROOT 每 ~31 帧、OBJECT_META 每 ~17 帧定期广播 OTI |
+| 恶意/越界 META/Manifest | `ObjectMeta::validate` + Manifest 路径/长度校验 |
 | 越界符号坐标 | 拒绝 ESI ≥ 2²⁴ 或载荷长度 ≠ symbol_size |
 | 解压炸弹 | 原生端流式解压按 `original_size` 封顶；网页端按浏览器接收上限封顶 |
 
@@ -205,7 +204,7 @@ core/
 | QR 纠错 | L | 最大化容量 |
 | 4 码并行 | 默认 4 | 同帧 tile 4 符号 |
 | 默认冗余率 | 5% | 仅 UI 时长估算 |
-| 描述符间隔 | ~17/31 帧 | 周期轮转 ROOT 与 OBJECT_META |
+| META/ROOT 间隔 | ~17/31 帧 | 周期轮转 OBJECT_META 与 ROOT |
 | 帧率 | 15 / 20 / 30 / 45 / 60（默认）/ 90 / 120 / 0=无限制 | `types.ts` + Params UI |
 | 接收采集（Android） | ~60fps | **ImageAnalysis 1920×1080** |
 | 亚像素抖动 | 默认关 | ±1px 打散摩尔纹 |

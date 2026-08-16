@@ -17,10 +17,10 @@
 ## 特性
 
 - ✅ 高可靠性、高容错率（支持高丢帧 / 乱序 / 重复帧 / 部分损坏）
-- ✅ 支持大文件分段传输（整段压缩后按 ~32 MiB 切压缩流段；文件/多文件包/文字均可）
+- ✅ 支持大文件 chunk 化传输（默认 8 MiB 定长切块、逐块三算法选优压缩；文件/多文件包/文字均可）
 - ✅ 持续新鲜喷泉码：源符号发一遍后持续补充不重复修复符号，进度近似线性；到 RFC 24 位 ESI 上限时明确停止
 - ✅ 接收端并行解码池：多线程 ZXing + 串行原生摄入，吃满高帧率采集
-- ✅ 大文件断点恢复（历史页显示缺失段；已校验完成段跨重启保留）
+- ✅ 大文件断续恢复（已完成 chunk 跨重启持久化；丢失 chunk 由后续新鲜修复符号补齐）
 - ✅ 连续二维码视频流（多档帧率可选，含无限制模式）
 - ✅ Air-Gap 场景，零网络依赖
 - ✅ 单向信道，无需回传确认
@@ -97,10 +97,10 @@
 ```
 AirFerry/
 ├── core/                  # 跨端 Rust 协议核心 + ZXing-C++ 相机解码核心
-│   ├── af2/               # AF2 核心协议层（帧格式、三层 ID、Manifest、状态机，迁移中）
+│   ├── af2/               # AF2 核心协议层（帧格式、三层 ID、Manifest、状态机、Playlist）
 │   ├── raptorq-core/      # RFC 6330 RaptorQ 编解码封装
-│   ├── qr-protocol/       # 帧格式 / 分块 / 压缩 / CRC / QR 矩阵
-│   ├── transfer-engine/   # 编排 / 状态机 / 进度 / 断点 + WASM/JNI/C ABI
+│   ├── qr-protocol/       # 压缩 / CRC / QR 矩阵
+│   ├── transfer-engine/   # 编排 / 状态机 / 进度 / 快照 + WASM/JNI/C ABI
 │   └── zxing-decoder/     # ZXing-C++ 的 WASM / Windows 解码封装
 ├── apps/
 │   ├── web/               # Vite + React + TS + WASM 前端（浏览器扩展 + 网页发送/接收 + 单文件版）
