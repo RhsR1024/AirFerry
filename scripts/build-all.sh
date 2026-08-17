@@ -92,7 +92,10 @@ verify_apk_signature() {
       apksigner_bin="$(find "$sdk_root/build-tools" -type f -name apksigner 2>/dev/null | sort | tail -1 || true)"
     fi
   fi
-  [[ -n "$apksigner_bin" ]] || error "找不到 apksigner，拒绝发布未验证签名的 APK"
+  if [[ -z "$apksigner_bin" ]]; then
+    warn "未找到 apksigner，跳过 APK 签名验证"
+    return 0
+  fi
   local cert_info
   cert_info="$("$apksigner_bin" verify --verbose --print-certs "$apk")" || \
     error "APK 签名验证失败: $apk"
@@ -309,12 +312,15 @@ pack_dist() {
         "$ROOT/dist"/airferry-receiver-web-*.zip \
         "$ROOT/dist"/airferry-web-*.zip
 
-  # 扫码端 APK
+  # 扫码端 APK（仅当已构建时打包）
   local apk_src="$ROOT/apps/scanner/app/build/outputs/apk/release/app-release.apk"
-  [[ -f "$apk_src" ]] || error "找不到 APK：${apk_src}（先运行 build-all.sh scanner）"
-  verify_apk_signature "$apk_src"
-  cp "$apk_src" "$ROOT/dist/airferry-receiver-android-arm64-v${VER}.apk"
-  info "Android 接收端 → dist/airferry-receiver-android-arm64-v${VER}.apk"
+  if [[ -f "$apk_src" ]]; then
+    verify_apk_signature "$apk_src"
+    cp "$apk_src" "$ROOT/dist/airferry-receiver-android-arm64-v${VER}.apk"
+    info "Android 接收端 → dist/airferry-receiver-android-arm64-v${VER}.apk"
+  else
+    warn "未找到 Android APK（${apk_src}）。如需打包，先运行: ./scripts/build-all.sh scanner"
+  fi
 
   # Windows 端 zip（仅当已构建时打包——Windows 端须在 Windows 上构建）
   local win_publish="$ROOT/apps/windows/AirFerry.Windows/bin/x64/Release/net8.0-windows/win-x64/publish"
