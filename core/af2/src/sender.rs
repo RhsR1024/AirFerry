@@ -83,6 +83,13 @@ pub struct Af2Sender {
     /// reached, freed again when the playlist moves on — peak memory stays
     /// O(one chunk's encoder + packets), not O(whole file)).
     chunk_encoders: Vec<Option<ObjectEncoder>>,
+    /// Per-chunk next repair ESI, surviving encoder free/rebuild (§9.2:
+    /// later epochs send only repair ESIs never used before). 0 = never
+    /// built (repair starts at the chunk's source symbol count).
+    chunk_repair_esi: Vec<u32>,
+    /// 1-based broadcast epoch. Epoch 1 sends each chunk's source symbols
+    /// once; epoch ≥ 2 sends only fresh repair symbols.
+    epoch: u32,
     // Playlist emission state
     state: PlaylistState,
     global_frame_count: u64,
@@ -254,6 +261,7 @@ impl Af2Sender {
         let chunk_count = manifest.chunk_count as usize;
         let mut chunk_encoders = Vec::with_capacity(chunk_count);
         chunk_encoders.resize_with(chunk_count, || None);
+        let chunk_repair_esi = vec![0u32; chunk_count];
 
         Ok(Self {
             config,
@@ -263,6 +271,8 @@ impl Af2Sender {
             manifest_encoder: manifest_obj_encoder,
             stream,
             chunk_encoders,
+            chunk_repair_esi,
+            epoch: 1,
             state: PlaylistState::BootstrapRoot(4),
             global_frame_count: 0,
             since_meta_counter: 0,
@@ -363,7 +373,11 @@ impl Af2Sender {
                     if self.manifest_interleave_count % 8 == 1 {
                         return Ok(self.manifest_encoder.meta_frame_bytes.clone());
                     }
-                    return self.get_manifest_interleave_frame();
+                    if let Some(frame) = self.get_manifest_interleave_frame()? {
+                        return Ok(frame);
+                    }
+                    // Manifest repair ESI exhausted (§9.1: stop at 2^24, never
+                    // re-issue) — fall through to the chunk symbol flow.
                 }
 
                 // Normal Chunk Playlist: §9.2 "ROOT ×1 → CHUNK i META × 2 → symbols"
@@ -394,37 +408,24 @@ impl Af2Sender {
                     return Ok(meta_bytes);
                 }
 
-                let frame = self.get_chunk_symbol_frame(chunk_index, symbol_index)?;
+                let frame = match self.get_chunk_symbol_frame(chunk_index, symbol_index)? {
+                    Some(f) => f,
+                    None => {
+                        // §9.1: this chunk's repair ESI space is exhausted —
+                        // no fresh symbols left. Advance exactly as if its
+                        // target had been reached; the returned frame is the
+                        // next playlist step's leading ROOT (§9.2).
+                        self.advance_past_chunk(chunk_index)?;
+                        self.since_root_counter = 0;
+                        if let PlaylistState::ChunkLoop { root_sent, .. } = &mut self.state {
+                            *root_sent = true;
+                        }
+                        return Ok(self.root_frame_bytes.clone());
+                    }
+                };
                 let next_idx = symbol_index + 1;
                 if next_idx >= symbols_target {
-                    // Next chunk or next Epoch. Free the finished chunk's
-                    // encoder + cached packets — rebuilt deterministically
-                    // (same inputs ⇒ same OTI / object_id) when the playlist
-                    // returns to it, keeping peak memory at O(one chunk).
-                    self.chunk_encoders[chunk_index] = None;
-                    let next_chunk = chunk_index + 1;
-                    if next_chunk < self.chunk_encoders.len() {
-                        self.ensure_chunk_encoder(next_chunk)?;
-                        let next_target = self.chunk_target_symbols(next_chunk);
-                        self.state = PlaylistState::ChunkLoop {
-                            chunk_index: next_chunk,
-                            root_sent: false,
-                            meta_count: 2,
-                            symbol_index: 0,
-                            symbols_target: next_target,
-                        };
-                    } else {
-                        // Epoch finished: restart from Chunk 0 with fresh repair symbols
-                        self.ensure_chunk_encoder(0)?;
-                        let next_target = self.chunk_target_symbols(0);
-                        self.state = PlaylistState::ChunkLoop {
-                            chunk_index: 0,
-                            root_sent: false,
-                            meta_count: 2,
-                            symbol_index: 0,
-                            symbols_target: next_target,
-                        };
-                    }
+                    self.advance_past_chunk(chunk_index)?;
                 } else {
                     self.state = PlaylistState::ChunkLoop {
                         chunk_index,
@@ -437,6 +438,49 @@ impl Af2Sender {
                 Ok(frame)
             }
         }
+    }
+
+    /// Chunk `chunk_index` is finished (symbol target reached, or its repair
+    /// ESI space exhausted per §9.1): free its encoder and move the playlist
+    /// to the next chunk — or, on the last chunk, restart the epoch from
+    /// Chunk 0. Later epochs skip the source-symbol pass and send only fresh
+    /// repair ESIs (§9.2), resuming from the persisted per-chunk ESI.
+    fn advance_past_chunk(&mut self, chunk_index: usize) -> Result<(), SenderError> {
+        // Free the finished chunk's encoder + cached packets — rebuilt
+        // deterministically (same inputs ⇒ same OTI / object_id) when the
+        // playlist returns to it, keeping peak memory at O(one chunk).
+        self.chunk_encoders[chunk_index] = None;
+        let next_chunk = chunk_index + 1;
+        if next_chunk < self.chunk_encoders.len() {
+            self.ensure_chunk_encoder(next_chunk)?;
+            let k = self.chunk_encoders[next_chunk].as_ref().unwrap().source_symbol_count;
+            let start = if self.epoch == 1 { 0 } else { k };
+            let next_target = self.chunk_target_symbols(next_chunk);
+            self.state = PlaylistState::ChunkLoop {
+                chunk_index: next_chunk,
+                root_sent: false,
+                meta_count: 2,
+                symbol_index: start,
+                symbols_target: next_target,
+            };
+        } else {
+            // Epoch finished: restart from Chunk 0 with fresh repair symbols
+            self.epoch += 1;
+            self.ensure_chunk_encoder(0)?;
+            let k = self.chunk_encoders[0].as_ref().unwrap().source_symbol_count;
+            // Epoch 1 already sent every source symbol once; epoch ≥ 2 sends
+            // only repair symbols the receiver has never seen (§9.2).
+            let start = if self.epoch == 1 { 0 } else { k };
+            let next_target = self.chunk_target_symbols(0);
+            self.state = PlaylistState::ChunkLoop {
+                chunk_index: 0,
+                root_sent: false,
+                meta_count: 2,
+                symbol_index: start,
+                symbols_target: next_target,
+            };
+        }
+        Ok(())
     }
 
     /// Lazily construct the RaptorQ encoder for chunk `index` if not built yet.
@@ -502,7 +546,12 @@ impl Af2Sender {
             raptorq_encoder: chunk_enc,
             source_packets: chunk_source_packets,
             source_symbol_count: chunk_source_count,
-            next_repair_esi: chunk_source_count,
+            // Resume the persisted never-repeated repair cursor; 0 marks a
+            // chunk never encoded before (repair starts at its source count).
+            next_repair_esi: match self.chunk_repair_esi[index] {
+                0 => chunk_source_count,
+                saved => saved,
+            },
         });
         Ok(())
     }
@@ -531,78 +580,92 @@ impl Af2Sender {
         .to_bytes()?)
     }
 
-    /// Produce a fresh repair symbol for the Manifest (§9.1 monotonic ESI, capped at 2^24).
-    fn get_manifest_interleave_frame(&mut self) -> Result<Vec<u8>, SenderError> {
+    /// Produce a fresh repair symbol for the Manifest (§9.1 monotonic ESI,
+    /// never repeated). Returns `None` once the ESI space is exhausted
+    /// (2^24 − 1): per §9.1 the sender stops rather than re-issuing.
+    fn get_manifest_interleave_frame(&mut self) -> Result<Option<Vec<u8>>, SenderError> {
         let t = self.config.symbol_size;
         let current_esi = self.manifest_encoder.next_repair_esi;
-        // Monotonic ESI advancement; clamp to MAX_ESI (§9.1: cap at 2^24).
-        if self.manifest_encoder.next_repair_esi < MAX_ESI {
-            self.manifest_encoder.next_repair_esi += 1;
-        } else {
-            // Reached ESI limit: wrap to initial repair ESI to keep emitting
-            self.manifest_encoder.next_repair_esi = self.manifest_encoder.source_symbol_count;
+        if current_esi >= MAX_ESI {
+            return Ok(None);
         }
+        self.manifest_encoder.next_repair_esi += 1;
         let block_encoders = self.manifest_encoder.raptorq_encoder.get_block_encoders();
         let block_idx = (current_esi as usize) % block_encoders.len().max(1);
         let repair_pkts = block_encoders[block_idx].repair_packets(current_esi, 1);
         let pkt = &repair_pkts[0];
-        Ok(Af2Frame {
-            frame_type: FrameType::Symbol,
-            object_id: self.manifest_encoder.object_id,
-            sbn: pkt.payload_id().source_block_number(),
-            esi: pkt.payload_id().encoding_symbol_id(),
-            body: pkt.data().to_vec(),
-            t,
-        }
-        .to_bytes()?)
+        Ok(Some(
+            Af2Frame {
+                frame_type: FrameType::Symbol,
+                object_id: self.manifest_encoder.object_id,
+                sbn: pkt.payload_id().source_block_number(),
+                esi: pkt.payload_id().encoding_symbol_id(),
+                body: pkt.data().to_vec(),
+                t,
+            }
+            .to_bytes()?,
+        ))
     }
 
+    /// Produce the chunk's `symbol_index`-th symbol frame. Source symbols are
+    /// replayable; repair symbols use a monotonically advancing ESI that is
+    /// persisted across encoder free/rebuild so later epochs never re-issue a
+    /// repair ESI (§9.1/§9.2). Returns `None` when the repair ESI space is
+    /// exhausted — the caller must treat the chunk as finished.
     fn get_chunk_symbol_frame(
         &mut self,
         chunk_index: usize,
         symbol_index: u32,
-    ) -> Result<Vec<u8>, SenderError> {
+    ) -> Result<Option<Vec<u8>>, SenderError> {
         self.ensure_chunk_encoder(chunk_index)?;
         let t = self.config.symbol_size;
-        let enc = self.chunk_encoders[chunk_index].as_mut().unwrap();
-        let k = enc.source_symbol_count;
-        let (sbn, esi, body) = if symbol_index < k {
-            // Source symbol — O(1) from the construction-time packet cache.
-            let packets = &enc.source_packets;
-            let pkt = &packets[symbol_index as usize % packets.len()];
-            (
-                pkt.payload_id().source_block_number(),
-                pkt.payload_id().encoding_symbol_id(),
-                pkt.data().to_vec(),
-            )
-        } else {
-            // Fresh repair symbol (monotonic ESI, capped at 2^24)
-            let current_repair_esi = enc.next_repair_esi;
-            if enc.next_repair_esi < MAX_ESI {
-                enc.next_repair_esi += 1;
+        let (object_id, sbn, esi, body, esi_cursor) = {
+            let enc = self.chunk_encoders[chunk_index].as_mut().unwrap();
+            let k = enc.source_symbol_count;
+            let (sbn, esi, body) = if symbol_index < k {
+                // Source symbol — O(1) from the construction-time packet cache.
+                let packets = &enc.source_packets;
+                let pkt = &packets[symbol_index as usize % packets.len()];
+                (
+                    pkt.payload_id().source_block_number(),
+                    pkt.payload_id().encoding_symbol_id(),
+                    pkt.data().to_vec(),
+                )
             } else {
-                enc.next_repair_esi = enc.source_symbol_count;
-            }
-            let block_encoders = enc.raptorq_encoder.get_block_encoders();
-            let block_idx = (current_repair_esi as usize) % block_encoders.len().max(1);
-            let repair_pkts = block_encoders[block_idx].repair_packets(current_repair_esi, 1);
-            let pkt = &repair_pkts[0];
-            (
-                pkt.payload_id().source_block_number(),
-                pkt.payload_id().encoding_symbol_id(),
-                pkt.data().to_vec(),
-            )
+                // Fresh repair symbol (monotonic ESI, never repeated, stop at 2^24 §9.1)
+                let current_repair_esi = enc.next_repair_esi;
+                if current_repair_esi >= MAX_ESI {
+                    return Ok(None);
+                }
+                enc.next_repair_esi += 1;
+                let block_encoders = enc.raptorq_encoder.get_block_encoders();
+                let block_idx = (current_repair_esi as usize) % block_encoders.len().max(1);
+                let repair_pkts = block_encoders[block_idx].repair_packets(current_repair_esi, 1);
+                let pkt = &repair_pkts[0];
+                (
+                    pkt.payload_id().source_block_number(),
+                    pkt.payload_id().encoding_symbol_id(),
+                    pkt.data().to_vec(),
+                )
+            };
+            (enc.object_id, sbn, esi, body, enc.next_repair_esi)
         };
+        // Persist the cursor after the encoder borrow ends — the encoder may
+        // be freed at any moment by the playlist and must rebuild with the
+        // same never-repeated ESI sequence.
+        self.chunk_repair_esi[chunk_index] = esi_cursor;
 
-        Ok(Af2Frame {
-            frame_type: FrameType::Symbol,
-            object_id: enc.object_id,
-            sbn,
-            esi,
-            body,
-            t,
-        }
-        .to_bytes()?)
+        Ok(Some(
+            Af2Frame {
+                frame_type: FrameType::Symbol,
+                object_id,
+                sbn,
+                esi,
+                body,
+                t,
+            }
+            .to_bytes()?,
+        ))
     }
 }
 
@@ -765,6 +828,125 @@ mod tests {
             seen_chunk_oids.len() == 1,
             "one chunk ⇒ exactly one chunk object_id across epochs, got {}",
             seen_chunk_oids.len()
+        );
+    }
+
+    #[test]
+    fn chunk_symbol_esis_never_repeat_across_epochs() {
+        // §9.1/§9.2: source symbols are sent exactly once (epoch 1) and every
+        // repair ESI is never re-issued — including across encoder
+        // free/rebuild at epoch boundaries and chunk transitions.
+        let mut sender = Af2Sender::new(
+            vec![
+                (KIND_FILE, "a.bin".to_string(), vec![0x41u8; 6144]),
+                (KIND_FILE, "b.bin".to_string(), vec![0x42u8; 4096]),
+            ],
+            SenderConfig {
+                symbol_size: 512,
+                redundancy_pct: 25,
+                ..SenderConfig::default()
+            },
+        )
+        .unwrap();
+        let mut seen: std::collections::HashSet<([u8; 16], u8, u32)> =
+            std::collections::HashSet::new();
+        let mut duplicates = 0usize;
+        // Enough frames for several epochs (chunks are small).
+        for _ in 0..4000 {
+            let f = sender.next_frame().unwrap();
+            let parsed = Af2Frame::from_bytes(&f).unwrap();
+            if parsed.frame_type == FrameType::Symbol && !seen.insert((
+                parsed.object_id,
+                parsed.sbn,
+                parsed.esi,
+            )) {
+                duplicates += 1;
+            }
+        }
+        assert_eq!(duplicates, 0, "no symbol frame may ever repeat");
+    }
+
+    #[test]
+    fn manifest_repair_esi_exhaustion_stops() {
+        let mut sender = Af2Sender::new(
+            vec![(KIND_FILE, "x.bin".to_string(), vec![0x55u8; 2048])],
+            SenderConfig {
+                symbol_size: 512,
+                ..SenderConfig::default()
+            },
+        )
+        .unwrap();
+        sender.manifest_encoder.next_repair_esi = MAX_ESI;
+        assert!(
+            sender.get_manifest_interleave_frame().unwrap().is_none(),
+            "§9.1: exhausted repair ESI space must stop, not wrap"
+        );
+    }
+
+    #[test]
+    fn chunk_repair_esi_exhaustion_advances_playlist() {
+        // Exhausting chunk 0's repair ESI cursor mid-playlist: the sender must
+        // stop emitting chunk-0 symbols (forever — the cursor persists across
+        // rebuilds) and advance to the next chunk instead of re-issuing.
+        let mut sender = Af2Sender::new(
+            vec![
+                (KIND_FILE, "a.bin".to_string(), vec![0x41u8; 700 << 10]),
+                (KIND_FILE, "b.bin".to_string(), vec![0x42u8; 700 << 10]),
+            ],
+            SenderConfig {
+                symbol_size: 512,
+                chunk_raw_size: 1 << 20,
+                redundancy_pct: 25,
+            },
+        )
+        .unwrap();
+        // Advance to chunk 0's phase (its encoder is built at chunk start and
+        // spans the ROOT/META preamble plus the symbol pass).
+        for _ in 0..64 {
+            if sender.chunk_encoders[0].is_some() {
+                break;
+            }
+            let _ = sender.next_frame().unwrap();
+        }
+        assert!(
+            sender.chunk_encoders[0].is_some(),
+            "chunk 0 encoder must be live in its symbol phase"
+        );
+        let chunk0_k = sender.chunk_encoders[0].as_ref().unwrap().source_symbol_count;
+        if let Some(enc) = sender.chunk_encoders[0].as_mut() {
+            enc.next_repair_esi = MAX_ESI;
+        }
+        sender.chunk_repair_esi[0] = MAX_ESI;
+        let chunk0_oid = sender.chunk_encoders[0].as_ref().unwrap().object_id;
+        let chunk1_oid = {
+            sender.ensure_chunk_encoder(1).unwrap();
+            sender.chunk_encoders[1].as_ref().unwrap().object_id
+        };
+        let mut chunk0_repairs = 0usize;
+        let mut chunk1_symbols = 0usize;
+        for _ in 0..600 {
+            let f = sender.next_frame().unwrap();
+            let parsed = Af2Frame::from_bytes(&f).unwrap();
+            if parsed.frame_type == FrameType::Symbol {
+                if parsed.object_id == chunk0_oid {
+                    // Source symbols (esi < k) may still finish their epoch-1
+                    // pass; no repair symbol may ever be issued after the
+                    // cursor is exhausted.
+                    if parsed.esi >= chunk0_k {
+                        chunk0_repairs += 1;
+                    }
+                } else if parsed.object_id == chunk1_oid {
+                    chunk1_symbols += 1;
+                }
+            }
+        }
+        assert_eq!(
+            chunk0_repairs, 0,
+            "exhausted chunk must never issue repair symbols (also across epochs)"
+        );
+        assert!(
+            chunk1_symbols > 0,
+            "playlist must advance to the next chunk after exhaustion"
         );
     }
 }
