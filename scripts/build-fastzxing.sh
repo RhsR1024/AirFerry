@@ -35,6 +35,17 @@ if [[ "${1:-}" == "--use-cache" ]]; then
 fi
 
 echo "== configure (emcmake) =="
+# If CMakeCache.txt points to an emcc compiler path that does not exist
+# (stale CI cache restored across runners with different temp-dir hashes),
+# wipe the cache files so cmake re-configures cleanly while preserving the
+# downloaded _deps/ zxing-cpp source tree.
+if [[ -f "$BUILD/CMakeCache.txt" ]]; then
+  cached_cxx="$(grep "^CMAKE_CXX_COMPILER:FILEPATH=" "$BUILD/CMakeCache.txt" 2>/dev/null | cut -d= -f2 || true)"
+  if [[ -n "$cached_cxx" && ! -f "$cached_cxx" ]]; then
+    echo "stale CMakeCache.txt compiler ($cached_cxx); clearing CMake cache"
+    rm -rf "$BUILD/CMakeCache.txt" "$BUILD/CMakeFiles"
+  fi
+fi
 # `${EXTRA_CMAKE[@]+"${EXTRA_CMAKE[@]}"}` — expanding a possibly-empty array
 # under `set -u` errors on macOS's stock bash 3.2 ("unbound variable"); the
 # guard expands to nothing when the array is empty.

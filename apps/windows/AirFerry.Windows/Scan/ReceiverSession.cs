@@ -1,3 +1,4 @@
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
 using AirFerry.Windows.Native;
@@ -320,7 +321,7 @@ public sealed class ReceiverSession : IDisposable
     public string FileName()
     {
         var snap = GetSnapshot();
-        var nonDir = snap.Entries.FindAll(e => e.Kind != 3);
+        var nonDir = snap.Entries.Where(e => e.Kind != 3).ToList();
         if (nonDir.Count == 1) return nonDir[0].Path;
         if (nonDir.Count > 1) return $"多文件传输包 ({nonDir.Count} 项)";
         if (snap.EntryCount > 1) return $"多文件传输包 ({snap.EntryCount} 项)";
