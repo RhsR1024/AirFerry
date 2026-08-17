@@ -26,6 +26,7 @@ import {
   FileIcon,
   HistoryIcon,
   PackageIcon,
+  TextDocIcon,
   WarningIcon,
 } from "@/components/icons"
 import iconUrl from "../../assets/receiver-icon128.png"
@@ -236,6 +237,7 @@ function computeStatusText(
 
 interface ResultInfo {
   recovered: Recovered
+  name?: string
 }
 
 /** Progress fields shipped by receive.worker's status message. */
@@ -253,6 +255,12 @@ interface ProgressSnapshot {
   symbolSize: number
   legacyPeerFrames: number
   complete: boolean
+  fileName?: string
+  fileSize?: number
+  totalRawSize?: number
+  transferIdHex?: string
+  entryCount?: number
+  chunkCount?: number
 }
 
 /**
@@ -509,6 +517,24 @@ export function ReceivePage(): React.ReactElement {
         p.symbolSize = snap.symbolSize
         p.legacyPeerFrames = snap.legacyPeerFrames || 0
         p.framesSeen = snap.framesSeen
+        if (snap.fileName) {
+          p.fileName = snap.fileName
+          activeNameRef.current = snap.fileName
+        }
+        const rawSz = snap.fileSize ?? snap.totalRawSize
+        if (rawSz && rawSz > 0) {
+          p.fileSize = rawSz
+          activeTotalSizeRef.current = rawSz
+        }
+        if (snap.transferIdHex) {
+          activeTransferIdRef.current = snap.transferIdHex
+        }
+        if (snap.entryCount) {
+          activeEntryCountRef.current = snap.entryCount
+        }
+        if (snap.chunkCount) {
+          activeChunkCountRef.current = snap.chunkCount
+        }
       }
 
       // Sliding-window rates (matches Android: prune stale samples, derive
@@ -775,8 +801,9 @@ export function ReceivePage(): React.ReactElement {
         }
         applyStatus(d as Record<string, unknown>)
       } else if (d.type === "meta") {
-        const m = d.meta as {
+        const m = (d.meta || d) as {
           fileName?: string
+          fileSize?: number
           originalSize?: number
           compressedSize?: number
           compressedSizeKnown?: boolean
@@ -786,14 +813,15 @@ export function ReceivePage(): React.ReactElement {
           entryCount?: number
           chunkCount?: number
         } | null
-        const sz = m?.totalRawSize ?? m?.originalSize
+        const sz = m?.totalRawSize ?? m?.fileSize ?? m?.originalSize
         const tid = m?.transferIdHex || ""
+        const fn = m?.fileName
+        if (fn) activeNameRef.current = fn
+        if (sz) activeTotalSizeRef.current = sz
+        if (m?.entryCount) activeEntryCountRef.current = m.entryCount
+        if (m?.chunkCount) activeChunkCountRef.current = m.chunkCount
         if (tid) {
           activeTransferIdRef.current = tid
-          if (m?.fileName) activeNameRef.current = m.fileName
-          if (sz) activeTotalSizeRef.current = sz
-          if (m?.entryCount) activeEntryCountRef.current = m.entryCount
-          if (m?.chunkCount) activeChunkCountRef.current = m.chunkCount
           recordPartialTransfer(
             tid,
             activeNameRef.current,
@@ -806,7 +834,7 @@ export function ReceivePage(): React.ReactElement {
         }
         setProgress((p) => ({
           ...p,
-          fileName: m?.fileName ?? p.fileName,
+          fileName: fn ?? p.fileName,
           fileSize: sz ?? p.fileSize,
           compressedSize: m?.compressedSize ?? p.compressedSize,
           compressedSizeKnown: m?.compressedSizeKnown ?? p.compressedSizeKnown,
@@ -829,17 +857,18 @@ export function ReceivePage(): React.ReactElement {
       } else if (d.type === "result") {
         dbg(`[recv] RESULT: ${d.recovered?.kind}`)
         const rec = d.recovered as Recovered
-        setResult({
-          recovered: rec,
-        })
-        const tid = activeTransferIdRef.current
         const kind = rec?.kind || "file"
         const name =
           kind === "text"
-            ? "文字消息"
+            ? (rec as { name?: string }).name || "文字消息.txt"
             : kind === "file"
-            ? (rec as { name: string }).name
-            : activeNameRef.current || "多文件包"
+            ? (rec as { name: string }).name || activeNameRef.current || "received_file"
+            : activeNameRef.current || "多文件传输包"
+        setResult({
+          recovered: rec,
+          name,
+        })
+        const tid = activeTransferIdRef.current
         const textContent = kind === "text" ? (rec as { text: string }).text : undefined
         recordCompletedTransfer(
           tid,
@@ -1240,15 +1269,22 @@ function ResultView({
       </p>
       {recovered.kind === "text" && (
         <TextView
+          name={result.name}
           text={recovered.text}
           valid={recovered.validUtf8}
         />
       )}
       {recovered.kind === "file" && (
-        <FileView name={recovered.name} data={recovered.data} />
+        <FileView
+          name={result.name || "received_file"}
+          data={recovered.data}
+        />
       )}
       {recovered.kind === "bundle" && (
-        <BundleView entries={recovered.entries} />
+        <BundleView
+          title={result.name}
+          entries={recovered.entries}
+        />
       )}
       <button onClick={onReset} className="btn primary">
         再接收一次
@@ -1258,13 +1294,16 @@ function ResultView({
 }
 
 function TextView({
+  name,
   text,
   valid,
 }: {
+  name?: string
   text: string
   valid: boolean
 }): React.ReactElement {
   const [copied, setCopied] = useState(false)
+  const displayName = name || "文字消息.txt"
   const onCopy = () => {
     navigator.clipboard.writeText(text).then(() => {
       setCopied(true)
@@ -1276,13 +1315,17 @@ function TextView({
     const url = URL.createObjectURL(blob)
     const a = document.createElement("a")
     a.href = url
-    a.download = "文字消息.txt"
+    a.download = displayName
     a.click()
     // Firefox cancels the download if the URL is revoked synchronously.
     setTimeout(() => URL.revokeObjectURL(url), 0)
   }
   return (
     <div className="text-result">
+      <div className="file-result-header" style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "8px", fontWeight: 600, fontSize: "14px" }}>
+        <TextDocIcon size={16} />
+        <span className="file-result-name">{displayName}</span>
+      </div>
       {!valid && (
         <p className="warn">
           <WarningIcon size={14} /> 文本包含无效 UTF-8，已尽力解码
@@ -1341,8 +1384,10 @@ function FileView({
 }
 
 function BundleView({
+  title,
   entries,
 }: {
+  title?: string
   entries: { name: string; data: Uint8Array }[]
 }): React.ReactElement {
   const onDownloadZip = () => {
@@ -1372,9 +1417,10 @@ function BundleView({
 
   return (
     <div className="bundle-result">
-      <p>
-        <PackageIcon size={16} /> {entries.length} 个文件
-      </p>
+      <div className="file-result-header" style={{ display: "flex", alignItems: "center", gap: "8px", fontWeight: 600, fontSize: "14px" }}>
+        <PackageIcon size={16} />
+        <span className="file-result-name">{title || `多文件传输包（${entries.length} 个文件）`}</span>
+      </div>
       <ul className="bundle-list">
         {entries.map((e, i) => {
           const onDownload = () => {

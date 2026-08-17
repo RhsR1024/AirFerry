@@ -437,9 +437,15 @@ async function ingestBatch(frames: Uint8Array[], jobId: number): Promise<{
       await chunkStore.discard()
       await journal.discard()
       lastMetaSent = false
+      lastPostedFileName = ""
+      lastPostedMetaTid = ""
       totalAcceptedSymbols = 0
       pendingReverify = null
       post({ type: "relock", jobId })
+    }
+    // Also post initial meta when ROOT locks (entry count + total size available)
+    if (accepted && !lastMetaSent) {
+      maybePostMeta(jobId)
     }
     if (manifestReady) {
       const m = readMeta(session)
@@ -467,9 +473,15 @@ async function ingestBatch(frames: Uint8Array[], jobId: number): Promise<{
   }
 
   const meta = readMeta(session)
+  // Completion requires the decoded Manifest (entries non-empty): the core may
+  // report all chunks done BEFORE the Manifest object is recovered. Staging
+  // without the entry table would fail the final gate (or emit an empty
+  // bundle) — keep ingesting instead; the manifest interleave delivers it and
+  // every later batch re-announces complete=true.
   const isComplete =
     meta.metaConfirmed &&
     meta.chunkCount > 0 &&
+    meta.entries.length > 0 &&
     chunkStore.completedCount >= meta.chunkCount
 
   const t = meta.symbolSize > 0 ? meta.symbolSize : 1024
@@ -479,6 +491,18 @@ async function ingestBatch(frames: Uint8Array[], jobId: number): Promise<{
     chunkStore.completedCount * Math.ceil(meta.chunkRawSize / t),
     totalSymbols
   )
+
+  const nonDirEntries = meta.entries.filter((e) => e.kind !== KIND_DIRECTORY)
+  let currentFileName = ""
+  if (nonDirEntries.length === 1) {
+    currentFileName = nonDirEntries[0].save_path || nonDirEntries[0].path || "文件传输"
+  } else if (nonDirEntries.length > 1) {
+    currentFileName = `多文件传输包 (${nonDirEntries.length} 项)`
+  } else if (meta.entryCount > 1) {
+    currentFileName = `多文件传输包 (${meta.entryCount} 项)`
+  } else if (meta.totalRawSize > 0) {
+    currentFileName = "文件传输"
+  }
 
   const snapshot = {
     totalSymbols,
@@ -494,34 +518,73 @@ async function ingestBatch(frames: Uint8Array[], jobId: number): Promise<{
     symbolSize: meta.symbolSize,
     legacyPeerFrames: meta.legacyPeerFrames,
     complete: isComplete,
+    fileName: currentFileName,
+    fileSize: meta.totalRawSize,
+    totalRawSize: meta.totalRawSize,
+    transferIdHex: meta.transferIdHex,
+    entryCount: meta.entryCount,
+    chunkCount: meta.chunkCount,
   }
 
   return { complete: isComplete, acceptedCount, snapshot }
 }
 
+let lastPostedFileName = ""
+let lastPostedMetaTid = ""
+
 function maybePostMeta(jobId: number): void {
-  if (!session || lastMetaSent) return
+  if (!session) return
   const meta = readMeta(session)
-  if (!meta.metaConfirmed) return
+  if (meta.totalRawSize === 0 && !meta.metaConfirmed) return
 
   const nonDirEntries = meta.entries.filter((e) => e.kind !== KIND_DIRECTORY)
   let fileName = "文件传输"
   if (nonDirEntries.length === 1) {
-    fileName = nonDirEntries[0].save_path || nonDirEntries[0].path
+    fileName = nonDirEntries[0].save_path || nonDirEntries[0].path || "文件传输"
   } else if (nonDirEntries.length > 1) {
     fileName = `多文件传输包 (${nonDirEntries.length} 项)`
+  } else if (meta.entryCount > 1) {
+    fileName = `多文件传输包 (${meta.entryCount} 项)`
   }
 
-  lastMetaSent = true
-  post({
+  // Only post when we have new metadata (e.g. initial ROOT lock or refined Manifest filename)
+  if (
+    lastPostedMetaTid === meta.transferIdHex &&
+    lastPostedFileName === fileName &&
+    lastMetaSent
+  ) {
+    return
+  }
+
+  lastPostedMetaTid = meta.transferIdHex
+  lastPostedFileName = fileName
+  if (meta.metaConfirmed) {
+    lastMetaSent = true
+  }
+
+  const payload = {
     type: "meta",
     fileName,
     fileSize: meta.totalRawSize,
+    totalRawSize: meta.totalRawSize,
     compressedSize: meta.totalRawSize,
+    transferIdHex: meta.transferIdHex,
+    entryCount: meta.entryCount,
+    chunkCount: Math.max(1, meta.chunkCount),
     segmentIndex: 0,
     segmentCount: Math.max(1, meta.chunkCount),
+    meta: {
+      fileName,
+      fileSize: meta.totalRawSize,
+      totalRawSize: meta.totalRawSize,
+      compressedSize: meta.totalRawSize,
+      transferIdHex: meta.transferIdHex,
+      entryCount: meta.entryCount,
+      chunkCount: Math.max(1, meta.chunkCount),
+    },
     jobId,
-  })
+  }
+  post(payload)
 }
 
 // ---------------------------------------------------------------------------
