@@ -145,6 +145,20 @@ jobs:
       - name: Dist gate
         run: node scripts/verify-dist.mjs
 
+      - name: Package web release artifacts to dist/
+        run: ./scripts/build-all.sh dist
+
+      - name: Upload Web Artifacts (zip, crx, xpi, standalone HTML)
+        uses: actions/upload-artifact@v4
+        with:
+          name: airferry-web-dist
+          path: |
+            dist/*.zip
+            dist/*.crx
+            dist/*.xpi
+            dist/*.html
+          if-no-files-found: error
+
   android:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -193,6 +207,13 @@ jobs:
         # assembleDebug 的 compileRustJni 前置会自动 cargo-ndk 重编 .so，
         # 打进 APK 的 JNI 库永远与源码同步（v1.2.0 防护）。
         run: ./gradlew :app:testDebugUnitTest :app:assembleDebug
+
+      - name: Upload Android APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: airferry-android-apk
+          path: apps/scanner/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
 
   windows:
     runs-on: windows-latest

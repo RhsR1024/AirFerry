@@ -493,6 +493,54 @@ mod tests {
     }
 
     #[test]
+    fn complete_before_manifest_stays_recoverable_while_ingesting() {
+        // Host contract (§11/§13): the core may announce is_complete() while
+        // the Manifest is still undecoded — a §12 resume whose ledger already
+        // holds every chunk, or a small transfer whose last chunk beats the
+        // manifest interleave. Hosts must NOT stop ingesting on that first
+        // complete=true: verify_chunk stays false (no Manifest table) and the
+        // snapshot carries no entry table, so staging can only fail. Keeping
+        // the feed alive delivers the Manifest (recurring META + interleave
+        // symbols), completion persists, and staging then succeeds.
+        let data = vec![0x5Au8; 3000];
+        let mut sender = Af2Sender::new(
+            vec![(KIND_FILE, "race.bin".to_string(), data.clone())],
+            SenderConfig::default(),
+        )
+        .unwrap();
+        let root_frame = sender.next_frame().unwrap(); // bootstrap ROOT
+
+        // §12 resume with every chunk already committed: complete, no manifest.
+        let mut session = ReceiverSession::new();
+        assert!(session.resume(&root_frame, &[0]));
+        assert!(session.is_complete(), "1/1 ledger chunks ⇒ complete pre-manifest");
+        assert!(
+            !session.snapshot_json().contains("\"entries\":[{"),
+            "snapshot has no entry table before the manifest decodes"
+        );
+        assert!(
+            !session.verify_chunk(0, &data),
+            "verify_chunk is false without the manifest — staging must wait"
+        );
+
+        // The host keeps ingesting (the fixed behavior): the manifest arrives…
+        let mut manifest_ready = false;
+        for _ in 0..4000 {
+            let f = sender.next_frame().unwrap();
+            let (_, _, manifest, _) = bits(session.ingest(&f));
+            if manifest {
+                manifest_ready = true;
+                break;
+            }
+        }
+        assert!(manifest_ready, "the recurring manifest interleave must deliver it");
+        // …completion persists across the wait, and staging is now possible.
+        assert!(session.is_complete(), "completion must survive the manifest wait");
+        assert!(session.verify_chunk(0, &data));
+        assert!(session.verify_final_stream(&data));
+    }
+
+    #[test]
     fn resume_restores_completion_state() {
         let data = vec![0x77u8; 2500];
         let mut sender = Af2Sender::new(

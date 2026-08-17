@@ -67,6 +67,8 @@ interface PreparedPayload {
 
 export interface AppState {
   page: Page
+  /** Page the settings screen was opened from; closing settings returns here. */
+  settingsFrom: Page | null
   items: PendingItem[]
   prepared: PreparedPayload | null
   session: SenderSessionWasm | null
@@ -94,6 +96,7 @@ export default function App() {
 
   const [state, setState] = useState<AppState>({
     page: "select",
+    settingsFrom: null,
     items: [],
     prepared: null,
     session: null,
@@ -109,6 +112,11 @@ export default function App() {
   const restartWorkerRef = useRef<() => void>(() => undefined)
   const mountedRef = useRef(true)
   const ownedSessionRef = useRef<SenderSessionWasm | null>(null)
+  // Latest session builder. The worker "done" handler lives in a mount-time
+  // effect closure, so it must call through this ref to see fresh config.
+  const startPlaybackRef = useRef<(p: PreparedPayload, startEpoch: number) => Promise<void>>(
+    async () => undefined
+  )
 
   const releaseOwnedSession = useCallback(() => {
     const s = ownedSessionRef.current
@@ -171,7 +179,9 @@ export default function App() {
           compressPhase: null,
           error: null,
         }))
-        void startPlaybackWithPayload(payload, epoch.current)
+        // Files are ready — build the encoder session and jump straight to the
+        // QR play page (no intermediate params step in the main flow).
+        void startPlaybackRef.current(payload, epoch.current)
       }
     }
 
@@ -336,6 +346,8 @@ export default function App() {
     }
   }, [state.config, releaseOwnedSession])
 
+  startPlaybackRef.current = startPlaybackWithPayload
+
   const onPlay = useCallback(() => {
     const items = state.items
     if (items.length === 0) return
@@ -385,6 +397,14 @@ export default function App() {
     }))
   }, [])
 
+  const openSettings = useCallback(() => {
+    setState((s) => ({ ...s, settingsFrom: s.page, page: "settings" }))
+  }, [])
+
+  const closeSettings = useCallback(() => {
+    setState((s) => ({ ...s, page: s.settingsFrom ?? "select", settingsFrom: null }))
+  }, [])
+
   const closeStats = useCallback(() => {
     releaseOwnedSession()
     setState((s) => ({
@@ -406,21 +426,18 @@ export default function App() {
 
   return (
     <div className="app">
-      <header className="app-header" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: "14px" }}>
-          <div className="app-logo">
-            <img src={iconUrl} alt="AirFerry" />
-          </div>
-          <div className="app-title">
-            <h1>AirFerry</h1>
-          </div>
+      <header className="app-header">
+        <div className="app-logo">
+          <img src={iconUrl} alt="AirFerry" />
+        </div>
+        <div className="app-title">
+          <h1>AirFerry</h1>
         </div>
         {state.page !== "settings" && (
           <button
             type="button"
-            className="btn secondary btn-sm"
-            style={{ display: "flex", alignItems: "center", gap: "6px" }}
-            onClick={() => setState((s) => ({ ...s, page: "settings" }))}
+            className="btn secondary btn-sm settings-btn"
+            onClick={openSettings}
             title="传输设置"
           >
             <SettingsIcon size={16} />
@@ -471,7 +488,7 @@ export default function App() {
           <SettingsPage
             config={state.config}
             onChange={updateConfig}
-            onBack={() => setState((s) => ({ ...s, page: "select" }))}
+            onBack={closeSettings}
           />
         )}
         {state.page === "play" && state.session && state.prepared && (

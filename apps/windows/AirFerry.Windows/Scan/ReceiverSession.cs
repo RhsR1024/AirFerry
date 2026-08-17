@@ -244,7 +244,11 @@ public sealed class ReceiverSession : IDisposable
             {
                 return new Snapshot();
             }
-            if (_cachedSnapshot is { MetaConfirmed: true } cached)
+            // Freeze only once the Manifest is decoded. `meta_confirmed` in
+            // the AF2 snapshot merely means the ROOT locked — freezing there
+            // (a v1-era refactor) pins Entries = [] for the whole session and
+            // staging falls back to one nameless concatenated file.
+            if (_cachedSnapshot is { MetaConfirmed: true, Entries.Count: > 0 } cached)
             {
                 return cached;
             }

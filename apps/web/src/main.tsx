@@ -1,8 +1,8 @@
 /**
  * AirFerry web sender — entry point.
  *
- * Thin shell: the entire sender app (file/text select → params → QR stream →
- * stats) lives in `src/options.tsx` (via the `@/` alias configured in
+ * Thin shell: the entire sender app (file/text select → QR stream → stats,
+ * with transfer params on a separate settings page) lives in `src/options.tsx` (via the `@/` alias configured in
  * vite.config.ts / tsconfig.json). The same source serves the browser
  * extension build; extension-only bits (background worker, chrome.runtime.getURL)
  * are handled inside it via environment detection, so this file only mounts

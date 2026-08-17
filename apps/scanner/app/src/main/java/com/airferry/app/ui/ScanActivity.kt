@@ -692,8 +692,20 @@ class ScanActivity : ComponentActivity() {
         val segCount = if (segmented) session.segmentCount() else 1
         val legacy = if (session.isInitialized) session.snapshot().legacyPeerFrames else 0
 
-        val snapshot = FrameSnapshot(progress, fn, fs, cs, segIdx, segCount, legacy)
-        if (status.complete) {
+        // Completion requires the decoded Manifest: the core may report all
+        // chunks done BEFORE the Manifest object is recovered (single small
+        // chunk racing the manifest interleave; also every §12 resume whose
+        // ledger already holds every chunk). Staging then has no entry table
+        // (and verify_chunk fails without the Manifest), which used to abort
+        // with "块校验失败" and discard a fully received transfer. Keep
+        // ingesting instead — the recurring MANIFEST META + interleave symbols
+        // decode it, and every later frame re-announces complete=true.
+        val manifestDecoded = session.snapshot().entries.isNotEmpty()
+        val completionEligible = status.complete && manifestDecoded
+        val displayProgress =
+            if (status.complete && !manifestDecoded) progress.copy(complete = false) else progress
+        val snapshot = FrameSnapshot(displayProgress, fn, fs, cs, segIdx, segCount, legacy)
+        if (completionEligible) {
             // Block any further ingest before the completion path (assemble +
             // file I/O + Activity start) runs on the main thread.
             ingestStopped.set(true)
@@ -797,7 +809,14 @@ class ScanActivity : ComponentActivity() {
         updateUi {
             it.copy(
                 progressPct = pct,
-                receivedSymbols = progress.receivedSymbols,
+                // `receivedSymbols` also counts Manifest symbols and FEC
+                // repairs, while `totalSymbols` is the source-symbol estimate
+                // — the raw pair routinely reads past 100% ("2100 / 2048"),
+                // which users read as "接收超过了源文件". Clamp the DISPLAY
+                // at the estimate; the raw count still drives the rate window.
+                receivedSymbols = if (progress.totalSymbols > 0)
+                    progress.receivedSymbols.coerceAtMost(progress.totalSymbols)
+                else progress.receivedSymbols,
                 totalSymbols = progress.totalSymbols,
                 decodedBlocks = progress.decodedBlocks,
                 totalBlocks = progress.totalBlocks,

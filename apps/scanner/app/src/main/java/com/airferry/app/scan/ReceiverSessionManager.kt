@@ -184,7 +184,11 @@ class ReceiverSessionManager {
     fun snapshot(): Snapshot {
         if (!initialized) return Snapshot(false, "", "", ByteArray(0), 0L, 0, 0, 0, emptyList(), 0)
         cachedSnapshot?.let { snap ->
-            if (snap.metaConfirmed) return snap
+            // Freeze only once the Manifest is decoded. `meta_confirmed` in the
+            // AF2 snapshot merely means the ROOT locked — freezing there (as a
+            // v1-era refactor did) pins `entries = []` for the whole session
+            // and staging falls back to one nameless concatenated file.
+            if (snap.metaConfirmed && snap.entries.isNotEmpty()) return snap
         }
         val json = NativeBridge.receiverSnapshotJson(handle)
             ?: return cachedSnapshot

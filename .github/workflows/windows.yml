@@ -164,6 +164,38 @@ jobs:
       - name: dotnet build (WPF Release)
         run: dotnet build apps/windows/AirFerry.Windows/AirFerry.Windows.csproj -c Release --no-restore
 
+      - name: dotnet publish (single-file, win-x64, self-contained=false)
+        run: >-
+          dotnet publish apps/windows/AirFerry.Windows/AirFerry.Windows.csproj
+          -c Release -r win-x64
+          -p:PublishSingleFile=true --self-contained false
+
+      - name: Pack zip
+        shell: pwsh
+        run: |
+          $BinRoot = "apps/windows/AirFerry.Windows/bin"
+          $publishDirs = Get-ChildItem -Path $BinRoot -Recurse -Directory -Filter "publish" -ErrorAction SilentlyContinue
+          if ($publishDirs.Count -eq 0) {
+            throw "未找到 publish 目录"
+          }
+          $PublishDir = $publishDirs[-1].FullName
+          foreach ($required in @("transfer_engine.dll", "airferry_zxing.dll")) {
+            $runtimeDll = Join-Path "apps/windows/AirFerry.Windows/runtime" $required
+            Copy-Item $runtimeDll (Join-Path $PublishDir $required) -Force
+          }
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $ZipName = "dist/airferry-receiver-windows-x64.zip"
+          if (Test-Path $ZipName) { Remove-Item $ZipName -Force }
+          Compress-Archive -Path "$PublishDir/*" -DestinationPath $ZipName
+          Write-Host "Windows 接收端 -> $ZipName"
+
+      - name: Upload Windows Receiver Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: airferry-windows-x64
+          path: dist/airferry-receiver-windows-x64.zip
+          if-no-files-found: error
+
   # ── Job 4: Windows 发布打包 + 上传到 GitHub release ──────────────────────
   # 镜像 build-windows.ps1 -Pack：
   # ① cargo build --features cffi → transfer_engine.dll → runtime/

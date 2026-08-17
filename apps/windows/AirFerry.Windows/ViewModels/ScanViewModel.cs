@@ -723,7 +723,13 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             }
         }
 
-        if (s.Complete)
+        // Completion requires the decoded Manifest: the core may report all
+        // chunks done BEFORE the Manifest object is recovered (small transfers
+        // racing the manifest interleave; also a §12 resume whose ledger
+        // already holds every chunk). Staging without the entry table used to
+        // fail the final gate and discard a fully received transfer. Keep
+        // ingesting instead — every later frame re-announces Complete=true.
+        if (s.Complete && session.GetSnapshot().Entries.Count > 0)
         {
             if (Interlocked.Exchange(ref _recoveryStarted, 1) == 0)
             {

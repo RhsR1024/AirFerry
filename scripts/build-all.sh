@@ -225,8 +225,10 @@ build_web() {
   if command -v emcc >/dev/null 2>&1; then
     info "重编 FAST ZXing-C++ 快路径 (airferry_zxing.js/.wasm → apps/web/src/fastzxing/) ..."
     "$ROOT/scripts/build-fastzxing.sh" --use-cache
+  elif [[ -f "$ROOT/apps/web/src/fastzxing/airferry_zxing.js" && -f "$ROOT/apps/web/src/fastzxing/airferry_zxing.wasm" ]]; then
+    info "复用现有 FAST ZXing-C++ 缓存产物 (airferry_zxing.js/.wasm)"
   else
-    error "未找到 emcc（Emscripten）。FAST ZXing-C++ 是接收端唯一解码后端（zxing-wasm 回退已移除），产物缺失则构建失败。请安装 Emscripten 3.1.64 后运行: ./scripts/build-fastzxing.sh（产物有缓存，日常构建无需重编）"
+    error "未找到 emcc（Emscripten），且缺失缓存产物。请安装 Emscripten 3.1.64 后运行: ./scripts/build-fastzxing.sh"
     exit 1
   fi
 
