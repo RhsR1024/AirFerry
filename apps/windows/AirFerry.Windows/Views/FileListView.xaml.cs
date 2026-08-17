@@ -5,6 +5,7 @@ using System.Windows;
 using System.Windows.Controls;
 using AirFerry.Windows.Bundle;
 using AirFerry.Windows.Models;
+using AirFerry.Windows.Scan;
 using AirFerry.Windows.Services;
 
 namespace AirFerry.Windows.Views;

@@ -4,6 +4,7 @@ using System.IO;
 using System.Text;
 using AirFerry.Windows.Bundle;
 using AirFerry.Windows.Models;
+using AirFerry.Windows.Native;
 using AirFerry.Windows.Scan;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
