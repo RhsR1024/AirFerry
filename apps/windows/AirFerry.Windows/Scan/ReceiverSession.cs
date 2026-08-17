@@ -234,8 +234,6 @@ public sealed class ReceiverSession : IDisposable
     /// <summary>One AF2 Manifest entry (kind/path/savePath/offset/size).</summary>
     public sealed record ManifestEntryDto(int Kind, string Path, string SavePath, ulong Offset, ulong Size);
 
-    private Snapshot? _cachedSnapshot;
-
     /// <summary>Current snapshot (cached once the manifest has entries).</summary>
     public Snapshot GetSnapshot()
     {
