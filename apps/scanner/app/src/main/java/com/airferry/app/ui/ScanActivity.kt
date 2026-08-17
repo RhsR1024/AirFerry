@@ -1262,7 +1262,7 @@ class ScanActivity : ComponentActivity() {
         private const val RATE_WINDOW_MS = 3_000L
         /** Minimum Δt before publishing a rate (avoids 1-tick spikes). */
         private const val RATE_MIN_DT_MS = 300L
-        /** Default display/store name when an older TEXT descriptor has no filename. */
+        /** Defensive fallback store name if a UTF8_TEXT entry ever arrives with an empty path. */
         private const val TEXT_RECEIVED_NAME = "文字消息.txt"
 
         fun formatSize(bytes: Long): String {

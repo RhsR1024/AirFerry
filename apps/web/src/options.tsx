@@ -22,6 +22,11 @@ import {
   SenderBuilderWasm,
   type SenderSessionWasm,
 } from "@/wasm/loader"
+import { getCachedManifest, putCachedManifest } from "@/lib/sender-cache"
+import {
+  type ChunkEncoding,
+  prepareChunkEncodings,
+} from "@/lib/chunk-encode"
 import type { PreparedItem } from "@/workers/compress.worker"
 import "@/assets/app.css"
 
@@ -290,15 +295,83 @@ export default function App() {
         }
         return
       }
-      const builder = new SenderBuilderWasm()
-      for (const it of p.items) {
-        builder.add_entry(it.kind, it.path, new Uint8Array(it.content))
-      }
-      const session = builder.build(
-        cfg.symbolSize,
-        8 * 1024 * 1024,
-        cfg.redundancyPct
+      // §9.3 resend cache (SPEC §10.2): same selection + chunk_raw_size hits
+      // the stored encoded Manifest and skips the whole BLAKE3 hash pass.
+      // Advisory — every step below falls back to the full build on miss,
+      // stale entry, or any cache error. Note: `build`/`build_cached` consume
+      // the builder (wasm-bindgen by-value), so each attempt needs its own.
+      const chunkRawSize = 8 * 1024 * 1024
+      // Balanced chunk pre-encode (SPEC §10.1 sender policy): classify and
+      // compress every chunk NOW so the rAF play loop never compresses.
+      // channelBps = playout payload rate (fps × T × QR count) drives the
+      // p6 escalation; single-chunk transfers escalate unconditionally.
+      // Advisory — any failure falls back to the lazy play-time path.
+      const channelBps = Math.round(
+        cfg.symbolSize * (cfg.fps || 60) * Math.max(1, cfg.multiQr || 1)
       )
+      const forceFull = p.totalBytes <= chunkRawSize
+      let encodings: ChunkEncoding[] = []
+      try {
+        encodings = await prepareChunkEncodings(p.items, {
+          chunkRawSize,
+          channelBps,
+          forceFull,
+        })
+      } catch (e) {
+        console.warn("chunk pre-encode failed, falling back to lazy encoding:", e)
+        encodings = []
+      }
+      if (!mountedRef.current || epoch.current !== startEpoch) {
+        if (mountedRef.current) {
+          setState((s) => ({ ...s, initializing: false }))
+        }
+        return
+      }
+      const fillBuilder = (): SenderBuilderWasm => {
+        const builder = new SenderBuilderWasm()
+        for (const it of p.items) {
+          builder.add_entry(it.kind, it.path, new Uint8Array(it.content))
+        }
+        for (const c of encodings) {
+          builder.add_preencoded_chunk(c.index, c.codec, c.data)
+        }
+        return builder
+      }
+      let session: SenderSessionWasm | null = null
+      try {
+        const cached = await getCachedManifest(p.items, chunkRawSize)
+        if (!mountedRef.current || epoch.current !== startEpoch) {
+          if (mountedRef.current) {
+            setState((s) => ({ ...s, initializing: false }))
+          }
+          return
+        }
+        if (cached && cached.chunkRawSize === chunkRawSize) {
+          try {
+            session = fillBuilder().build_cached(
+              cached.manifestHex,
+              cfg.symbolSize,
+              chunkRawSize,
+              cfg.redundancyPct
+            )
+          } catch (e) {
+            // Stale/corrupt cache entry — fall through to a full rebuild.
+            console.warn("cached manifest unusable, rebuilding:", e)
+            session = null
+          }
+        }
+      } catch {
+        session = null
+      }
+      if (!session) {
+        session = fillBuilder().build(cfg.symbolSize, chunkRawSize, cfg.redundancyPct)
+        // Only cache what a fresh build produced — never a fallback session.
+        try {
+          await putCachedManifest(p.items, session.manifest_json(), chunkRawSize)
+        } catch {
+          // advisory
+        }
+      }
       if (!mountedRef.current || epoch.current !== startEpoch) {
         freeSenderSession(session)
         releaseOwnedSession()

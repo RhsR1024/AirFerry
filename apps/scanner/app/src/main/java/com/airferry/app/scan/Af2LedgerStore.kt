@@ -95,7 +95,51 @@ class Af2LedgerStore private constructor(private val path: File) {
         path.delete()
     }
 
+    data class PendingTransfer(
+        val transferIdHex: String,
+        val chunkRawSize: Int,
+        val completedCount: Int,
+        val diskBytes: Long,
+        val lastModified: Long,
+    )
+
     companion object {
+        /** List all uncompleted/partial transfer ledgers in `dir`. */
+        fun listPendingTransfers(dir: File): List<PendingTransfer> {
+            val candidates = dir.listFiles { f -> f.name.startsWith("af2-") && f.name.endsWith(".ledger.jsonl") }
+                ?: return emptyList()
+            val list = mutableListOf<PendingTransfer>()
+            for (f in candidates) {
+                val store = Af2LedgerStore(f)
+                if (store.reload()) {
+                    val tid = store.transferIdHex
+                    val spill = File(dir, "af2-$tid.partial")
+                    val spillBytes = if (spill.isFile) spill.length() else 0L
+                    list.add(
+                        PendingTransfer(
+                            transferIdHex = tid,
+                            chunkRawSize = store.chunkRawSize,
+                            completedCount = store.completedIndices.size,
+                            diskBytes = f.length() + spillBytes,
+                            lastModified = f.lastModified()
+                        )
+                    )
+                }
+            }
+            return list.sortedByDescending { it.lastModified }
+        }
+
+        /** Discard all pending journals and spill files in `dir`. */
+        fun discardAllPending(dir: File) {
+            dir.listFiles { f ->
+                f.name.startsWith("af2-") && (
+                    f.name.endsWith(".ledger.jsonl") ||
+                    f.name.endsWith(".partial") ||
+                    f.name.endsWith(".tmp")
+                )
+            }?.forEach { it.delete() }
+        }
+
         /** Resume source: the most recent ledger in `dir` (by mtime), or null. */
         fun loadMostRecent(dir: File): Af2LedgerStore? {
             val candidates = dir.listFiles { f -> f.name.endsWith(".ledger.jsonl") }

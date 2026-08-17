@@ -178,6 +178,7 @@ object_id = Trunc128(H(
 | 1 | Zstd | 单 Frame、windowLog ≤ 23 |
 | 2 | XZ/LZMA2 | 单 Stream、解码内存 ≤ 128 MiB |
 
+- **接收端 MUST 可解码全部三种 codec**（三端已实现：Native 走 zstd/xz2，Web 走 ruzstd/lzma-rs）；发送端按 §10.1 逐块自选算法，**RAW 恒合法**。
 - 严格变小才压缩：压缩结果严格小于原始大小时方可使用压缩，否则必须为 RAW。
 
 ### 7.2 标准 Playlist 调度
@@ -243,7 +244,7 @@ total_raw_size, chunk_raw_size, chunk_count, completed_bitmap, chunk_hash[](Mani
 | chunk_raw_size | 1..32 MiB 2 的幂（默认 8） |
 | chunk_count / 总大小 | 131072 / 4 TiB（`total_raw_size ≥ 1`） |
 | 单 Encoded Object | 32 MiB（Manifest 16 MiB） |
-| Source Blocks / ESI | 255 / < 2²⁴（触顶循环） |
+| Source Blocks / ESI | 255 / < 2²⁴（触顶停止，跨 Epoch 永不重复） |
 | zstd windowLog / XZ 内存 | 23 / 128 MiB |
 | 活跃 Decoder | Manifest 1 + Chunk 1 |
 | 未知 Object 符号缓存 | **0** |
@@ -254,6 +255,32 @@ total_raw_size, chunk_raw_size, chunk_count, completed_bitmap, chunk_hash[](Mani
 
 | 端 | 发送端支持 | 接收端支持 | 备注 |
 |---|---|---|---|
-| Native (Android / Windows) | RAW, Zstd, XZ | RAW, Zstd, XZ | 全功能 |
-| Web (WASM) | RAW | RAW | 压缩流接收显式报 `UnsupportedCodec` |
+| Native (Android / Windows) | RAW, Zstd, XZ | RAW, Zstd, XZ | 全功能（C 库绑定 `zstd` / `xz2`） |
+| Web (WASM) | RAW, Zstd, XZ | RAW, Zstd, XZ | 全功能（纯 Rust `zrip` / `lzma-rust2` 编码，`ruzstd` / `lzma-rs` 解码） |
+
+> **Web 发送端压缩实现**：Web/WASM 发送端使用纯 Rust 的 `zrip` 与 `lzma-rust2` 编码（`ruzstd` / `lzma-rs` 解码），严格遵守 §7.1"严格变小才压缩"的双端不变量（产物小于原始数据时才使用压缩标签，否则自动使用 RAW）。四端线格式与编解码能力 100% 闭合。
+>
+> **发送端选优策略（不进线格式，三规则平衡策略）**：发送端在预处理期（`开始传输` 时）对每个 Chunk 用
+> `encode_chunk_balanced` 预编码，播放循环零压缩——
+> ① **采样跳过**：每 Chunk 前 256 KiB 用 zstd-L1 与 xz-p2 试压，两者都压不到 98% 以下即判不可压缩（媒体/随机数据），直接 RAW、不做全量尝试；
+> ② **best-of(zstd-L1, xz-p2)**：可压缩 Chunk 在两档间取小（p2 拿回 xz 大部分压缩率、编码速度约 7 倍于标准档）；
+> ③ **速率门控升级**：仅当高压缩档（native 6|EXTREME / wasm 6）预估节省的传输时间大于其编码耗时（按播放速率 R = fps×T×码数 与实测编码吞吐校准），或单 Chunk 传输（≤1 chunk，等待有界）时，才升级到高压缩档。
+> 预编码产物经 `PreencodedChunk` 通道进入发送器，核心侧强制校验严格变小不变量；任何预编码失败回退播放期惰性编码（`encode_chunk`），不影响可用性。
+
+---
+
+## 14. TLV 规则（ROOT / META / Manifest / Entry 四作用域）
+
+```text
+type:u16 || length:u16 || value          type & 0x8000 = Critical
+```
+
+- 同一作用域内 type **严格升序**、不得重复；length 累加与 body_len 必须 checked 后才切片。
+- 未知 Optional → 跳过；未知 Critical → 拒绝所在结构并提示升级（fail-closed）。
+- `0x4000–0x7FFF` / `0xC000–0xFFFF` 为实验/厂商段。
+- 演进判定：新注解 → Optional TLV；新算法/新语义 → 注册表新码点 + Critical TLV；
+  帧头布局变化 → wire_version+1。禁止复用已废弃码点。
+- 预留方向：Ed25519 签名、分块 AEAD、SHA-256 注册（外部合规核验）、双向确认 Profile、CDC 分块。
+- 已知 Entry 注解 TLV（均 Optional）：`0x0101` mtime_ms(u64)、`0x0102` unix_mode(u32)、
+  `0x0103` mime(UTF-8 ≤ 255B)、`0x0104` type_class(u8，纯 UI 提示，非信任来源)。
 

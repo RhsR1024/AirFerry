@@ -15,6 +15,27 @@ export interface PreparedItem {
   kind: number
   path: string
   content: ArrayBuffer
+  /**
+   * §9.3 resend-cache stamp for this item — the sender's local cache
+   * invalidation key (SPEC §10.2: `(path, size, mtime)`; mtime is a LOCAL
+   * cache key, never protocol identity). Files: `size:lastModified`.
+   * Text items have no mtime, so their stamp is `t:size:fnv1a(content)`
+   * (same-length edits change the hash).
+   */
+  fingerprint: string
+}
+
+/**
+ * FNV-1a 32-bit — cheap content stamp for text items (the only input that can
+ * change without changing size). Not a security primitive.
+ */
+function fnv1a32(bytes: Uint8Array): number {
+  let h = 0x811c9dc5
+  for (let i = 0; i < bytes.length; i++) {
+    h ^= bytes[i]
+    h = Math.imul(h, 0x01000193)
+  }
+  return h >>> 0
 }
 
 export interface CompressResult {
@@ -62,6 +83,7 @@ self.addEventListener("message", async (e: MessageEvent) => {
         kind: KIND_UTF8_TEXT,
         path: cleanName,
         content: encoded.buffer,
+        fingerprint: `t:${encoded.byteLength}:${fnv1a32(encoded)}`,
       })
     } else if (Array.isArray(files) && files.length > 0) {
       displayName = files[0].name
@@ -94,6 +116,7 @@ self.addEventListener("message", async (e: MessageEvent) => {
           kind: KIND_FILE,
           path: filePath,
           content: buffer,
+          fingerprint: `${file.size}:${file.lastModified}`,
         })
       }
     }

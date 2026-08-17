@@ -35,6 +35,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.airferry.app.scan.Af2LedgerStore
 import com.airferry.app.scan.ContentStore
 import com.airferry.app.scan.CreateNamedDocument
 import com.airferry.app.scan.FileTransfer
@@ -150,6 +151,7 @@ class FileListActivity : ComponentActivity() {
         // null = root (top-level entries + bundle groups); non-null = inside a bundle
         var openBundleId by remember { mutableStateOf<String?>(null) }
         var rows by remember { mutableStateOf<List<Row>>(emptyList()) }
+        var pendingTransfers by remember { mutableStateOf<List<Af2LedgerStore.PendingTransfer>>(emptyList()) }
         var selection by remember { mutableStateOf<Set<String>?>(null) }
         var pendingDelete by remember { mutableStateOf<List<Row>?>(null) }
         var pendingClearAll by remember { mutableStateOf(false) }
@@ -162,22 +164,18 @@ class FileListActivity : ComponentActivity() {
         // overwrite a newer one (e.g. rapidly entering/leaving a bundle).
         var rowsGeneration by remember { mutableStateOf(0) }
         fun refresh() {
-            // Fail-safe against the executor being shut down from onDestroy:
-            // the background completion callbacks (clear-all / delete) post
-            // back via runOnUiThread without checking destroy state, and
-            // submitting to a shutdown executor throws
-            // RejectedExecutionException on the main thread (uncaught → crash).
-            // refresh() and onDestroy both run on the main thread, so the
-            // lifecycle check cannot race with shutdown; the try/catch is
-            // defense-in-depth for any future background-thread caller.
             if (isFinishing || isDestroyed) return
             val filter = openBundleId
             val gen = ++rowsGeneration
             try {
                 bgExecutor.execute {
                     val loaded = loadRows(filter)
+                    val pending = if (filter == null) Af2LedgerStore.listPendingTransfers(cacheDir) else emptyList()
                     runOnUiThread {
-                        if (gen == rowsGeneration) rows = loaded
+                        if (gen == rowsGeneration) {
+                            rows = loaded
+                            pendingTransfers = pending
+                        }
                     }
                 }
             } catch (_: RejectedExecutionException) {
@@ -264,7 +262,48 @@ class FileListActivity : ComponentActivity() {
                 }
             }
 
-            if (rows.isEmpty()) {
+            if (openBundleId == null && pendingTransfers.isNotEmpty()) {
+                val totalPendingBytes = pendingTransfers.sumOf { it.diskBytes }
+                Card(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF332005)),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "${pendingTransfers.size} 个未完成断点传输",
+                                color = Color(0xFFFBBF24),
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 14.sp
+                            )
+                            TextButton(
+                                onClick = {
+                                    bgExecutor.execute {
+                                        Af2LedgerStore.discardAllPending(cacheDir)
+                                        runOnUiThread { refresh() }
+                                    }
+                                },
+                                contentPadding = PaddingValues(0.dp)
+                            ) {
+                                Text("清理断点", color = DeleteRed, fontSize = 12.sp)
+                            }
+                        }
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            text = "已占用磁盘 ${ScanActivity.formatSize(totalPendingBytes)} · 再次对准原二维码即可接续传输",
+                            color = Color(0xFFFDE68A),
+                            fontSize = 12.sp
+                        )
+                    }
+                }
+            }
+
+            if (rows.isEmpty() && pendingTransfers.isEmpty()) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     Text("暂无接收文件或待恢复任务", color = TextSecondary, fontSize = 16.sp, textAlign = TextAlign.Center)
                 }

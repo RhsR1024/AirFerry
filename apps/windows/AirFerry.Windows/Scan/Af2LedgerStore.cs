@@ -23,6 +23,7 @@ public sealed class Af2LedgerStore
 {
     private readonly string _path;
     public string TransferIdHex { get; private set; } = "";
+    public int ChunkRawSize { get; private set; }
     public byte[] RootFrameBytes { get; private set; } = Array.Empty<byte>();
     public SortedSet<int> Completed { get; } = new();
 
@@ -74,6 +75,8 @@ public sealed class Af2LedgerStore
                     continue;
                 }
                 TransferIdHex = o.TryGetProperty("tid", out JsonElement tid) ? tid.GetString() ?? "" : "";
+                ChunkRawSize = o.TryGetProperty("crs", out JsonElement crs) && crs.TryGetInt32(out int crsVal)
+                    ? crsVal : 0;
                 RootFrameBytes = o.TryGetProperty("root", out JsonElement root)
                     ? HexToBytes(root.GetString() ?? "") : Array.Empty<byte>();
                 headerSeen = true;
@@ -129,6 +132,62 @@ public sealed class Af2LedgerStore
         try { File.Delete(_path); } catch (IOException) { }
     }
 
+    public record PendingTransfer(
+        string TransferIdHex,
+        int ChunkRawSize,
+        int CompletedCount,
+        long DiskBytes,
+        DateTime LastModified);
+
+    /// <summary>List all pending/uncompleted transfer ledgers in <paramref name="dir"/>.</summary>
+    public static IReadOnlyList<PendingTransfer> ListPendingTransfers(string dir)
+    {
+        if (!Directory.Exists(dir)) return [];
+        try
+        {
+            var list = new List<PendingTransfer>();
+            foreach (var file in Directory.EnumerateFiles(dir, "af2-*.ledger.jsonl"))
+            {
+                var store = new Af2LedgerStore(file);
+                if (store.Reload())
+                {
+                    string tid = store.TransferIdHex;
+                    string spill = Path.Combine(dir, $"af2-{tid}.partial");
+                    long spillBytes = File.Exists(spill) ? new FileInfo(spill).Length : 0L;
+                    var fi = new FileInfo(file);
+                    list.Add(new PendingTransfer(
+                        tid,
+                        store.ChunkRawSize,
+                        store.CompletedIndices.Length,
+                        fi.Length + spillBytes,
+                        fi.LastWriteTime));
+                }
+            }
+            return list.OrderByDescending(p => p.LastModified).ToList();
+        }
+        catch (Exception)
+        {
+            return [];
+        }
+    }
+
+    /// <summary>Discard all pending journals, spills, and temp files in <paramref name="dir"/>.</summary>
+    public static void DiscardAllPending(string dir)
+    {
+        if (!Directory.Exists(dir)) return;
+        try
+        {
+            foreach (var f in Directory.EnumerateFiles(dir, "af2-*"))
+            {
+                if (f.EndsWith(".ledger.jsonl") || f.EndsWith(".partial") || f.EndsWith(".tmp"))
+                {
+                    try { File.Delete(f); } catch { }
+                }
+            }
+        }
+        catch { }
+    }
+
     /// <summary>Resume source: the most recent journal in <paramref name="dir"/> (by mtime).</summary>
     public static Af2LedgerStore? LoadMostRecent(string dir)
     {
@@ -179,6 +238,7 @@ public sealed class Af2LedgerStore
         return new Af2LedgerStore(path)
         {
             TransferIdHex = transferIdHex,
+            ChunkRawSize = chunkRawSize,
             RootFrameBytes = rootFrameBytes,
         };
     }

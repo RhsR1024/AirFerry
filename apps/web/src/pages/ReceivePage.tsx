@@ -24,12 +24,19 @@ import {
   CheckIcon,
   ErrorIcon,
   FileIcon,
+  HistoryIcon,
   PackageIcon,
   WarningIcon,
 } from "@/components/icons"
 import iconUrl from "../../assets/receiver-icon128.png"
 import type { Recovered } from "@/receive/parse"
 import { ensureWasm } from "@/wasm/loader"
+import { createZipBlob } from "@/lib/zip"
+import {
+  recordPartialTransfer,
+  recordCompletedTransfer,
+} from "@/storage/receiveHistory"
+import { HistoryModal } from "@/components/HistoryModal"
 
 type Stage = "camera" | "scanning" | "recovering" | "done" | "error"
 
@@ -270,6 +277,7 @@ export function ReceivePage(): React.ReactElement {
   const [error, setError] = useState<string | null>(null)
   const [progress, setProgress] = useState<ProgressInfo>(() => initialProgress())
   const [result, setResult] = useState<ResultInfo | null>(null)
+  const [historyOpen, setHistoryOpen] = useState(false)
   // End-to-end capture fps (how often captureLoop runs) — shown in the corner to
   // diagnose whether the 120 codes/s ceiling is camera fps (30) vs decode speed.
   const [captureFps, setCaptureFps] = useState<number>(0)
@@ -281,6 +289,13 @@ export function ReceivePage(): React.ReactElement {
     !!navigator.mediaDevices &&
     typeof navigator.mediaDevices.getDisplayMedia === "function"
   )
+
+  // In-flight transfer metadata tracking for history & resume
+  const activeTransferIdRef = useRef<string>("")
+  const activeNameRef = useRef<string>("")
+  const activeTotalSizeRef = useRef<number>(0)
+  const activeEntryCountRef = useRef<number>(1)
+  const activeChunkCountRef = useRef<number>(1)
 
   // Sliding-window rate samples + transfer timer (mirror Android refs).
   const rateSamplesRef = useRef<RateSample[]>([])
@@ -747,6 +762,17 @@ export function ReceivePage(): React.ReactElement {
           setStage((s) => (s === "scanning" ? "recovering" : s))
           recv.postMessage({ type: "assemble", jobId: jobIdRef.current })
         }
+        if (activeTransferIdRef.current) {
+          recordPartialTransfer(
+            activeTransferIdRef.current,
+            activeNameRef.current,
+            activeTotalSizeRef.current,
+            activeEntryCountRef.current,
+            Number(d.decodedBlocks) || 0,
+            Number(d.totalBlocks) || activeChunkCountRef.current,
+            activeEntryCountRef.current > 1 ? "bundle" : "file"
+          )
+        }
         applyStatus(d as Record<string, unknown>)
       } else if (d.type === "meta") {
         const m = d.meta as {
@@ -757,8 +783,27 @@ export function ReceivePage(): React.ReactElement {
           rootId?: string
           transferIdHex?: string
           totalRawSize?: number
+          entryCount?: number
+          chunkCount?: number
         } | null
         const sz = m?.totalRawSize ?? m?.originalSize
+        const tid = m?.transferIdHex || ""
+        if (tid) {
+          activeTransferIdRef.current = tid
+          if (m?.fileName) activeNameRef.current = m.fileName
+          if (sz) activeTotalSizeRef.current = sz
+          if (m?.entryCount) activeEntryCountRef.current = m.entryCount
+          if (m?.chunkCount) activeChunkCountRef.current = m.chunkCount
+          recordPartialTransfer(
+            tid,
+            activeNameRef.current,
+            activeTotalSizeRef.current,
+            activeEntryCountRef.current,
+            0,
+            m?.chunkCount || 1,
+            (m?.entryCount || 1) > 1 ? "bundle" : "file"
+          )
+        }
         setProgress((p) => ({
           ...p,
           fileName: m?.fileName ?? p.fileName,
@@ -773,15 +818,37 @@ export function ReceivePage(): React.ReactElement {
         // previous transfer's name/progress display until the new manifest
         // arrives (otherwise the UI keeps showing stale data with no hint).
         dbg("[recv] relocked to a new transfer")
+        activeTransferIdRef.current = ""
+        activeNameRef.current = ""
+        activeTotalSizeRef.current = 0
+        activeEntryCountRef.current = 1
         setProgress((p) => ({
           ...initialProgress(),
           statusText: "检测到新传输，已切换…",
         }))
       } else if (d.type === "result") {
         dbg(`[recv] RESULT: ${d.recovered?.kind}`)
+        const rec = d.recovered as Recovered
         setResult({
-          recovered: d.recovered,
+          recovered: rec,
         })
+        const tid = activeTransferIdRef.current
+        const kind = rec?.kind || "file"
+        const name =
+          kind === "text"
+            ? "文字消息"
+            : kind === "file"
+            ? (rec as { name: string }).name
+            : activeNameRef.current || "多文件包"
+        const textContent = kind === "text" ? (rec as { text: string }).text : undefined
+        recordCompletedTransfer(
+          tid,
+          name,
+          activeTotalSizeRef.current,
+          activeEntryCountRef.current,
+          kind,
+          textContent
+        )
         assemblingRef.current = false
         stageRef.current = "done"
         setStage("done")
@@ -945,6 +1012,18 @@ export function ReceivePage(): React.ReactElement {
         <div className="app-title">
           <h1>AirFerry 接收端</h1>
         </div>
+        <div className="header-right-actions">
+          <button
+            type="button"
+            className="btn btn-sm"
+            onClick={() => setHistoryOpen(true)}
+            title="查看接收历史与断点任务"
+            style={{ display: "flex", alignItems: "center", gap: "6px" }}
+          >
+            <HistoryIcon size={16} />
+            <span>历史与断点</span>
+          </button>
+        </div>
       </header>
 
       <main className="app-main">
@@ -1038,6 +1117,8 @@ export function ReceivePage(): React.ReactElement {
       <footer className="app-footer">
         <span className="app-footer-hint">AirFerry · 无网文件传输</span>
       </footer>
+
+      <HistoryModal isOpen={historyOpen} onClose={() => setHistoryOpen(false)} />
     </div>
   )
 }
@@ -1264,10 +1345,18 @@ function BundleView({
 }: {
   entries: { name: string; data: Uint8Array }[]
 }): React.ReactElement {
+  const onDownloadZip = () => {
+    const zipBlob = createZipBlob(entries)
+    const url = URL.createObjectURL(zipBlob)
+    const a = document.createElement("a")
+    a.href = url
+    const dateStr = new Date().toISOString().slice(0, 10)
+    a.download = `AirFerry-文件包-${dateStr}.zip`
+    a.click()
+    setTimeout(() => URL.revokeObjectURL(url), 0)
+  }
+
   const onDownloadAll = () => {
-    // Download each sequentially (no zip dependency in M2). The URL is
-    // revoked on a macrotask: Firefox cancels downloads whose blob URL is
-    // revoked synchronously after click().
     for (const e of entries) {
       const blob = new Blob([e.data.slice().buffer as ArrayBuffer], {
         type: "application/octet-stream",
@@ -1280,6 +1369,7 @@ function BundleView({
       setTimeout(() => URL.revokeObjectURL(url), 0)
     }
   }
+
   return (
     <div className="bundle-result">
       <p>
@@ -1310,9 +1400,14 @@ function BundleView({
           )
         })}
       </ul>
-      <button onClick={onDownloadAll} className="btn primary">
-        全部下载
-      </button>
+      <div className="bundle-actions" style={{ display: "flex", gap: "10px", marginTop: "6px" }}>
+        <button onClick={onDownloadZip} className="btn primary" style={{ flex: 2 }}>
+          打包下载 (.zip)
+        </button>
+        <button onClick={onDownloadAll} className="btn" style={{ flex: 1 }}>
+          逐个下载
+        </button>
+      </div>
     </div>
   )
 }

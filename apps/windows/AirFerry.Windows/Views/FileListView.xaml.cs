@@ -58,6 +58,27 @@ public partial class FileListView : Page
                 item.CrcHex,
                 item.CrcUnknown));
         }
+
+        string tempDir = Path.Combine(Path.GetTempPath(), "AirFerry");
+        var pending = Scan.Af2LedgerStore.ListPendingTransfers(tempDir);
+        if (pending.Count > 0)
+        {
+            long totalPendingBytes = pending.Sum(p => p.DiskBytes);
+            PendingCard.Visibility = Visibility.Visible;
+            PendingTitle.Text = $"{pending.Count} 个未完成断点传输";
+            PendingDesc.Text = $"已占用磁盘 {FormatSize((ulong)totalPendingBytes)} · 再次扫描原二维码即可接续传输";
+        }
+        else
+        {
+            PendingCard.Visibility = Visibility.Collapsed;
+        }
+    }
+
+    private void ClearPending_Click(object sender, RoutedEventArgs e)
+    {
+        string tempDir = Path.Combine(Path.GetTempPath(), "AirFerry");
+        Scan.Af2LedgerStore.DiscardAllPending(tempDir);
+        Refresh();
     }
 
     private async void FileList_DoubleClick(object sender, RoutedEventArgs e)

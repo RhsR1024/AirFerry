@@ -17,7 +17,6 @@ crate-type = ["rlib", "cdylib"]
 raptorq-core.workspace = true
 qr-protocol.workspace = true
 af2.workspace = true
-sha2.workspace = true
 
 [dev-dependencies]
 # ReceiverSession §11 eviction test crafts a hostile chunk object (encoder side).

@@ -17,11 +17,12 @@
 use crate::chunk::encode_chunk;
 use crate::frame::{Af2Frame, FrameType, MAX_ESI, MAX_T, MIN_T};
 use crate::id::{hash, object_id, transfer_id, EntryIdInput, ROLE_CHUNK, ROLE_MANIFEST};
-use crate::manifest::build_manifest;
-use crate::meta::{ObjectMetaRecord, CODEC_RAW, FEC_ID_RAPTORQ};
+use crate::manifest::{build_manifest, Manifest};
+use crate::meta::{ObjectMetaRecord, CODEC_RAW, CODEC_XZ, CODEC_ZSTD, FEC_ID_RAPTORQ};
 use crate::receiver::object_meta_from_oti;
 use crate::root::RootRecord;
 use raptorq::{Encoder, EncodingPacket};
+use std::borrow::Cow;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SenderError {
@@ -46,6 +47,32 @@ pub struct SenderConfig {
     pub symbol_size: usize,
     pub chunk_raw_size: u32,
     pub redundancy_pct: u8,
+}
+
+/// A host pre-encoded chunk for the prep-time balanced policy
+/// ([`crate::chunk::encode_chunk_balanced`]). Keeps compression off the
+/// play path entirely; the wire format is untouched (a chunk's codec_id and
+/// bytes are whatever they are).
+#[derive(Debug, Clone)]
+pub enum PreencodedChunk {
+    /// "Compression cannot win" — skip the play-time codec attempts and
+    /// stream the raw slice as RAW. Carries no bytes, so RAW-heavy media
+    /// transfers pay zero duplicated memory.
+    RawMarker,
+    /// Pre-encoded chunk bytes with their wire codec tag. MUST be strictly
+    /// smaller than the chunk's raw slice (§10.1 dual-end invariant); the
+    /// build rejects violations.
+    Encoded(u8, Vec<u8>),
+}
+
+/// One `(item index, offset within item, length)` slice of the canonical
+/// stream — the host assembles chunk bytes from these without re-implementing
+/// the NFC-path ordering rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkSegment {
+    pub item: u32,
+    pub start: u64,
+    pub len: u64,
 }
 
 impl Default for SenderConfig {
@@ -76,6 +103,10 @@ pub struct Af2Sender {
     transfer_id: [u8; 16],
     root_record: RootRecord,
     root_frame_bytes: Vec<u8>,
+    /// Encoded Manifest bytes (§9.3 resend cache: the whole hash pass —
+    /// entry hashes, chunk hash table, content_id — is contained in these
+    /// bytes, so a cached manifest rebuilds a sender without re-hashing).
+    manifest_bytes: Vec<u8>,
     manifest_encoder: ObjectEncoder,
     /// Canonical content stream (single copy, entries concatenated).
     stream: Vec<u8>,
@@ -87,6 +118,10 @@ pub struct Af2Sender {
     /// later epochs send only repair ESIs never used before). 0 = never
     /// built (repair starts at the chunk's source symbol count).
     chunk_repair_esi: Vec<u32>,
+    /// Host pre-encoded chunks (balanced sender policy). `None` chunks fall
+    /// back to lazy `encode_chunk` at play time, so partially-provisioned
+    /// hosts (and all native/tests paths) keep working unchanged.
+    preencoded_chunks: Vec<Option<PreencodedChunk>>,
     /// 1-based broadcast epoch. Epoch 1 sends each chunk's source symbols
     /// once; epoch ≥ 2 sends only fresh repair symbols.
     epoch: u32,
@@ -124,6 +159,55 @@ impl Af2Sender {
         items: Vec<(u8, String, Vec<u8>)>,
         config: SenderConfig,
     ) -> Result<Self, SenderError> {
+        Self::new_with_preencoded(items, config, Vec::new())
+    }
+
+    /// [`Self::new`] plus host pre-encoded chunks (balanced sender policy):
+    /// every provisioned chunk skips play-time compression; the rest behave
+    /// exactly like [`Self::new`].
+    pub fn new_with_preencoded(
+        items: Vec<(u8, String, Vec<u8>)>,
+        config: SenderConfig,
+        preencoded: Vec<(u32, PreencodedChunk)>,
+    ) -> Result<Self, SenderError> {
+        let mut entry_refs = Vec::new();
+        for (kind, path, content) in &items {
+            entry_refs.push((*kind, path.as_str(), content.as_slice()));
+        }
+        let manifest = build_manifest(entry_refs, config.chunk_raw_size)?;
+        Self::from_manifest_with_preencoded(manifest, items, config, preencoded)
+    }
+
+    /// Build a sender from a **pre-built, already-trusted Manifest** — the
+    /// §9.3 resend-cache path. Every hash pass (per-entry BLAKE3, chunk hash
+    /// table, content_id derivation) is skipped; everything else (manifest
+    /// encode, ROOT/META frames, lazy chunk encoders, canonical stream
+    /// assembly) is identical to [`Self::new`], so the emitted frame stream
+    /// is byte-for-byte the same as a full rebuild from the same items.
+    ///
+    /// The cache is advisory (SPEC §10.2): validity is keyed by the caller's
+    /// `(path, size, mtime)` fingerprint, and a stale manifest produces a
+    /// transfer whose receivers fail §13 verification — never a wire crash.
+    /// Hosts MUST fall back to [`Self::new`] when the cache is unavailable
+    /// or untrusted.
+    pub fn from_manifest(
+        manifest: Manifest,
+        items: Vec<(u8, String, Vec<u8>)>,
+        config: SenderConfig,
+    ) -> Result<Self, SenderError> {
+        Self::from_manifest_with_preencoded(manifest, items, config, Vec::new())
+    }
+
+    /// [`Self::from_manifest`] plus host pre-encoded chunks. Validation is
+    /// fail-closed on the §10.1 invariant: an `Encoded` chunk must carry a
+    /// Zstd/Xz tag and be strictly smaller than its canonical raw slice —
+    /// a host bug can never put an illegal wire object on the air.
+    pub fn from_manifest_with_preencoded(
+        manifest: Manifest,
+        items: Vec<(u8, String, Vec<u8>)>,
+        config: SenderConfig,
+        preencoded: Vec<(u32, PreencodedChunk)>,
+    ) -> Result<Self, SenderError> {
         let t = config.symbol_size;
         // Fail fast on bad config: `to_bytes` would otherwise reject every
         // produced frame and the error would surface as an empty QR stream.
@@ -138,11 +222,15 @@ impl Af2Sender {
                 config.redundancy_pct
             )));
         }
-        let mut entry_refs = Vec::new();
-        for (kind, path, content) in &items {
-            entry_refs.push((*kind, path.as_str(), content.as_slice()));
+        // The manifest is the authoritative chunking (its chunk hash table was
+        // built with ITS chunk_raw_size); a caller-supplied mismatch would
+        // desync stream slicing and the transfer_id derivation.
+        if config.chunk_raw_size != manifest.chunk_raw_size {
+            return Err(SenderError::Config(format!(
+                "chunk_raw_size {} does not match manifest's {}",
+                config.chunk_raw_size, manifest.chunk_raw_size
+            )));
         }
-        let manifest = build_manifest(entry_refs, config.chunk_raw_size)?;
         if manifest.total_raw_size == 0 {
             return Err(SenderError::EmptyContent);
         }
@@ -263,15 +351,53 @@ impl Af2Sender {
         chunk_encoders.resize_with(chunk_count, || None);
         let chunk_repair_esi = vec![0u32; chunk_count];
 
+        // Validate + index the host pre-encoded chunks against the assembled
+        // canonical stream (the authoritative chunking lives in the manifest).
+        let mut preencoded_chunks: Vec<Option<PreencodedChunk>> =
+            (0..chunk_count).map(|_| None).collect();
+        for (index, pc) in preencoded {
+            let idx = index as usize;
+            if idx >= chunk_count {
+                return Err(SenderError::Config(format!(
+                    "preencoded chunk index {index} out of range (chunk_count {chunk_count})"
+                )));
+            }
+            if preencoded_chunks[idx].is_some() {
+                return Err(SenderError::Config(format!(
+                    "preencoded chunk {index} provided twice"
+                )));
+            }
+            if let PreencodedChunk::Encoded(codec, bytes) = &pc {
+                if *codec != CODEC_ZSTD && *codec != CODEC_XZ {
+                    return Err(SenderError::Config(format!(
+                        "preencoded chunk {index} codec {codec} must be Zstd/Xz (send RawMarker for RAW)"
+                    )));
+                }
+                let start = idx as u64 * u64::from(manifest.chunk_raw_size);
+                let raw_len = (manifest.total_raw_size.saturating_sub(start))
+                    .min(u64::from(manifest.chunk_raw_size))
+                    as usize;
+                if bytes.len() >= raw_len {
+                    return Err(SenderError::Config(format!(
+                        "preencoded chunk {index} violates strictly-smaller ({} >= {raw_len})",
+                        bytes.len()
+                    )));
+                }
+            }
+            preencoded_chunks[idx] = Some(pc);
+        }
+
         Ok(Self {
             config,
             transfer_id: tid,
             root_record,
             root_frame_bytes: root_frame,
+            manifest_bytes,
             manifest_encoder: manifest_obj_encoder,
             stream,
             chunk_encoders,
             chunk_repair_esi,
+            preencoded_chunks,
             epoch: 1,
             state: PlaylistState::BootstrapRoot(4),
             global_frame_count: 0,
@@ -288,6 +414,14 @@ impl Af2Sender {
 
     pub fn content_id(&self) -> [u8; 32] {
         self.root_record.content_id
+    }
+
+    /// Encoded Manifest bytes — the §9.3 resend-cache payload. Deterministic:
+    /// the same items + chunk_raw_size always produce the same bytes, so a
+    /// cached copy can be handed back to [`Self::from_manifest`] to rebuild
+    /// this sender without re-running the hash pass.
+    pub fn manifest_bytes(&self) -> &[u8] {
+        &self.manifest_bytes
     }
 
     /// Produce the next wire frame according to the standard automatic playlist.
@@ -496,12 +630,22 @@ impl Af2Sender {
         } else {
             &[]
         };
-        let (codec, encoded) = encode_chunk(raw);
-        let chunk_enc = Encoder::with_defaults(&encoded, t as u16);
+        let (codec, encoded): (u8, Cow<'_, [u8]>) = match &self.preencoded_chunks[index] {
+            // Balanced policy provisioned this chunk at prep time — no codec
+            // runs on the play path (the rAF/QR loop must never block on
+            // compression).
+            Some(PreencodedChunk::RawMarker) => (CODEC_RAW, Cow::Borrowed(raw)),
+            Some(PreencodedChunk::Encoded(c, bytes)) => (*c, Cow::Borrowed(bytes)),
+            None => {
+                let (c, e) = encode_chunk(raw);
+                (c, Cow::Owned(e))
+            }
+        };
+        let chunk_enc = Encoder::with_defaults(encoded.as_ref(), t as u16);
         let chunk_oti = chunk_enc.get_config().serialize();
         let chunk_meta_obj = object_meta_from_oti(&chunk_oti, 32 << 20)
             .map_err(|e| SenderError::Oti(format!("{e}")))?;
-        let encoded_hash = hash(&encoded);
+        let encoded_hash = hash(encoded.as_ref());
         let chunk_oid = object_id(
             &self.transfer_id,
             ROLE_CHUNK,
@@ -669,6 +813,59 @@ impl Af2Sender {
     }
 }
 
+/// Canonical-stream chunk layout WITHOUT reading or hashing any content:
+/// NFC-normalize paths, drop directories, sort by path bytes — exactly
+/// [`build_manifest`]'s ordering — then cut the cumulative stream into
+/// `chunk_raw_size` chunks. Hosts use this during prep to assemble each
+/// chunk's bytes for pre-encoding; `from_manifest_with_preencoded` validates
+/// the resulting encodings against the same slices, so a layout mismatch can
+/// never reach the wire.
+pub fn plan_chunks(
+    metas: &[(u8, String, u64)],
+    chunk_raw_size: u32,
+) -> Result<Vec<Vec<ChunkSegment>>, SenderError> {
+    use unicode_normalization::UnicodeNormalization;
+    if chunk_raw_size == 0 {
+        return Err(SenderError::Config("chunk_raw_size must be > 0".into()));
+    }
+    let mut ordered: Vec<(String, u32, u64)> = metas
+        .iter()
+        .enumerate()
+        .filter(|(_, (kind, _, _))| *kind != crate::id::KIND_DIRECTORY)
+        .map(|(i, (_, path, size))| (path.nfc().collect::<String>(), i as u32, *size))
+        .collect();
+    ordered.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    let total: u64 = ordered.iter().map(|(_, _, s)| s).sum();
+    if total == 0 {
+        return Err(SenderError::EmptyContent);
+    }
+    let chunk = u64::from(chunk_raw_size);
+    let mut out: Vec<Vec<ChunkSegment>> = Vec::new();
+    let mut cur: Vec<ChunkSegment> = Vec::new();
+    let mut cur_len: u64 = 0;
+    for (_, item, size) in ordered {
+        let mut pos: u64 = 0;
+        while pos < size {
+            let take = (chunk - cur_len).min(size - pos);
+            cur.push(ChunkSegment {
+                item,
+                start: pos,
+                len: take,
+            });
+            cur_len += take;
+            pos += take;
+            if cur_len == chunk {
+                out.push(std::mem::take(&mut cur));
+                cur_len = 0;
+            }
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -710,6 +907,66 @@ mod tests {
 
         assert!(manifest_ready, "manifest must be ready");
         assert_eq!(chunks_received, 1, "all chunks must be received");
+    }
+
+    #[test]
+    fn from_manifest_rebuilds_byte_identical_stream() {
+        // §9.3 resend cache: a sender rebuilt from its own cached manifest
+        // bytes (skipping the whole hash pass) must emit a byte-for-byte
+        // identical frame stream, transfer id and content id.
+        let items = vec![
+            (
+                KIND_UTF8_TEXT,
+                "msg.txt".to_string(),
+                b"cached rebuild payload".to_vec(),
+            ),
+            (KIND_FILE, "data.bin".to_string(), vec![0x42u8; 7000]),
+        ];
+        let config = SenderConfig {
+            symbol_size: 512,
+            chunk_raw_size: 1 << 20,
+            redundancy_pct: 25,
+        };
+        let mut full = Af2Sender::new(items.clone(), config.clone()).unwrap();
+        let manifest_bytes = full.manifest_bytes().to_vec();
+        // Rebuild from the cached manifest bytes only (the host re-reads the
+        // content items, but no BLAKE3 pass runs).
+        let (manifest, _) = crate::manifest::Manifest::parse(&manifest_bytes).unwrap();
+        let mut cached = Af2Sender::from_manifest(manifest, items, config).unwrap();
+        assert_eq!(cached.manifest_bytes(), manifest_bytes.as_slice());
+        assert_eq!(cached.transfer_id(), full.transfer_id());
+        assert_eq!(cached.content_id(), full.content_id());
+        for _ in 0..300 {
+            assert_eq!(
+                full.next_frame().unwrap(),
+                cached.next_frame().unwrap(),
+                "cached rebuild must emit identical frames"
+            );
+        }
+    }
+
+    #[test]
+    fn from_manifest_rejects_chunk_raw_size_mismatch() {
+        let items = vec![(KIND_FILE, "a.bin".to_string(), vec![0x11u8; 4096])];
+        let manifest = crate::manifest::build_manifest(
+            vec![(KIND_FILE, "a.bin", &items[0].2[..])],
+            1 << 20,
+        )
+        .unwrap();
+        match Af2Sender::from_manifest(
+            manifest,
+            items,
+            SenderConfig {
+                chunk_raw_size: 2 << 20,
+                ..SenderConfig::default()
+            },
+        ) {
+            Ok(_) => panic!("chunk_raw_size mismatch must be rejected"),
+            Err(e) => assert!(
+                e.to_string().contains("does not match manifest"),
+                "unexpected error: {e}"
+            ),
+        }
     }
 
     #[test]
@@ -948,5 +1205,154 @@ mod tests {
             chunk1_symbols > 0,
             "playlist must advance to the next chunk after exhaustion"
         );
+    }
+
+    /// Host-side prep flow: plan_chunks → assemble → encode_chunk_balanced →
+    /// new_with_preencoded. The layout must match the sender's own stream
+    /// slicing and the receiver must complete the full transfer.
+    #[test]
+    fn preencoded_roundtrip_completes() {
+        let text: Vec<u8> = {
+            let paragraph = b"preencoded roundtrip payload; repetition compresses. ";
+            let mut v = Vec::new();
+            while v.len() < 900_000 {
+                v.extend_from_slice(paragraph);
+            }
+            v
+        };
+        let items = vec![
+            (KIND_FILE, "b.bin".to_string(), vec![0x33u8; 700_000]),
+            (KIND_UTF8_TEXT, "a.txt".to_string(), text),
+        ];
+        let chunk_raw_size: u32 = 1 << 20;
+        let config = SenderConfig {
+            symbol_size: 512,
+            chunk_raw_size,
+            redundancy_pct: 25,
+        };
+        let metas: Vec<(u8, String, u64)> = items
+            .iter()
+            .map(|(k, p, c)| (*k, p.clone(), c.len() as u64))
+            .collect();
+        let plan = plan_chunks(&metas, chunk_raw_size).unwrap();
+        assert_eq!(plan.len(), 2, "1.6 MiB stream → 2 chunks");
+        let mut preencoded = Vec::new();
+        for (index, segs) in plan.iter().enumerate() {
+            let mut raw = Vec::new();
+            for seg in segs {
+                let (.., content) = &items[seg.item as usize];
+                raw.extend_from_slice(&content[seg.start as usize..(seg.start + seg.len) as usize]);
+            }
+            let (codec, encoded) =
+                crate::chunk::encode_chunk_balanced(&raw, 0, true);
+            let pc = if codec == crate::meta::CODEC_RAW {
+                PreencodedChunk::RawMarker
+            } else {
+                assert!(encoded.len() < raw.len(), "strictly-smaller invariant");
+                PreencodedChunk::Encoded(codec, encoded)
+            };
+            preencoded.push((index as u32, pc));
+        }
+        let mut sender = Af2Sender::new_with_preencoded(items, config, preencoded).unwrap();
+        let mut receiver = Af2Receiver::new();
+        let mut manifest_ready = false;
+        let mut ready = 0usize;
+        for _ in 0..4000 {
+            let frame = sender.next_frame().unwrap();
+            match receiver.ingest(&frame).unwrap() {
+                IngestEvent::ManifestReady => manifest_ready = true,
+                IngestEvent::ChunkReady { .. } => ready += 1,
+                _ => {}
+            }
+            if manifest_ready && ready == 2 {
+                break;
+            }
+        }
+        assert!(manifest_ready);
+        assert_eq!(ready, 2, "both preencoded chunks must complete");
+    }
+
+    #[test]
+    fn preencoded_rejects_invariant_violations() {
+        let items = vec![(KIND_FILE, "a.bin".to_string(), vec![0x11u8; 4096])];
+        let config = SenderConfig {
+            symbol_size: 512,
+            chunk_raw_size: 1 << 20,
+            redundancy_pct: 25,
+        };
+        // Not strictly smaller.
+        let raw_clone = items[0].2.clone();
+        let err = Af2Sender::new_with_preencoded(
+            items.clone(),
+            config.clone(),
+            vec![(0, PreencodedChunk::Encoded(crate::meta::CODEC_ZSTD, raw_clone))],
+        );
+        assert!(err.err().unwrap().to_string().contains("strictly-smaller"));
+        // RAW bytes must use the marker, not carried bytes.
+        let err = Af2Sender::new_with_preencoded(
+            items.clone(),
+            config.clone(),
+            vec![(0, PreencodedChunk::Encoded(crate::meta::CODEC_RAW, vec![1, 2, 3]))],
+        );
+        assert!(err.err().unwrap().to_string().contains("RawMarker"));
+        // Out-of-range index.
+        let err = Af2Sender::new_with_preencoded(
+            items.clone(),
+            config,
+            vec![(7, PreencodedChunk::RawMarker)],
+        );
+        assert!(err.err().unwrap().to_string().contains("out of range"));
+        // Duplicate index.
+        let config = SenderConfig {
+            symbol_size: 512,
+            chunk_raw_size: 1 << 20,
+            redundancy_pct: 25,
+        };
+        let err = Af2Sender::new_with_preencoded(
+            items,
+            config,
+            vec![(0, PreencodedChunk::RawMarker), (0, PreencodedChunk::RawMarker)],
+        );
+        assert!(err.err().unwrap().to_string().contains("twice"));
+    }
+
+    #[test]
+    fn plan_chunks_mirrors_canonical_stream() {
+        // NFD "é" must plan identically to NFC (build_manifest normalizes),
+        // directories carry no stream bytes, and the assembled chunks equal
+        // the NFC-path-ordered concatenation.
+        let items = [
+            (crate::id::KIND_DIRECTORY, "dir/".to_string(), Vec::new()),
+            (
+                KIND_UTF8_TEXT,
+                "me\u{301}xico.txt".to_string(), // NFD; NFC sorts before b.bin
+                b"nfd path normalizes".to_vec(),
+            ),
+            (KIND_FILE, "b.bin".to_string(), vec![0xAB; 30]),
+        ];
+        let metas: Vec<(u8, String, u64)> = items
+            .iter()
+            .map(|(k, p, c)| (*k, p.clone(), c.len() as u64))
+            .collect();
+        let chunk_raw_size = 1 << 20; // single chunk
+        let plan = plan_chunks(&metas, chunk_raw_size).unwrap();
+        assert_eq!(plan.len(), 1);
+        let mut assembled = Vec::new();
+        for seg in &plan[0] {
+            let content = &items[seg.item as usize].2;
+            assembled.extend_from_slice(&content[seg.start as usize..(seg.start + seg.len) as usize]);
+        }
+        // NFC-normalized "méxico.txt" ('m' = 0x6d) sorts AFTER "b.bin"
+        // ('b' = 0x62) in path-byte order, so b.bin's bytes come first.
+        let expected = [vec![0xAB; 30].as_slice(), b"nfd path normalizes".as_slice()].concat();
+        assert_eq!(assembled, expected);
+        // Empty content (all-directories) is unrepresentable, matching build.
+        assert!(matches!(
+            plan_chunks(
+                &[(crate::id::KIND_DIRECTORY, "d/".to_string(), 0)],
+                chunk_raw_size
+            ),
+            Err(SenderError::EmptyContent)
+        ));
     }
 }

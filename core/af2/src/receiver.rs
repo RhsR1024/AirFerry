@@ -1317,6 +1317,72 @@ mod tests {
     }
 
     #[test]
+    fn resumed_chunk_failing_reverify_is_invalidated_and_healed() {
+        // §12 crash-gap semantics: a host crash after a chunk was pwrite'd
+        // (or bit rot) leaves the ledger bit intact while the spill bytes are
+        // wrong. On recovery the host re-verifies every resumed bit against
+        // the manifest; a mismatch must fail verify_chunk, be invalidated,
+        // and be re-supplied by a later epoch — never left as "done".
+        let data: Vec<u8> = (0..((1 << 20) + 4000u32)).map(|i| (i % 251) as u8).collect();
+        let bc = build_broadcast(&data, 1 << 20, 1024);
+
+        // Phase 1 ("before the crash"): chunk 0 completes cleanly.
+        let mut rx1 = Af2Receiver::new();
+        rx1.ingest(&bc.root_frame).unwrap();
+        rx1.ingest(&bc.chunk_meta_frames[0]).unwrap();
+        let mut raw0 = Vec::new();
+        for f in &bc.chunk_symbol_frames {
+            if let IngestEvent::ChunkReady { index, raw } = rx1.ingest(f).unwrap() {
+                if index == 0 {
+                    raw0 = raw;
+                    break;
+                }
+            }
+        }
+        assert!(!raw0.is_empty(), "chunk 0 must complete before the crash");
+
+        // Phase 2 ("recovery"): a fresh session resumes from the stored ROOT
+        // + completed bits (what Af2LedgerStore.loadMostRecent hands over).
+        let mut rx2 = Af2Receiver::new();
+        assert!(rx2.resume(&bc.root_frame, &[0]).is_ok());
+        rx2.ingest(&bc.manifest_meta_frame).unwrap();
+        for f in &bc.manifest_symbol_frames {
+            rx2.ingest(f).unwrap();
+        }
+        // The spill bytes came back corrupted (crash mid-pwrite / torn tail):
+        // re-verification fails, the ledger bit is invalidated.
+        let mut corrupted = raw0.clone();
+        corrupted[0] ^= 0xFF;
+        assert!(
+            !rx2.verify_chunk(0, &corrupted),
+            "corrupted spill must fail manifest-bound re-verification"
+        );
+        assert!(rx2.invalidate_chunk(0), "resumed bit must be dropped");
+        assert!(
+            !rx2.invalidate_chunk(0),
+            "double invalidation of a cleared bit must report false"
+        );
+
+        // Phase 3: a later epoch re-supplies chunk 0; the healed receiver
+        // accepts it and the clean bytes verify against the manifest.
+        rx2.ingest(&bc.chunk_meta_frames[0]).unwrap();
+        let mut healed = None;
+        for f in &bc.chunk_symbol_frames {
+            if let IngestEvent::ChunkReady { index, raw } = rx2.ingest(f).unwrap() {
+                if index == 0 {
+                    healed = Some(raw);
+                    break;
+                }
+            }
+        }
+        assert_eq!(healed.expect("chunk 0 must be re-received"), raw0);
+        assert!(
+            rx2.verify_chunk(0, &raw0),
+            "re-verified chunk must pass the manifest table"
+        );
+    }
+
+    #[test]
     fn verify_final_stream_end_to_end() {
         // Full receive → reassemble → §13 ⑧⑨ gate passes; any tamper fails.
         // build_broadcast tags the entry UTF8_TEXT, so the payload must be

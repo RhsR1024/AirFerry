@@ -28,6 +28,13 @@ xz2 = "0.1"
 [target.wasm32-unknown-unknown.dependencies]
 lzma-rs = "0.3"
 ruzstd = "0.7"
+zrip = { version = "0.8", default-features = false, features = ["std", "frame"] }
+lzma-rust2 = { version = "0.19", default-features = false, features = ["std", "encoder", "xz"] }
+
+[dev-dependencies]
+# Host tests cross-verify the pure-Rust wasm32 codecs against native decoders
+zrip = { version = "0.8", default-features = false, features = ["std", "frame"] }
+lzma-rust2 = { version = "0.19", default-features = false, features = ["std", "encoder", "xz"] }
 
 [features]
 default = []

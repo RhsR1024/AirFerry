@@ -30,7 +30,6 @@ pub enum ChunkError {
 /// Encode one chunk: try Zstd then Xz, keep a compressed tag ONLY when it is
 /// strictly smaller than raw (§10.1). Three-algorithm selection with early
 /// exit is a sender POLICY living in the hosts; this is the core primitive.
-#[cfg(not(target_arch = "wasm32"))]
 pub fn encode_chunk(raw: &[u8]) -> (u8, Vec<u8>) {
     // Empty and tiny chunks: compression can never win meaningfully; zstd on
     // empty input still emits a frame header (3 bytes) — strictly larger.
@@ -50,14 +49,88 @@ pub fn encode_chunk(raw: &[u8]) -> (u8, Vec<u8>) {
     (CODEC_RAW, raw.to_vec())
 }
 
-#[cfg(target_arch = "wasm32")]
-pub fn encode_chunk(raw: &[u8]) -> (u8, Vec<u8>) {
-    // The zstd/xz2 C libraries do not build for wasm32-unknown-unknown (see
-    // qr-protocol's Cargo.toml), so the web sender always sends RAW. This is
-    // a deliberate capability decision, not a bug: receivers stay compatible
-    // because RAW needs no decoder.
-    (CODEC_RAW, raw.to_vec())
+/// Balanced sender policy (host prep-time pre-encode; SPEC §10.1 keeps the
+/// policy out of the wire format). Three rules, calibrated on measured
+/// zstd-L1 / xz-preset trade-offs:
+///
+/// 1. **Sample skip** — compress a 256 KiB prefix with both zstd-L1 and
+///    xz-p2; when neither reaches 98%, the chunk is treated as
+///    incompressible (media / random) and ships RAW without any full-size
+///    attempt. This also removes the wasted play-time codec attempts the
+///    lazy fallback performs on media files.
+/// 2. **Best of (zstd-L1, xz-p2)** — p2 captures most of xz's ratio at
+///    ~7× the encode speed of the standard preset, so it is the default
+///    candidate set for compressible chunks.
+/// 3. **R-gated escalation** — the standard high-ratio preset runs only when
+///    its projected transfer-time saving beats its own encode time
+///    (`(rz − 0.8·rx) > channel_bps / P6_ENCODE_BPS`), or unconditionally
+///    for single-chunk transfers (`force_full`: bounded wait, biggest
+///    relative win).
+///
+/// `channel_bps` is the sender's playout payload rate (fps × T × QR count);
+/// 0 disables escalation entirely.
+pub fn encode_chunk_balanced(raw: &[u8], channel_bps: u64, force_full: bool) -> (u8, Vec<u8>) {
+    if raw.len() < 64 {
+        return (CODEC_RAW, raw.to_vec());
+    }
+    // Rule 1: sample skip. 4096 keeps the verdict off tiny tail chunks where
+    // the sample IS the chunk and the full pass below is cheaper than logic.
+    let sample = &raw[..raw.len().min(BALANCED_SAMPLE_BYTES)];
+    if sample.len() >= 4096 {
+        let sz = qr_protocol::compress::compress(sample, 1).unwrap_or_default();
+        let sx = qr_protocol::compress::compress_xz_preset(sample, 2).unwrap_or_default();
+        if sz.len() as u64 * 100 >= sample.len() as u64 * BALANCED_SAMPLE_KEEP_PCT
+            && sx.len() as u64 * 100 >= sample.len() as u64 * BALANCED_SAMPLE_KEEP_PCT
+        {
+            return (CODEC_RAW, raw.to_vec());
+        }
+    }
+    // Rule 2: best of zstd-L1 vs xz-p2.
+    let z_vec = qr_protocol::compress::compress(raw, 1).unwrap_or_default();
+    let mut best = (CODEC_RAW, raw.to_vec());
+    if z_vec.len() < best.1.len() {
+        best = (CODEC_ZSTD, z_vec.clone());
+    }
+    if let Ok(x2) = qr_protocol::compress::compress_xz_preset(raw, 2) {
+        if x2.len() < best.1.len() {
+            best = (CODEC_XZ, x2);
+        }
+    }
+    // Rule 3: escalate to the standard preset when the projected p6 ratio
+    // (≈ 0.8 × the p2 ratio, calibrated on text/JSON/base64 corpora) saves
+    // more channel time than the encode costs.
+    let r_best = best.1.len() as f64 / raw.len() as f64;
+    let r_zstd = if best.0 == CODEC_ZSTD {
+        r_best
+    } else {
+        // zstd lost or failed; clamp its measured ratio at 1.0 (the
+        // escalation is measured against the worst case it replaces).
+        (z_vec.len() as f64 / raw.len() as f64).min(1.0)
+    };
+    let escalate = force_full
+        || (channel_bps > 0
+            && r_zstd - P6_RATIO_FACTOR * r_best > channel_bps as f64 / P6_ENCODE_BPS);
+    if escalate {
+        if let Ok(x6) = qr_protocol::compress::compress_xz_standard(raw) {
+            if x6.len() < best.1.len() {
+                best = (CODEC_XZ, x6);
+            }
+        }
+    }
+    best
 }
+
+/// Rule-1 sample size (prefix of the chunk).
+pub const BALANCED_SAMPLE_BYTES: usize = 256 * 1024;
+/// Rule-1 keep threshold in percent: a sample result at or above this share
+/// of the sample length counts as "did not compress".
+const BALANCED_SAMPLE_KEEP_PCT: u64 = 98;
+/// Rule-3 calibration: standard-preset output ≈ this factor × the p2 output
+/// (measured 0.75 JSON / 0.94 base64 / ~1.0 text on the bench corpora).
+const P6_RATIO_FACTOR: f64 = 0.8;
+/// Rule-3 calibration: conservative wasm32 standard-preset encode throughput
+/// in bytes/second (native measures 3.3–12 MB/s; wasm ≈ 2.5× slower).
+const P6_ENCODE_BPS: f64 = 1_200_000.0;
 
 /// Decode one chunk with full bounded verification. `expected_raw_len` is the
 /// canonical chunk length (from ROOT); the output must match it exactly.
@@ -210,5 +283,80 @@ mod tests {
             decode_chunk(CODEC_XZ, &x, raw.len(), small_cap),
             Err(ChunkError::Decompress(_))
         ));
+    }
+
+    /// Deterministic xorshift stream for the incompressible corpora.
+    fn pseudorandom(len: usize) -> Vec<u8> {
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        out.truncate(len);
+        out
+    }
+
+    fn repetitive_text(len: usize) -> Vec<u8> {
+        let paragraph = b"the quick brown fox jumps over the lazy dog; compression finds repetition. ";
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            out.extend_from_slice(paragraph);
+        }
+        out.truncate(len);
+        out
+    }
+
+    #[test]
+    fn balanced_policy_skips_incompressible() {
+        // Rule 1: media-like chunk — both sample codecs fail the 98% gate and
+        // the chunk ships RAW without any full-size attempt (even force_full
+        // cannot help, the standard preset would not shrink it either).
+        let raw = pseudorandom(512 * 1024);
+        for force in [false, true] {
+            let (codec, data) = encode_chunk_balanced(&raw, 200_000, force);
+            assert_eq!(codec, CODEC_RAW);
+            assert_eq!(data.len(), raw.len());
+        }
+    }
+
+    #[test]
+    fn balanced_policy_compresses_repetitive() {
+        let raw = repetitive_text(512 * 1024);
+        let (codec, data) = encode_chunk_balanced(&raw, 0, false);
+        assert_ne!(codec, CODEC_RAW, "repetitive text must get a codec");
+        assert!(data.len() * 3 < raw.len(), "ratio must be well under 1/3");
+        // The chosen encoding must survive the §10.1 decode gate.
+        let back = decode_chunk(codec, &data, raw.len(), 8 << 20).unwrap();
+        assert_eq!(back, raw);
+    }
+
+    #[test]
+    fn balanced_policy_force_full_never_worse() {
+        // Rule 3 escalation only ever replaces the candidate via min(), so a
+        // forced escalation result can never be larger than the unforced one.
+        let raw = repetitive_text(256 * 1024);
+        let (_, relaxed) = encode_chunk_balanced(&raw, u64::MAX, false);
+        let (_, forced) = encode_chunk_balanced(&raw, 0, true);
+        assert!(forced.len() <= relaxed.len());
+    }
+
+    #[test]
+    fn balanced_policy_fast_channel_skips_escalation() {
+        // Rule 3 with an unreachable channel rate never escalates: the result
+        // is exactly best-of(zstd-L1, xz-p2).
+        let raw = repetitive_text(256 * 1024);
+        let (codec, data) = encode_chunk_balanced(&raw, u64::MAX, false);
+        let z = qr_protocol::compress::compress(&raw, 1).unwrap();
+        let x2 = qr_protocol::compress::compress_xz_preset(&raw, 2).unwrap();
+        let (expect_len, expect_codec) = if x2.len() < z.len() {
+            (x2.len(), CODEC_XZ)
+        } else {
+            (z.len(), CODEC_ZSTD)
+        };
+        assert_eq!(codec, expect_codec);
+        assert_eq!(data.len(), expect_len);
     }
 }

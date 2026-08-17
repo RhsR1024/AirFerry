@@ -1,12 +1,13 @@
 # AirFerry Protocol 2（AF2-IF）独立综合最终版
 
 > 综合者：Claude Fable 5（独立评审轮，2026-08-16）
-> 状态：**设计冻结候选，尚未实现**
+> 状态：**已实现**（2026-08-17 收尾，Rust 核心 + 三端接入完成；权威规格已合入 `docs/SPEC.md`）
 > Wire magic / version：`AF` / `2`
 > 兼容性：与现行 `ET / wire version 1` 完全不兼容，两代按 magic 互斥，无误解析窗口
 >
-> 本文是对 `docs/protocol/` 下 7 份 v2 提案的**独立**重新裁决与综合，不引用也不继承先前任何综合结论。
-> 实现完成并通过 §17 验收矩阵前，线上权威规格仍是 [`../SPEC.md`](../SPEC.md)、[`../protocol.md`](../protocol.md) 与源代码。
+> 本文是设计冻结稿的历史记录。**线上权威规格是 [`docs/SPEC.md`](../docs/SPEC.md) 与
+> `core/af2/` 代码**；实现期裁定与落地（E1 宿主形态、验收矩阵落地、Web 纯 Rust 压缩等）
+> 见 `todo/v2版本升级计划.md` 的"执行注记"表。
 
 ---
 

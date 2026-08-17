@@ -111,7 +111,29 @@ class SenderBuilderWasm {
   add_entry(kind: number, path: string, content: Uint8Array): void
   // kind: 1=文件, 2=UTF-8 文字, 3=目录
   build(symbol_size: number, chunk_raw_size: number, redundancy_pct: number): SenderSessionWasm
+
+  // 预编码 Chunk（平衡选优策略，SPEC §13 注记）：chunk 布局经 plan_chunks 计算、
+  // 逐 chunk 经 encode_chunk_balanced 编码后在此登记；播放循环零压缩。
+  // codec_id=0 且 data 为空 = RAW 标记（压缩必输，直接流原始切片，不复制内存）。
+  // 核心 build 侧强制 §7.1 严格变小不变量——违规宿主输入直接构建失败。
+  add_preencoded_chunk(index: number, codec_id: number, data: Uint8Array): void
+
+  // §9.3 重发免哈希缓存：信任先前算好的编码 Manifest（hex），跳过整个 BLAKE3 哈希趟。
+  // 宿主必须以 (path, size, mtime) 指纹为键缓存，miss/出错回退 build()（SPEC §10.2）。
+  build_cached(manifest_hex: string, symbol_size: number, chunk_raw_size: number, redundancy_pct: number): SenderSessionWasm
 }
+
+// 平衡逐 chunk 编码（发送端预处理期调用；三规则见 SPEC §13 注记）
+class EncodedChunkWasm {
+  readonly codec_id: number // 0=RAW（宿主应传 RAW 标记而非复制字节回传）, 1=Zstd, 2=Xz
+  readonly data: Uint8Array
+}
+function encode_chunk_balanced(raw: Uint8Array, channel_bps: bigint, force_full: boolean): EncodedChunkWasm
+// channel_bps = 播放载荷速率 fps×T×码数（0 = 关闭升级档）；force_full = 单 chunk 传输无条件升级
+
+// 规范流 chunk 布局（不读内容不哈希）：kinds/paths/sizes 为与 add_entry 同序的并行数组。
+// 返回 JSON {"chunks":[[item,start,len, …], …]} —— 每 chunk 一组 (条目序号, 条目内偏移, 长度)。
+function plan_chunks(kinds: Uint8Array, paths: string[], sizes: Float64Array, chunk_raw_size: number): string
 
 // SenderSessionWasm（发送端帧流）
 class SenderSessionWasm {
@@ -120,14 +142,10 @@ class SenderSessionWasm {
   stats_json(): string                   // {bytes, frames, elapsed_ms, fps, throughput_bps}
   content_id_hex(): string
   transfer_id_hex(): string
+  manifest_json(): string                // 编码 Manifest hex —— §9.3 重发缓存负载（存 IDB，键为内容指纹）
 }
 
-// Sha256Wasm（独立哈希）
-class Sha256Wasm {
-  constructor()
-  update(bytes: Uint8Array): void
-  digest(): Uint8Array
-}
+// Sha256Wasm 已移除（v1 遗留，AF2 基础哈希为 BLAKE3-256，见 SPEC §3）
 
 // QR 编码（独立函数）
 function encode_qr(frame_bytes: Uint8Array, out_side: Uint32Array): Uint8Array
@@ -158,8 +176,11 @@ class ReceiverSessionWasm {
 }
 ```
 
-> **WASM 接收端内置纯 Rust 解压**：AF2 下支持全部三种 codec（RAW、Zstd 经 ruzstd、XZ 经 lzma-rs），
-> Web 接收端已具备解压全部广播的能力；发送端暂以 RAW 发送（单向信道上 RAW 恒合法）。
+> **WASM 端内置纯 Rust 编解码**：wasm32-unknown-unknown 无 libc，zstd/xz2 C 库不可构建，
+> 因此收发两侧均走纯 Rust 实现——解码用 `ruzstd`（Zstd）与 `lzma-rs`（XZ），编码用
+> `zrip`（Zstd）与 `lzma-rust2`（XZ/LZMA2）。发送端逐 Chunk 三 codec 选优，严格遵守
+> SPEC §7.1"严格变小才压缩"不变量；Web 与 Native 四端线格式和编解码能力 100% 同构闭合
+> （见 SPEC §13 能力矩阵）。
 
 > **构造参数来源**：条目由 `src/workers/compress.worker.ts`（AF2 file-preparation
 > worker）离线读取产出 `PreparedItem[]`（`{ kind, path, content }`），主线程点「发送」
@@ -240,3 +261,31 @@ object ZxingDecoder {
   "session_mismatch_streak": 0
 }
 ```
+
+## C-ABI 绑定（Windows）
+
+Windows 端经 P/Invoke 直呼 `transfer_engine.dll`（`apps/windows/AirFerry.Windows/Native/NativeBridge.cs`）。
+调用约定 `Cdecl`；返回 `0` 表示成功、非零为错误码；`*mut ReceiverSession` 句柄非线程安全，
+Windows 侧同样以一把 ingest 锁串行化（与 Android JNI 模型一致）。ABI 版本启动握手：
+`NativeAbiVersion() >= NATIVE_ABI_VERSION` 不满足即进入错误页。
+
+| 函数 | 签名要点 |
+|---|---|
+| `airferry_native_abi_version()` | `u32` ABI 版本（当前 2，快照化 FFI） |
+| `airferry_receiver_create(sid_lo, sid_hi)` | 建会话，返回不透明句柄 |
+| `airferry_receiver_destroy(handle)` | 销毁句柄（幂等） |
+| `airferry_receiver_ingest(handle, frame, len)` | 摄入单帧；返回 packed `u64` 状态字（bit 0/1/2/3 + mismatch + received，与 JNI/WASM 同布局） |
+| `airferry_receiver_is_complete(handle)` | 是否全部 Chunk 已验 |
+| `airferry_receiver_progress_json(handle, buf, cap)` | 进度 JSON 写入调用方缓冲（NUL 结尾，返回所需长度） |
+| `airferry_receiver_snapshot_json(handle)` | 单一快照 JSON（Schema 2），`airferry_free_string` 释放 |
+| `airferry_receiver_assemble(handle, &buf, &len)` | 组装内存中已落的所有 RAW chunk 为规范流 |
+| `airferry_receiver_assemble_chunk(handle, index, &buf, &len)` | 取单块 RAW 字节，`airferry_buffer_free` 释放 |
+| `airferry_receiver_last_chunk_index(handle)` | 最近完成的 Chunk 下标 |
+| `airferry_receiver_forget_chunk(handle, index)` | 驱逐已落盘 chunk（内存常数化） |
+| `airferry_receiver_verify_chunk(handle, index, raw, len)` | §11/§12 对 Manifest 哈希表验块 |
+| `airferry_receiver_verify_final_stream(handle, stream, len)` | §13 ⑧⑨ 终验（条目哈希、UTF-8、Content ID） |
+| `airferry_receiver_resume(handle, root, len, completed[], n)` | §12 续传（账本恢复） |
+| `airferry_receiver_invalidate_chunk(handle, index)` | 重核失败作废已恢复块 |
+| `airferry_decompress_bytes(data, len, codec, out, cap)` | 有界解压（单帧/单流 + §10.1 约束） |
+| `airferry_decompress_stream_to_file(in, out, codec, cap)` | 流式解压落盘 + CRC32/SHA-256 增量 |
+| `airferry_free_string(ptr)` / `airferry_buffer_free(ptr, len)` | 字符串 / 字节缓冲所有权释放 |

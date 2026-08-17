@@ -164,3 +164,32 @@ export function CircleIcon({ size = 20 }: IconProps) {
     </svg>
   )
 }
+
+export function HistoryIcon({ size = 20 }: IconProps) {
+  return (
+    <svg {...svgProps} width={size} height={size}>
+      <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+      <path d="M3 3v5h5" />
+      <path d="M12 7v5l4 2" />
+    </svg>
+  )
+}
+
+export function DeleteIcon({ size = 20 }: IconProps) {
+  return (
+    <svg {...svgProps} width={size} height={size}>
+      <path d="M3 6h18" />
+      <path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6" />
+      <path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" />
+    </svg>
+  )
+}
+
+export function CloseIcon({ size = 20 }: IconProps) {
+  return (
+    <svg {...svgProps} width={size} height={size}>
+      <path d="M18 6 6 18" />
+      <path d="m6 6 12 12" />
+    </svg>
+  )
+}

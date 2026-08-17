@@ -28,7 +28,9 @@ pub use id::{
 };
 pub use manifest::sanitize_save_paths;
 pub use receiver::{Af2Receiver, IngestEvent};
-pub use sender::{Af2Sender, SenderConfig, SenderError};
+pub use sender::{
+    Af2Sender, ChunkSegment, PreencodedChunk, SenderConfig, SenderError, plan_chunks,
+};
 pub use tlv::{parse_tlvs, Tlv, TlvError};
 
 /// Common error type across AF2 parsing surfaces.

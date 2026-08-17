@@ -2,12 +2,11 @@
 //!
 //! Dual-algorithm bounded compression: Zstd (default, fast) and XZ (LZMA2,
 //! higher ratio for text). The strictly-smaller invariant is enforced by AF2
-//! chunk layers before wire emission. On `wasm32-unknown-unknown` the C
-//! compressor libraries do not build, so decompression runs on the pure-Rust
-//! `ruzstd` / `lzma-rs` codecs while the web sender transmits RAW chunks (no
-//! pure-Rust zstd encoder exists; RAW is always wire-legal). All decode
-//! paths enforce the §10.1 wire structure: single frame/stream, no trailing
-//! bytes, bounded windows/dictionaries, capped output.
+//! chunk layers before wire emission. Native builds use C bindings (`zstd` and
+//! `xz2`), while `wasm32-unknown-unknown` builds use pure-Rust implementations
+//! (`zrip` and `lzma-rust2` for compression, `ruzstd` and `lzma-rs` for
+//! decompression). All decode paths enforce the §10.1 wire structure: single
+//! frame/stream, no trailing bytes, bounded windows/dictionaries, capped output.
 
 #![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 
@@ -183,29 +182,7 @@ const MAX_XZ_DICT_BYTES: u64 = 32 * 1024 * 1024;
 const MIN_XZ_DICT_BYTES: u64 = 4096;
 
 /// Maximum zstd back-reference window (`2^log` bytes) enforced on BOTH sides
-/// of this stack (audit L1). libzstd defaults to
-/// `ZSTD_WINDOWLOG_LIMIT_DEFAULT = 27`, i.e. a hostile CRC-valid frame header
-/// can force a ~128 MiB window allocation *before* any output is produced —
-/// RAM that is independent of `read_capped`/`decompress_stream_to_file`'s
-/// output cap (the bomb defense only bounds output bytes). Clamping the
-/// window tightens that input-side hole, mirroring the XZ path's
-/// `XZ_DECODER_MEMORY_LIMIT`.
-///
-/// Choice of 23 (8 MiB window):
-/// - **Production sender** = the TS worker's wasm-zstd at **level 1**: zstd's
-///   default cParams table caps level 1 at `windowLog = 19` for any source
-///   size (`clevels.h`, "> 256 KB" row), so ≤ 256 MiB originals stay at 19 —
-///   23 leaves four levels of headroom (table values only reach 23 at
-///   level 17).
-/// - **Rust-side compression** (`DEFAULT_LEVEL = 22`, test path): the zstd
-///   crate's `encode_all` is a *streaming* encoder with no pledged src size,
-///   so level 22 used to emit `windowLog = 27` frames regardless of input
-///   size (the table value is never srcSize-clamped on that path — verified
-///   empirically: even an 8 KiB level-22 stream was rejected by a 23-clamped
-///   decoder before this change). [`compress`] now caps the encoder window
-///   at the same 23, so every stream this stack produces decodes under the
-///   clamp by construction (root `cargo test` green).
-#[cfg(not(target_arch = "wasm32"))]
+/// of this stack (audit L1).
 const ZSTD_WINDOW_LOG_MAX: u32 = 23;
 
 /// Build a zstd streaming decoder with the receiver-side window clamp
@@ -572,7 +549,6 @@ pub fn decompress_stream_to_file(
 /// remaining length is the trailing check), output capped.
 #[cfg(target_arch = "wasm32")]
 fn zstd_decode_bounded(data: &[u8], max_output: usize) -> Result<Vec<u8>> {
-    use std::io::Read;
     if !zstd_window_log_ok(data) {
         return Err(Error::Compress(
             "zstd frame malformed or window exceeds 2^23 (§10.1)".into(),
@@ -666,6 +642,61 @@ pub fn decompress_with(data: &[u8], compression: u8) -> Result<Vec<u8>> {
     decompress_with_limit(data, compression, 256 * 1024 * 1024)
 }
 
+/// wasm32 zstd compress via `zrip` (pure Rust).
+/// Clamps windowLog to `ZSTD_WINDOW_LOG_MAX` (23) so the produced frame is accepted
+/// by the receiver's window clamp.
+#[cfg(target_arch = "wasm32")]
+pub fn compress(data: &[u8], level: i32) -> Result<Vec<u8>> {
+    let opts = zrip::Options::default().window_log(ZSTD_WINDOW_LOG_MAX);
+    let z_level = level.clamp(1, 4);
+    zrip::compress_opts(data, z_level, &opts).map_err(|e| Error::Compress(e.to_string()))
+}
+
+/// wasm32 XZ/LZMA2 compress via `lzma-rust2` (pure Rust).
+/// Clamps declared dictionary to `min(chunk_raw_size/payload_len, 32 MiB)` and uses CRC64 check.
+#[cfg(target_arch = "wasm32")]
+fn xz_compress(data: &[u8]) -> Result<Vec<u8>> {
+    compress_xz_preset(data, 6)
+}
+
+/// wasm32 preset-parameterized XZ encode (lzma-rust2) — see the native
+/// [`compress_xz_preset`] doc for the sender-policy usage.
+#[cfg(target_arch = "wasm32")]
+pub fn compress_xz_preset(data: &[u8], preset: u32) -> Result<Vec<u8>> {
+    use std::io::Write;
+    let dict = lzma2_dict_at_most((data.len() as u64).clamp(MIN_XZ_DICT_BYTES, MAX_XZ_DICT_BYTES));
+    let mut lzma_opts = lzma_rust2::LzmaOptions::with_preset(preset.min(9));
+    lzma_opts.dict_size = dict as u32;
+    let mut xz_opts = lzma_rust2::XzOptions {
+        lzma_options: lzma_opts,
+        ..Default::default()
+    };
+    xz_opts.set_check_sum_type(lzma_rust2::CheckType::Crc64);
+    let mut writer = lzma_rust2::XzWriter::new(Vec::new(), xz_opts)
+        .map_err(|e| Error::Compress(e.to_string()))?;
+    writer
+        .write_all(data)
+        .map_err(|e| Error::Compress(e.to_string()))?;
+    writer.finish().map_err(|e| Error::Compress(e.to_string()))
+}
+
+/// The per-target standard high-ratio XZ preset (wasm32: 6 via lzma-rust2) —
+/// the "escalation" codec of the AF2 balanced sender policy.
+#[cfg(target_arch = "wasm32")]
+pub fn compress_xz_standard(data: &[u8]) -> Result<Vec<u8>> {
+    xz_compress(data)
+}
+
+/// wasm32 compress_with dispatch: RAW, Zstd (zrip), XZ (lzma-rust2).
+#[cfg(target_arch = "wasm32")]
+pub fn compress_with(data: &[u8], compression: u8) -> Result<Vec<u8>> {
+    match compression {
+        COMPRESSION_ZSTD => compress(data, 1),
+        COMPRESSION_XZ => xz_compress(data),
+        _ => Ok(data.to_vec()),
+    }
+}
+
 /// Compress `data` with XZ/LZMA2 at a high-ratio preset (level 6 + EXTREME).
 ///
 /// The declared dictionary is clamped to the largest legal size ≤ the input
@@ -676,9 +707,18 @@ pub fn decompress_with(data: &[u8], compression: u8) -> Result<Vec<u8>> {
 /// on low-end devices.
 #[cfg(not(target_arch = "wasm32"))]
 fn xz_compress(data: &[u8]) -> Result<Vec<u8>> {
+    compress_xz_preset(data, XZ_PRESET)
+}
+
+/// Compress `data` with XZ/LZMA2 at an arbitrary preset (0..=9, optionally
+/// `| LZMA_PRESET_EXTREME` on native). Dictionary is clamped exactly like the
+/// standard path. Sender-side policy (the AF2 balanced pre-encode) uses this
+/// to trade ratio against encode time (preset 2 vs the standard preset).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn compress_xz_preset(data: &[u8], preset: u32) -> Result<Vec<u8>> {
     use std::io::Write;
     let dict = lzma2_dict_at_most((data.len() as u64).clamp(MIN_XZ_DICT_BYTES, MAX_XZ_DICT_BYTES));
-    let mut opts = xz2::stream::LzmaOptions::new_preset(XZ_PRESET)
+    let mut opts = xz2::stream::LzmaOptions::new_preset(preset)
         .map_err(|e| Error::Compress(e.to_string()))?;
     opts.dict_size(dict);
     let mut filters = xz2::stream::Filters::new();
@@ -690,6 +730,13 @@ fn xz_compress(data: &[u8]) -> Result<Vec<u8>> {
         .write_all(data)
         .map_err(|e| Error::Compress(e.to_string()))?;
     encoder.finish().map_err(|e| Error::Compress(e.to_string()))
+}
+
+/// The per-target standard high-ratio XZ preset (native: 6|EXTREME, wasm32:
+/// 6) — the "escalation" codec of the AF2 balanced sender policy.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn compress_xz_standard(data: &[u8]) -> Result<Vec<u8>> {
+    xz_compress(data)
 }
 
 #[cfg(test)]
@@ -950,5 +997,39 @@ mod tests {
         let ok: Vec<u8> = (0..20_000).map(|i| (i & 0xff) as u8).collect();
         let z = compress(&ok, DEFAULT_LEVEL).unwrap();
         assert!(zstd_window_log_ok(&z));
+    }
+
+    /// Verify that the pure-Rust wasm32 compression codecs (zrip and lzma-rust2)
+    /// produce valid streams that decode cleanly with §10.1 bounds under both
+    /// native and wasm decoders.
+    #[test]
+    fn zrip_and_lzma_rust2_roundtrip_with_decoders() {
+        let data: Vec<u8> = b"The quick brown fox jumps over the lazy dog. 1234567890\n"
+            .repeat(1000);
+
+        // 1. zrip compression -> decodes with native/bounded zstd decoder
+        let opts = zrip::Options::default().window_log(ZSTD_WINDOW_LOG_MAX);
+        let zrip_out = zrip::compress_opts(&data, 1, &opts).unwrap();
+        assert!(zrip_out.len() < data.len());
+        assert!(zstd_window_log_ok(&zrip_out));
+        let zrip_dec = decompress_with(&zrip_out, COMPRESSION_ZSTD).unwrap();
+        assert_eq!(zrip_dec, data);
+
+        // 2. lzma-rust2 compression -> decodes with native/bounded xz decoder
+        use std::io::Write;
+        let dict = lzma2_dict_at_most((data.len() as u64).clamp(MIN_XZ_DICT_BYTES, MAX_XZ_DICT_BYTES));
+        let mut lzma_opts = lzma_rust2::LzmaOptions::with_preset(6);
+        lzma_opts.dict_size = dict;
+        let mut xz_opts = lzma_rust2::XzOptions {
+            lzma_options: lzma_opts,
+            ..Default::default()
+        };
+        xz_opts.set_check_sum_type(lzma_rust2::CheckType::Crc64);
+        let mut writer = lzma_rust2::XzWriter::new(Vec::new(), xz_opts).unwrap();
+        writer.write_all(&data).unwrap();
+        let xz_out = writer.finish().unwrap();
+        assert!(xz_out.len() < data.len());
+        let xz_dec = decompress_with(&xz_out, COMPRESSION_XZ).unwrap();
+        assert_eq!(xz_dec, data);
     }
 }

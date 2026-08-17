@@ -9,6 +9,7 @@
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
             <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
 
         <!-- Top bar: back + title + clear-all. -->
@@ -60,7 +61,24 @@
             </ListView>
         </hc:Card>
 
-        <TextBlock Grid.Row="2"
+        <!-- Pending transfers card -->
+        <hc:Card Grid.Row="2" x:Name="PendingCard" Margin="0,12,0,0" Visibility="Collapsed">
+            <Grid Margin="12">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <StackPanel Grid.Column="0" VerticalAlignment="Center">
+                    <TextBlock x:Name="PendingTitle" FontWeight="SemiBold" Foreground="{DynamicResource WarningBrush}" />
+                    <TextBlock x:Name="PendingDesc" FontSize="12" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,4,0,0" />
+                </StackPanel>
+                <Button Grid.Column="1" Click="ClearPending_Click" Foreground="{DynamicResource ErrorBrush}" VerticalAlignment="Center">
+                    <TextBlock Text="清理断点" />
+                </Button>
+            </Grid>
+        </hc:Card>
+
+        <TextBlock Grid.Row="3"
                    x:Name="PathHint"
                    Foreground="{DynamicResource TextFillColorTertiaryBrush}"
                    FontSize="12"
