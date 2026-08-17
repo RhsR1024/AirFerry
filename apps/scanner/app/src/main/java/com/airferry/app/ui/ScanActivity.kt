@@ -546,7 +546,9 @@ class ScanActivity : ComponentActivity() {
         /** Zero-based current segment index (0 when not segmented). */
         val segmentIndex: Int,
         /** Total segment count (1 when not segmented). */
-        val segmentCount: Int
+        val segmentCount: Int,
+        /** v1-magic frames rejected; > 0 ⇒ peer runs protocol 1 (F2 hint). */
+        val legacyPeerFrames: Int = 0
     )
 
     /** Ingest-thread entry (serialized by the pool): heavy work here, post a snapshot. */
@@ -602,8 +604,9 @@ class ScanActivity : ComponentActivity() {
         }
         val segIdx = if (segmented) session.segmentIndex() else 0
         val segCount = if (segmented) session.segmentCount() else 1
+        val legacy = if (session.isInitialized) session.snapshot().legacyPeerFrames else 0
 
-        val snapshot = FrameSnapshot(progress, fn, fs, cs, segIdx, segCount)
+        val snapshot = FrameSnapshot(progress, fn, fs, cs, segIdx, segCount, legacy)
         if (status.complete) {
             // Block any further ingest before the completion path (assemble +
             // file I/O + Activity start) runs on the main thread.
@@ -649,6 +652,8 @@ class ScanActivity : ComponentActivity() {
         }
         val statusMsg = when {
             progress.complete -> "文件恢复完成"
+            s.legacyPeerFrames > 0 ->
+                "检测到旧版 v1 协议二维码（已拒 ${s.legacyPeerFrames} 帧），请将发送端升级到 AF2 版本"
             !progress.metaConfirmed && progress.receivedSymbols > 0 ->
                 "正在同步… 已缓存 ${progress.receivedSymbols} 符号 (~$pct%)"
             progress.totalSymbols == 0 -> "等待二维码…"

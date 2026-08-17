@@ -151,6 +151,7 @@ class ReceiverSessionManager {
     data class ManifestEntry(
         val kind: Int,
         val path: String,
+        val savePath: String,
         val offset: Long,
         val size: Long
     )
@@ -164,18 +165,20 @@ class ReceiverSessionManager {
         val entryCount: Int,
         val chunkCount: Int,
         val chunkRawSize: Int,
-        val entries: List<ManifestEntry> = emptyList()
+        val entries: List<ManifestEntry> = emptyList(),
+        /** v1-magic frames rejected so far; > 0 ⇒ peer runs protocol 1. */
+        val legacyPeerFrames: Int = 0
     )
 
     private var cachedSnapshot: Snapshot? = null
 
     fun snapshot(): Snapshot {
-        if (!initialized) return Snapshot(false, "", "", 0L, 0, 0, 0, emptyList())
+        if (!initialized) return Snapshot(false, "", "", 0L, 0, 0, 0, emptyList(), 0)
         cachedSnapshot?.let { snap ->
             if (snap.metaConfirmed) return snap
         }
         val json = NativeBridge.receiverSnapshotJson(handle)
-            ?: return cachedSnapshot ?: Snapshot(false, "", "", 0L, 0, 0, 0, emptyList())
+            ?: return cachedSnapshot ?: Snapshot(false, "", "", 0L, 0, 0, 0, emptyList(), 0)
         return try {
             val o = JSONObject(json)
             val entriesList = mutableListOf<ManifestEntry>()
@@ -183,10 +186,13 @@ class ReceiverSessionManager {
             if (arr != null) {
                 for (i in 0 until arr.length()) {
                     val item = arr.getJSONObject(i)
+                    val path = item.optString("path", "")
                     entriesList.add(
                         ManifestEntry(
                             kind = item.optInt("kind", 1),
-                            path = item.optString("path", ""),
+                            path = path,
+                            // §7.2 save-time sanitized name (may equal path).
+                            savePath = item.optString("save_path", path),
                             offset = item.optLong("offset", 0L),
                             size = item.optLong("size", 0L)
                         )
@@ -201,12 +207,13 @@ class ReceiverSessionManager {
                 entryCount = o.optInt("entry_count", 0),
                 chunkCount = o.optInt("chunk_count", 0),
                 chunkRawSize = o.optInt("chunk_raw_size", 0),
-                entries = entriesList
+                entries = entriesList,
+                legacyPeerFrames = o.optInt("legacy_peer_frames", 0)
             )
             cachedSnapshot = snap
             snap
         } catch (_: Exception) {
-            cachedSnapshot ?: Snapshot(false, "", "", 0L, 0, 0, 0, emptyList())
+            cachedSnapshot ?: Snapshot(false, "", "", 0L, 0, 0, 0, emptyList(), 0)
         }
     }
 

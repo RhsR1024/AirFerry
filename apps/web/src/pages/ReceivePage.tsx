@@ -47,6 +47,8 @@ interface ProgressInfo {
   decodedFraction: number
   metaConfirmed: boolean
   symbolSize: number
+  /** v1-magic frames rejected; > 0 ⇒ peer runs protocol 1 (F2 hint). */
+  legacyPeerFrames: number
   lossPct: number
   framesSeen: number
   framesDropped: number
@@ -161,6 +163,7 @@ function initialProgress(): ProgressInfo {
     decodedFraction: 0,
     metaConfirmed: false,
     symbolSize: 0,
+    legacyPeerFrames: 0,
     lossPct: 0,
     framesSeen: 0,
     framesDropped: 0,
@@ -210,9 +213,12 @@ function computeStatusText(
   totalSymbols: number,
   receivedSymbols: number,
   decodedBlocks: number,
-  pct: number
+  pct: number,
+  legacyPeerFrames = 0
 ): string {
   if (complete) return "文件恢复完成"
+  if (legacyPeerFrames > 0)
+    return `检测到旧版 v1 协议二维码（已拒 ${legacyPeerFrames} 帧），请将发送端升级到 AF2 版本`
   if (!metaConfirmed && receivedSymbols > 0)
     return `正在同步… 已缓存 ${receivedSymbols} 符号 (~${pct}%)`
   if (totalSymbols === 0) return "等待二维码…"
@@ -238,6 +244,7 @@ interface ProgressSnapshot {
   framesCorrupt: number
   metaConfirmed: boolean
   symbolSize: number
+  legacyPeerFrames: number
   complete: boolean
 }
 
@@ -485,6 +492,7 @@ export function ReceivePage(): React.ReactElement {
         p.decodedFraction = snap.decodedFraction
         p.metaConfirmed = snap.metaConfirmed
         p.symbolSize = snap.symbolSize
+        p.legacyPeerFrames = snap.legacyPeerFrames || 0
         p.framesSeen = snap.framesSeen
       }
 
@@ -553,7 +561,8 @@ export function ReceivePage(): React.ReactElement {
         p.totalSymbols,
         p.receivedSymbols,
         p.decodedBlocks,
-        p.progressPct
+        p.progressPct,
+        p.legacyPeerFrames
       )
       return p
     })

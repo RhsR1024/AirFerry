@@ -163,6 +163,10 @@ pub struct Af2Receiver {
     chunk_decoder: Option<(u32, Decoder, ObjectMetaRecord)>,
     chunk_done: std::collections::HashSet<u32>,
     t: usize,
+    /// Frames carrying the v1 wire magic (`ET`) seen so far — an AF2 receiver
+    /// rejects them fail-closed; hosts surface "peer runs an old version"
+    /// from this counter via the snapshot instead of failing silently.
+    legacy_peer_frames: u32,
 }
 
 impl Default for Af2Receiver {
@@ -184,7 +188,15 @@ impl Af2Receiver {
             chunk_decoder: None,
             chunk_done: std::collections::HashSet::new(),
             t: 0,
+            legacy_peer_frames: 0,
         }
+    }
+
+    /// Count of v1-magic (`ET`) frames rejected so far (0 on a healthy AF2
+    /// link). Snapshot consumers surface a "peer version too old" hint when
+    /// this is non-zero.
+    pub fn legacy_peer_frames(&self) -> u32 {
+        self.legacy_peer_frames
     }
 
     pub fn root(&self) -> Option<&RootRecord> {
@@ -231,7 +243,16 @@ impl Af2Receiver {
     pub fn ingest(&mut self, frame_bytes: &[u8]) -> Result<IngestEvent, Af2ReceiverError> {
         let frame = match Af2Frame::from_bytes(frame_bytes) {
             Ok(f) => f,
-            Err(_) => return Ok(IngestEvent::Dropped),
+            Err(_) => {
+                // v1 wire magic ("ET", 0x45 0x54) on a frame this stack just
+                // rejected: the peer is broadcasting protocol 1. AF2 stays
+                // fail-closed, but surface the mismatch instead of dropping
+                // silently (F2: "对端版本过旧").
+                if frame_bytes.len() >= 2 && frame_bytes[..2] == [0x45, 0x54] {
+                    self.legacy_peer_frames = self.legacy_peer_frames.saturating_add(1);
+                }
+                return Ok(IngestEvent::Dropped);
+            }
         };
         match frame.frame_type {
             FrameType::Root => self.on_root(frame),
@@ -1061,6 +1082,15 @@ mod tests {
         v1_bytes[1] = 0x54;
         v1_bytes[2] = 1;
         assert_eq!(rx.ingest(&v1_bytes).unwrap(), IngestEvent::Dropped);
+        // The rejection is surfaced (F2): hosts show "peer version too old"
+        // from the snapshot counter instead of dropping silently.
+        assert_eq!(rx.legacy_peer_frames(), 1);
+        // Non-v1 garbage does NOT trip the legacy counter.
+        let mut junk = vec![0xFFu8; 84];
+        junk[0] = 0x12;
+        junk[1] = 0x34;
+        assert_eq!(rx.ingest(&junk).unwrap(), IngestEvent::Dropped);
+        assert_eq!(rx.legacy_peer_frames(), 1);
     }
 
     fn reframe_with_fixed_crc(frame: &mut [u8]) {

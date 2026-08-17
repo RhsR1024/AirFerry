@@ -240,7 +240,8 @@ impl ReceiverSession {
                     concat!(
                         r#"{{"schema_version":2,"meta_confirmed":true,"transfer_id_hex":"{}","#,
                         r#""content_id_hex":"{}","total_raw_size":{},"entry_count":{},"#,
-                        r#""chunk_count":{},"chunk_raw_size":{},"symbol_size":{},"entries":{}}}"#
+                        r#""chunk_count":{},"chunk_raw_size":{},"symbol_size":{},"#,
+                        r#""legacy_peer_frames":{},"entries":{}}}"#
                     ),
                     tid_hex,
                     cid_hex,
@@ -249,11 +250,12 @@ impl ReceiverSession {
                     r.chunk_count,
                     r.chunk_raw_size,
                     self.inner.symbol_size(),
+                    self.inner.legacy_peer_frames(),
                     entries_json,
                 )
             }
             None => {
-                r#"{"schema_version":2,"meta_confirmed":false,"transfer_id_hex":"","content_id_hex":"","total_raw_size":0,"entry_count":0,"chunk_count":0,"chunk_raw_size":0,"symbol_size":0,"entries":[]}"#.to_string()
+                r#"{"schema_version":2,"meta_confirmed":false,"transfer_id_hex":"","content_id_hex":"","total_raw_size":0,"entry_count":0,"chunk_count":0,"chunk_raw_size":0,"symbol_size":0,"legacy_peer_frames":0,"entries":[]}"#.to_string()
             }
         }
     }

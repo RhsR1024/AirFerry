@@ -209,10 +209,12 @@ public sealed class ReceiverSession : IDisposable
         public uint ChunkRawSize;
         public uint SymbolSize;
         public IReadOnlyList<ManifestEntryDto> Entries = Array.Empty<ManifestEntryDto>();
+        /// <summary>v1-magic frames rejected so far; &gt; 0 ⇒ the peer runs protocol 1.</summary>
+        public uint LegacyPeerFrames;
     }
 
-    /// <summary>One AF2 Manifest entry (kind/path/offset/size).</summary>
-    public sealed record ManifestEntryDto(int Kind, string Path, ulong Offset, ulong Size);
+    /// <summary>One AF2 Manifest entry (kind/path/savePath/offset/size).</summary>
+    public sealed record ManifestEntryDto(int Kind, string Path, string SavePath, ulong Offset, ulong Size);
 
     private Snapshot? _cachedSnapshot;
 
@@ -250,6 +252,7 @@ public sealed class ReceiverSession : IDisposable
                     ChunkCount = root.TryGetProperty("chunk_count", out var cc) ? (uint)cc.GetUInt64() : 0u,
                     ChunkRawSize = root.TryGetProperty("chunk_raw_size", out var crs) ? (uint)crs.GetUInt64() : 0u,
                     SymbolSize = root.TryGetProperty("symbol_size", out var ss) ? (uint)ss.GetUInt64() : 0u,
+                    LegacyPeerFrames = root.TryGetProperty("legacy_peer_frames", out var lpf) ? (uint)lpf.GetUInt64() : 0u,
                 };
                 if (root.TryGetProperty("entries", out var entriesEl) &&
                     entriesEl.ValueKind == System.Text.Json.JsonValueKind.Array)
@@ -257,9 +260,12 @@ public sealed class ReceiverSession : IDisposable
                     var list = new List<ManifestEntryDto>(entriesEl.GetArrayLength());
                     foreach (var e in entriesEl.EnumerateArray())
                     {
+                        var path = e.TryGetProperty("path", out var p) ? p.GetString() ?? "" : "";
                         list.Add(new ManifestEntryDto(
                             e.TryGetProperty("kind", out var k) ? k.GetInt32() : 1,
-                            e.TryGetProperty("path", out var p) ? p.GetString() ?? "" : "",
+                            path,
+                            // §7.2 save-time sanitized name (may equal path).
+                            e.TryGetProperty("save_path", out var sp) ? sp.GetString() ?? path : path,
                             e.TryGetProperty("offset", out var o) ? o.GetUInt64() : 0UL,
                             e.TryGetProperty("size", out var s) ? s.GetUInt64() : 0UL));
                     }

@@ -1303,15 +1303,18 @@ public partial class ScanViewModel : ObservableObject, IDisposable
 
         if (!IsRecovering)
         {
+            var legacy = _session?.GetSnapshot().LegacyPeerFrames ?? 0;
             StatusText = p.Complete
                 ? "文件恢复完成"
-                : !p.MetaConfirmed && p.ReceivedSymbols > 0
-                    ? $"正在同步…已缓存 {p.ReceivedSymbols} 个符号"
-                    : p.TotalSymbols == 0
-                        ? "等待二维码…"
-                        : p.ReceivedSymbols > 0 && p.DecodedBlocks == 0
-                            ? $"接收中… {p.ReceivedSymbols}/{p.TotalSymbols}（等待解码）"
-                            : $"恢复中… {Progress:F0}%";
+                : legacy > 0
+                    ? $"检测到旧版 v1 协议二维码（已拒 {legacy} 帧），请将发送端升级到 AF2 版本"
+                    : !p.MetaConfirmed && p.ReceivedSymbols > 0
+                        ? $"正在同步…已缓存 {p.ReceivedSymbols} 个符号"
+                        : p.TotalSymbols == 0
+                            ? "等待二维码…"
+                            : p.ReceivedSymbols > 0 && p.DecodedBlocks == 0
+                                ? $"接收中… {p.ReceivedSymbols}/{p.TotalSymbols}（等待解码）"
+                                : $"恢复中… {Progress:F0}%";
         }
     }
 

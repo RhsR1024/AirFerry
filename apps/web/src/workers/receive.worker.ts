@@ -16,6 +16,8 @@ export const KIND_DIRECTORY = 3
 export interface ManifestEntryDto {
   kind: number
   path: string
+  /** §7.2 save-time sanitized name (equals path when nothing needed fixing). */
+  save_path?: string
   offset: number
   size: number
 }
@@ -30,6 +32,8 @@ export interface MetaInfo {
   /** Wire symbol size T observed by the Rust receiver (0 before lock). */
   symbolSize: number
   metaConfirmed: boolean
+  /** v1-magic frames rejected so far; > 0 ⇒ the peer runs protocol 1. */
+  legacyPeerFrames: number
   entries: ManifestEntryDto[]
 }
 
@@ -86,6 +90,7 @@ function readMeta(s: ReceiverSessionWasm): MetaInfo {
     chunk_count: number
     chunk_raw_size: number
     symbol_size?: number
+    legacy_peer_frames?: number
     entries?: ManifestEntryDto[]
   }
   return {
@@ -97,6 +102,7 @@ function readMeta(s: ReceiverSessionWasm): MetaInfo {
     chunkRawSize: snap.chunk_raw_size || 0,
     symbolSize: Number(snap.symbol_size || 0),
     metaConfirmed: snap.meta_confirmed === true,
+    legacyPeerFrames: Number(snap.legacy_peer_frames || 0),
     entries: Array.isArray(snap.entries) ? snap.entries : [],
   }
 }
@@ -180,6 +186,7 @@ function ingestBatch(frames: Uint8Array[], jobId: number): {
     framesCorrupt: 0,
     metaConfirmed: meta.metaConfirmed,
     symbolSize: meta.symbolSize,
+    legacyPeerFrames: meta.legacyPeerFrames,
     complete: isComplete,
   }
 
