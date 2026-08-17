@@ -98,6 +98,12 @@ fn is_nfc(s: &str) -> bool {
 }
 
 /// Validate one canonical path (§7.2 rules). Public for sender-side reuse.
+///
+/// Wire-level rules only: NFC, relative, `/`-separated, no empty/dot/NUL/C0
+/// components, byte/length bounds. Windows-hostile names (`:` components,
+/// reserved device names, trailing dots/spaces) are NOT wire violations —
+/// they are legal manifest paths that receivers sanitize at save time via
+/// [`sanitize_save_paths`] (§7.2: cleaning changes only the saved name).
 pub fn validate_path(path: &str) -> Result<(), &'static str> {
     if path.is_empty() {
         return Err("empty path");
@@ -127,12 +133,6 @@ pub fn validate_path(path: &str) -> Result<(), &'static str> {
         if comp == "." || comp == ".." {
             return Err("dot component");
         }
-        if comp.contains(':') {
-            return Err("colon in path component (Windows drive/ADS separator)");
-        }
-        if is_windows_reserved_name(comp) {
-            return Err("Windows reserved device name");
-        }
         if comp.len() > MAX_COMPONENT_BYTES {
             return Err("component exceeds 255 bytes");
         }
@@ -141,8 +141,8 @@ pub fn validate_path(path: &str) -> Result<(), &'static str> {
 }
 
 /// `CON`/`PRN`/`AUX`/`NUL`/`COM1-9`/`LPT1-9` (with or without an extension)
-/// cannot exist as files on Windows — reject them on every platform so the
-/// same manifest stays portable and receivers never hit device-name I/O.
+/// cannot exist as files on Windows — save-time sanitization appends a `~`
+/// so the file can be created (§7.2: 确定性加后缀，只改保存名).
 fn is_windows_reserved_name(comp: &str) -> bool {
     let stem = comp.split('.').next().unwrap_or("").to_ascii_uppercase();
     let reserved_bare = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL");
@@ -152,6 +152,59 @@ fn is_windows_reserved_name(comp: &str) -> bool {
             .is_some_and(|n| (1..=9).contains(&n))
     };
     reserved_bare || reserved_num("COM") || reserved_num("LPT")
+}
+
+/// Sanitize one path component for a Windows-targeted save.
+fn sanitize_component_windows(comp: &str) -> String {
+    let mut out = comp.replace(':', "_");
+    if is_windows_reserved_name(&out) {
+        out.push('~');
+    }
+    if out.ends_with('.') || out.ends_with(' ') {
+        out.push('~');
+    }
+    out
+}
+
+/// §7.2 save-time platform sanitization over a whole entry set — the save
+/// name only: verification (entry hashes, Content ID) always uses the
+/// canonical manifest path.
+///
+/// - `windows == false`: names return unchanged (POSIX-family filesystems
+///   accept every wire-legal path).
+/// - `windows == true`: per component, `:` → `_` (drive/ADS separator);
+///   reserved device names and trailing dots/spaces (unsavable on NTFS)
+///   get a `~`; entries that collide under case-folding get deterministic
+///   `~1`, `~2`, … suffixes in manifest order.
+///
+/// The result can never escape the target directory: wire-legal inputs are
+/// already relative, `/`-separated and free of `.`/`..`, and the sanitizer
+/// introduces none of those.
+pub fn sanitize_save_paths(paths: &[&str], windows: bool) -> Vec<String> {
+    if !windows {
+        return paths.iter().map(|p| p.to_string()).collect();
+    }
+    let mut out: Vec<String> = paths
+        .iter()
+        .map(|p| {
+            p.split('/')
+                .map(sanitize_component_windows)
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .collect();
+    // Case-fold collisions: first occurrence keeps the name, later ones get
+    // ~k (k = occurrence number), deterministic in manifest order.
+    let mut folds: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for p in out.iter_mut() {
+        let key = p.to_lowercase();
+        let next = folds.entry(key).or_insert(0);
+        if *next > 0 {
+            p.push_str(&format!("~{}", *next));
+        }
+        *next += 1;
+    }
+    out
 }
 
 impl Manifest {
@@ -596,6 +649,34 @@ mod tests {
         }
         assert!(validate_path("dir/好文件.txt").is_ok());
         assert!(validate_path(&("a/".repeat(200) + "leaf.txt")).is_ok());
+        // §7.2: Windows-hostile names are wire-legal (save-time sanitization
+        // handles them), NOT manifest rejections.
+        assert!(validate_path("aux/config.txt").is_ok());
+        assert!(validate_path("notes:a.txt").is_ok());
+        assert!(validate_path("NUL").is_ok());
+    }
+
+    #[test]
+    fn sanitize_save_paths_windows_rules() {
+        // POSIX saves keep canonical names untouched.
+        assert_eq!(
+            sanitize_save_paths(&["aux/config.txt", "notes:a.txt"], false),
+            ["aux/config.txt", "notes:a.txt"]
+        );
+        // Windows rules: colon → _, reserved names and trailing dots/spaces
+        // get `~`, case-fold collisions get deterministic suffixes.
+        assert_eq!(
+            sanitize_save_paths(&["aux/config.txt", "notes:a.txt", "tail."], true),
+            ["aux~/config.txt", "notes_a.txt", "tail.~"]
+        );
+        assert_eq!(sanitize_save_paths(&["CON"], true), ["CON~"]);
+        assert_eq!(sanitize_save_paths(&["com3.bin"], true), ["com3.bin~"]);
+        // Same path twice (multi-entry manifests forbid duplicates, but the
+        // sanitizer must stay deterministic if a caller misuses it).
+        assert_eq!(
+            sanitize_save_paths(&["A.txt", "a.txt", "A.TXT"], true),
+            ["A.txt", "a.txt~1", "A.TXT~2"]
+        );
     }
 
     #[test]

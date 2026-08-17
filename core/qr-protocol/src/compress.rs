@@ -498,7 +498,7 @@ pub fn decompress_stream_to_file(
             let dict = reader
                 .fill_buf()
                 .map_err(|e| Error::Compress(format!("peek: {e}")))
-                .and_then(|buf| xz_declared_dict_size(buf).map_err(|e| Error::Compress(e)));
+                .and_then(|buf| xz_declared_dict_size(buf).map_err(Error::Compress));
             dict.and_then(|dict| {
                 if dict > MAX_XZ_DICT_BYTES {
                     return Err(Error::Compress(format!(
@@ -677,7 +677,7 @@ pub fn decompress_with(data: &[u8], compression: u8) -> Result<Vec<u8>> {
 #[cfg(not(target_arch = "wasm32"))]
 fn xz_compress(data: &[u8]) -> Result<Vec<u8>> {
     use std::io::Write;
-    let dict = lzma2_dict_at_most((data.len() as u64).min(MAX_XZ_DICT_BYTES).max(MIN_XZ_DICT_BYTES));
+    let dict = lzma2_dict_at_most((data.len() as u64).clamp(MIN_XZ_DICT_BYTES, MAX_XZ_DICT_BYTES));
     let mut opts = xz2::stream::LzmaOptions::new_preset(XZ_PRESET)
         .map_err(|e| Error::Compress(e.to_string()))?;
     opts.dict_size(dict);

@@ -26,6 +26,7 @@ pub use frame::{Af2Frame, FrameError, FrameType, HEADER_SIZE, MAX_ESI, MAX_SBN};
 pub use id::{
     content_id, empty_hash, hash, object_id, transfer_id, EntryIdInput, ROLE_CHUNK, ROLE_MANIFEST,
 };
+pub use manifest::sanitize_save_paths;
 pub use receiver::{Af2Receiver, IngestEvent};
 pub use sender::{Af2Sender, SenderConfig, SenderError};
 pub use tlv::{parse_tlvs, Tlv, TlvError};

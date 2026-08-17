@@ -214,14 +214,22 @@ impl ReceiverSession {
                 let cid_hex: String = r.content_id.iter().map(|b| format!("{b:02x}")).collect();
                 let mut entries_json = String::from("[");
                 if let Some(m) = self.inner.manifest() {
-                    for (i, e) in m.entries.iter().enumerate() {
+                    // §7.2 save-time sanitization: hosts materialize with
+                    // `save_path`; canonical `path` stays the verification
+                    // identity. The web (wasm) cannot know its client OS, so
+                    // it always gets Windows-safe names — safe everywhere.
+                    let windows_rules = cfg!(windows) || cfg!(target_arch = "wasm32");
+                    let paths: Vec<&str> = m.entries.iter().map(|e| e.path.as_str()).collect();
+                    let save_paths = af2::sanitize_save_paths(&paths, windows_rules);
+                    for (i, (e, save)) in m.entries.iter().zip(save_paths.iter()).enumerate() {
                         if i > 0 {
                             entries_json.push(',');
                         }
                         entries_json.push_str(&format!(
-                            r#"{{"kind":{},"path":"{}","offset":{},"size":{}}}"#,
+                            r#"{{"kind":{},"path":"{}","save_path":"{}","offset":{},"size":{}}}"#,
                             e.kind,
                             escape_json(&e.path),
+                            escape_json(save),
                             e.content_offset,
                             e.content_size
                         ));
