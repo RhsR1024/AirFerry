@@ -232,6 +232,12 @@ impl ReceiverSessionWasm {
         self.inner.resume(root_frame_bytes, completed)
     }
 
+    /// Evict one chunk from both ledgers after a spill re-verification
+    /// failure (§11/§12): the sender's next epoch re-supplies it.
+    pub fn invalidate_chunk(&mut self, index: u32) -> bool {
+        self.inner.invalidate_chunk(index)
+    }
+
     /// Single-JSON receiver snapshot (`schema_version: 2`).
     pub fn snapshot_json(&self) -> String {
         self.inner.snapshot_json()

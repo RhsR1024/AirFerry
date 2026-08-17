@@ -245,6 +245,14 @@ internal static class NativeBridge
         EntryPoint = "airferry_receiver_resume")]
     public static extern int ReceiverResume(IntPtr handle, byte[] rootFrameBytes, nuint rootLen, uint[] completedIndices, nuint completedLen);
 
+    /// <summary>
+    /// Evict one chunk from both ledgers after a spill re-verification failure
+    /// (§11/§12): the sender's next epoch re-supplies it.
+    /// </summary>
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl,
+        EntryPoint = "airferry_receiver_invalidate_chunk")]
+    public static extern int ReceiverInvalidateChunk(IntPtr handle, uint index);
+
     /// <summary>Report the native ABI / capability version of the loaded DLL.</summary>
     /// <remarks>
     /// Mirrors the Android <c>NativeBridge.nativeAbiVersion()</c> handshake:

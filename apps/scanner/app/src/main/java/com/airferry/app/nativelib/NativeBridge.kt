@@ -93,5 +93,11 @@ object NativeBridge {
     /** Restore receiver from stored ROOT frame bytes + completed chunk indices (§12 resume). */
     external fun receiverResume(handle: Long, rootFrameBytes: ByteArray, completedIndices: IntArray): Boolean
 
+    /**
+     * Evict one chunk from both ledgers after a spill re-verification failure
+     * (§11/§12): the sender's next epoch re-supplies it.
+     */
+    external fun receiverInvalidateChunk(handle: Long, index: Int): Boolean
+
     external fun receiverDestroy(handle: Long)
 }

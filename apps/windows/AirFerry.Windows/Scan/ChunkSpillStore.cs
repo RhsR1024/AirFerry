@@ -116,5 +116,49 @@ public sealed class ChunkSpillStore : IDisposable
         try { File.Delete(_path); } catch (IOException) { }
     }
 
+    /// <summary>
+    /// Read one canonical-stream range (§12 reopen re-verification reads
+    /// individual chunks back). Returns null when the spill is shorter than
+    /// the requested range end.
+    /// </summary>
+    public byte[]? ReadRange(long offset, long size)
+    {
+        if (offset < 0 || size < 0 || size > int.MaxValue)
+        {
+            return null;
+        }
+        if (_stream is null && !File.Exists(_path))
+        {
+            return null;
+        }
+        FileStream fs;
+        try
+        {
+            fs = _stream ??= new FileStream(
+                _path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        }
+        catch (IOException)
+        {
+            return null;
+        }
+        if (offset + size > fs.Length)
+        {
+            return null;
+        }
+        var buf = new byte[size];
+        fs.Seek(offset, SeekOrigin.Begin);
+        int done = 0;
+        while (done < buf.Length)
+        {
+            int n = fs.Read(buf, done, buf.Length - done);
+            if (n <= 0)
+            {
+                return null;
+            }
+            done += n;
+        }
+        return buf;
+    }
+
     public void Dispose() => Discard();
 }

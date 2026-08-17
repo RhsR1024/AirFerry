@@ -365,6 +365,23 @@ pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverResu
     session.resume(r_slice, &completed_u32) as jni::sys::jboolean
 }
 
+/// Evict one chunk from both ledgers after a host-side spill re-verification
+/// failure (§11/§12): the sender's next epoch re-supplies it. Mirrors
+/// [`ReceiverSession::invalidate_chunk`].
+#[no_mangle]
+pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverInvalidateChunk(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    index: jint,
+) -> jni::sys::jboolean {
+    if handle == 0 || index < 0 {
+        return false as jni::sys::jboolean;
+    }
+    let session = unsafe { &mut *(handle as *mut ReceiverSession) };
+    session.invalidate_chunk(index as u32) as jni::sys::jboolean
+}
+
 /// Single-JSON receiver snapshot (`ReceiverSnapshotV2`, see
 /// [`ReceiverSession::snapshot_json`]).
 ///

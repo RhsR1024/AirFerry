@@ -49,6 +49,10 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     /// lifecycle swap paths that run under the same ingest lock.
     /// </summary>
     private ChunkSpillStore? _chunkSpill;
+    /// <summary>§12 resume ledger journal bound to the current transfer.</summary>
+    private Af2LedgerStore? _af2Ledger;
+    /// <summary>Resumed chunk indices awaiting post-manifest re-verification (§12).</summary>
+    private SortedSet<int>? _pendingReverify;
     private Thread? _producerThread;
     private volatile bool _producerRunning;
     private bool _disposed;
@@ -247,9 +251,19 @@ public partial class ScanViewModel : ObservableObject, IDisposable
                 throw new InvalidOperationException(
                     $"传输引擎 ABI 不兼容（期望 >= {NativeBridge.NativeAbiVersion2}，实际 {nativeAbi}）");
             }
-            _chunkSpill?.Discard();
-            _chunkSpill = null;
+            // §12 resume attempt BEFORE the first frame is ingested (the
+            // receiver accepts resume only while unlocked). On success the
+            // previous spill + ledger journal stay bound; on failure both are
+            // dropped like any other leftover.
             _session = new ReceiverSession();
+            if (!TryResumeFromLedger())
+            {
+                _chunkSpill?.Discard();
+                _chunkSpill = null;
+                _af2Ledger?.Discard();
+                _af2Ledger = null;
+                _pendingReverify = null;
+            }
             Interlocked.Exchange(ref _recoveryStarted, 0);
             _capture = FrameSourceFactory.Create(source);
             if (!_capture.IsOpen)
@@ -560,6 +574,83 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>
+    /// §12 crash recovery: rebuild the session from the most recent ledger
+    /// journal before any frame is ingested (Resume requires an unlocked
+    /// receiver). A journal without its spill file is worthless — the chunk
+    /// bytes live there — and both are dropped by the caller.
+    /// </summary>
+    private bool TryResumeFromLedger()
+    {
+        Af2LedgerStore? ledger = Af2LedgerStore.LoadMostRecent(TempDir);
+        if (ledger is null)
+        {
+            return false;
+        }
+        ReceiverSession? session = _session;
+        if (session is null)
+        {
+            return false;
+        }
+        string spillPath = Path.Combine(
+            TempDir, $"af2-{ledger.TransferIdHex}.partial");
+        uint[] completed = ledger.CompletedIndices.Select(i => (uint)i).ToArray();
+        if (!File.Exists(spillPath) || !session.Resume(ledger.RootFrameBytes, completed))
+        {
+            ledger.Discard();
+            return false;
+        }
+        _af2Ledger = ledger;
+        _chunkSpill = new ChunkSpillStore(TempDir, ledger.TransferIdHex);
+        _pendingReverify = new SortedSet<int>(ledger.CompletedIndices);
+        return true;
+    }
+
+    /// <summary>
+    /// §12 reopen re-verification: once the Manifest is in, every resumed
+    /// completed bit is checked against the spill bytes via the core's
+    /// manifest-bound VerifyChunk; failures are invalidated (the sender's
+    /// next epoch re-supplies them).
+    /// </summary>
+    private void ReverifyResumedChunks(ReceiverSession session)
+    {
+        SortedSet<int>? pending = _pendingReverify;
+        Af2LedgerStore? ledger = _af2Ledger;
+        ChunkSpillStore? spill = _chunkSpill;
+        if (pending is null || pending.Count == 0 || ledger is null || spill is null)
+        {
+            return;
+        }
+        ReceiverSession.Snapshot snap = session.GetSnapshot();
+        if (!snap.MetaConfirmed || snap.ChunkRawSize == 0)
+        {
+            return;
+        }
+        long crs = snap.ChunkRawSize;
+        foreach (int i in pending.ToArray())
+        {
+            long off = i * crs;
+            long len = Math.Clamp((long)snap.TotalRawSize - off, 0, crs);
+            byte[]? bytes = spill.ReadRange(off, len);
+            if (bytes is null)
+            {
+                continue; // spill short — retry on a later tick
+            }
+            pending.Remove(i);
+            if (!session.VerifyChunk((uint)i, bytes))
+            {
+                session.InvalidateChunk((uint)i);
+                ledger.Invalidate(i);
+                System.Diagnostics.Debug.WriteLine(
+                    $"[Af2] resumed chunk {i} failed re-verification; invalidated");
+            }
+        }
+        if (pending.Count == 0)
+        {
+            _pendingReverify = null;
+        }
+    }
+
+    /// <summary>
     /// Per-frame ingest callback (runs under <see cref="QrDecodePool.IngestLock"/>).
     /// Returns true when this symbol completes recovery.
     /// </summary>
@@ -586,17 +677,42 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         if (s.Accepted && s.ReceivedSymbols == 0)
         {
             // Relock (or first lock): a foreign Transfer owns the session now,
-            // so the old spill's bytes belong to nobody.
+            // so the old spill's bytes belong to nobody. The ledger journal
+            // follows — its ROOT/completed set reference the abandoned
+            // transfer. (A resumed same-transfer session never gets here:
+            // duplicate ROOTs are dropped, not re-locked.)
             _chunkSpill?.Discard();
             _chunkSpill = null;
+            _af2Ledger?.Discard();
+            _af2Ledger = null;
+            _pendingReverify = null;
+        }
+        if (s.ManifestReady)
+        {
+            ReverifyResumedChunks(session);
         }
         if (s.ChunkReady)
         {
             try
             {
+                ReceiverSession.Snapshot snap = session.GetSnapshot();
                 ChunkSpillStore spill = _chunkSpill ??= new ChunkSpillStore(
-                    TempDir, session.GetSnapshot().TransferIdHex);
-                session.DrainLastChunk(spill.Write);
+                    TempDir, snap.TransferIdHex);
+                int completedIndex = -1;
+                session.DrainLastChunk((index, chunkRawSize, bytes) =>
+                {
+                    spill.Write(index, chunkRawSize, bytes);
+                    completedIndex = index;
+                });
+                // §12 commit order: the chunk bytes were pwritten + flushed
+                // into the spill inside DrainLastChunk; only now may the
+                // ledger journal record the bit.
+                if (completedIndex >= 0)
+                {
+                    Af2LedgerStore ledger = _af2Ledger ??= Af2LedgerStore.Create(
+                        TempDir, snap.TransferIdHex, (int)snap.ChunkRawSize, snap.RootFrameBytes);
+                    ledger.Commit(completedIndex);
+                }
             }
             catch (Exception ex)
             {
@@ -706,14 +822,31 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             byte[]? fromFile = spill.ReadAll(total);
             if (fromFile is not null)
             {
+                // §13 ⑧⑨ final gate BEFORE staging: entry hashes, UTF-8 text
+                // and Content ID recompute over the full stream (Windows
+                // holds the whole stream here by design).
+                if (!session.VerifyFinalStream(fromFile))
+                {
+                    throw new InvalidOperationException(
+                        "最终校验失败，请对准二维码重新接收");
+                }
                 // Consumed: staging may still fail, but the failure path resets
                 // the whole receiver anyway, so no retry needs this file.
                 spill.Discard();
                 _chunkSpill = null;
+                _af2Ledger?.Discard();
+                _af2Ledger = null;
+                _pendingReverify = null;
                 return fromFile;
             }
         }
-        return session.Assemble();
+        byte[]? assembled = session.Assemble();
+        if (assembled is not null && assembled.Length > 0 &&
+            !session.VerifyFinalStream(assembled))
+        {
+            throw new InvalidOperationException("最终校验失败，请对准二维码重新接收");
+        }
+        return assembled;
     }
 
     private RecoveryOutcome RecoverAndStageCore(
@@ -910,6 +1043,9 @@ public partial class ScanViewModel : ObservableObject, IDisposable
                 session.Destroy();
                 _chunkSpill?.Discard();
                 _chunkSpill = null;
+                _af2Ledger?.Discard();
+                _af2Ledger = null;
+                _pendingReverify = null;
                 _session = new ReceiverSession();
                 Interlocked.Exchange(ref _recoveryStarted, 0);
                 pool.IngestStopped = false;
@@ -1037,6 +1173,9 @@ public partial class ScanViewModel : ObservableObject, IDisposable
                 session.Destroy();
                 _chunkSpill?.Discard();
                 _chunkSpill = null;
+                _af2Ledger?.Discard();
+                _af2Ledger = null;
+                _pendingReverify = null;
                 _session = new ReceiverSession();
                 Interlocked.Exchange(ref _recoveryStarted, 0);
                 pool.IngestStopped = false;

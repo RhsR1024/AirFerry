@@ -202,9 +202,19 @@ impl ReceiverSession {
 
     /// Evict one chunk from BOTH ledgers (engine map + core chunk_done), so
     /// the sender's next epoch can re-supply it. Also exposed for hosts that
-    /// re-verify spilled chunks via the FFI.
+    /// re-verify spilled chunks via the FFI. `completed_count` follows the
+    /// eviction — otherwise a host-side invalidation followed by the chunk's
+    /// re-completion could never re-declare completion.
     pub fn invalidate_chunk(&mut self, index: u32) -> bool {
-        self.inner.invalidate_chunk(index)
+        let removed_engine = self.completed_chunks.remove(&index).is_some();
+        let removed_core = self.inner.invalidate_chunk(index);
+        if removed_engine || removed_core {
+            self.completed_count = self.completed_count.saturating_sub(1);
+            if self.last_chunk.as_ref().is_some_and(|(i, _)| *i == index) {
+                self.last_chunk = None;
+            }
+        }
+        removed_engine || removed_core
     }
 
     pub fn snapshot_json(&self) -> String {
@@ -212,6 +222,21 @@ impl ReceiverSession {
             Some(r) => {
                 let tid_hex: String = r.transfer().iter().map(|b| format!("{b:02x}")).collect();
                 let cid_hex: String = r.content_id.iter().map(|b| format!("{b:02x}")).collect();
+                // Canonical ROOT frame re-encode (deterministic: same record,
+                // same T ⇒ byte-identical to the wire frame that locked the
+                // session). Hosts persist it in their §12 ledger and feed it
+                // back through `resume` after a restart.
+                let root_frame_hex = af2::Af2Frame {
+                    frame_type: af2::FrameType::Root,
+                    object_id: r.transfer(),
+                    sbn: 0,
+                    esi: 0,
+                    body: r.encode().unwrap_or_default(),
+                    t: self.inner.symbol_size(),
+                }
+                .to_bytes()
+                .map(|b| b.iter().map(|x| format!("{x:02x}")).collect::<String>())
+                .unwrap_or_default();
                 let mut entries_json = String::from("[");
                 if let Some(m) = self.inner.manifest() {
                     // §7.2 save-time sanitization: hosts materialize with
@@ -239,12 +264,13 @@ impl ReceiverSession {
                 format!(
                     concat!(
                         r#"{{"schema_version":2,"meta_confirmed":true,"transfer_id_hex":"{}","#,
-                        r#""content_id_hex":"{}","total_raw_size":{},"entry_count":{},"#,
-                        r#""chunk_count":{},"chunk_raw_size":{},"symbol_size":{},"#,
+                        r#""content_id_hex":"{}","root_frame_hex":"{}","total_raw_size":{},"#,
+                        r#""entry_count":{},"chunk_count":{},"chunk_raw_size":{},"symbol_size":{},"#,
                         r#""legacy_peer_frames":{},"entries":{}}}"#
                     ),
                     tid_hex,
                     cid_hex,
+                    root_frame_hex,
                     r.total_raw_size,
                     r.entry_count,
                     r.chunk_count,
@@ -255,7 +281,7 @@ impl ReceiverSession {
                 )
             }
             None => {
-                r#"{"schema_version":2,"meta_confirmed":false,"transfer_id_hex":"","content_id_hex":"","total_raw_size":0,"entry_count":0,"chunk_count":0,"chunk_raw_size":0,"symbol_size":0,"legacy_peer_frames":0,"entries":[]}"#.to_string()
+                r#"{"schema_version":2,"meta_confirmed":false,"transfer_id_hex":"","content_id_hex":"","root_frame_hex":"","total_raw_size":0,"entry_count":0,"chunk_count":0,"chunk_raw_size":0,"symbol_size":0,"legacy_peer_frames":0,"entries":[]}"#.to_string()
             }
         }
     }
@@ -488,5 +514,77 @@ mod tests {
         bad[n - 5] ^= 0xFF;
         let mut fresh = ReceiverSession::new();
         assert!(!fresh.resume(&bad, &[0]));
+    }
+
+    #[test]
+    fn snapshot_root_frame_hex_round_trips_into_resume() {
+        // The ledger persists the snapshot's canonical ROOT re-encode; feeding
+        // it back through resume() must lock byte-identically.
+        let data = vec![0x66u8; 2500];
+        let mut sender = Af2Sender::new(
+            vec![(KIND_FILE, "hex.bin".to_string(), data)],
+            SenderConfig::default(),
+        )
+        .unwrap();
+        let root_frame = sender.next_frame().unwrap();
+        let mut session = ReceiverSession::new();
+        session.ingest(&root_frame);
+        let snap = session.snapshot_json();
+        assert!(snap.contains("\"root_frame_hex\":\""));
+        let hex = snap
+            .split("\"root_frame_hex\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or_default();
+        assert!(!hex.is_empty());
+        let decoded: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        assert_eq!(decoded, root_frame, "canonical re-encode must be byte-identical");
+        let mut resumed = ReceiverSession::new();
+        assert!(resumed.resume(&decoded, &[]));
+    }
+
+    #[test]
+    fn host_invalidate_chunk_decrements_completion() {
+        // The host-side spill re-verification failure path: invalidate must
+        // drop completion so a re-supplied chunk can complete again (the
+        // pre-fix engine kept completed_count, wedging completion true).
+        let data = vec![0x11u8; 2500];
+        let mut sender = Af2Sender::new(
+            vec![(KIND_FILE, "inv.bin".to_string(), data)],
+            SenderConfig::default(),
+        )
+        .unwrap();
+        let mut session = ReceiverSession::new();
+        session.ingest(&sender.next_frame().unwrap()); // lock
+        let mut completed = false;
+        for _ in 0..8000 {
+            let f = sender.next_frame().unwrap();
+            let (_, _, _, chunk_ready) = bits(session.ingest(&f));
+            if chunk_ready {
+                completed = true;
+                break;
+            }
+        }
+        assert!(completed, "chunk must complete");
+        assert!(session.is_complete());
+        // Host drained + forgot the chunk, then re-verification failed.
+        session.forget_chunk(0);
+        assert!(session.invalidate_chunk(0));
+        assert!(!session.is_complete(), "invalidation must drop completion");
+        // Re-supply: the sender's next epoch replays the chunk's META +
+        // source symbols; completion must be reachable again.
+        let mut recompleted = false;
+        for _ in 0..12_000 {
+            let (complete, _, _, chunk_ready) = bits(session.ingest(&sender.next_frame().unwrap()));
+            if chunk_ready {
+                assert!(complete, "re-supplied chunk must complete again");
+                recompleted = true;
+                break;
+            }
+        }
+        assert!(recompleted);
     }
 }

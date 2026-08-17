@@ -518,6 +518,21 @@ pub unsafe extern "C" fn airferry_receiver_resume(
     if session.resume(root_bytes, completed) { 1 } else { 0 }
 }
 
+/// Evict one chunk from both ledgers after a host-side spill re-verification
+/// failure (§11/§12): the sender's next epoch re-supplies it. Returns 1 when
+/// the index was resident in either ledger.
+#[no_mangle]
+pub unsafe extern "C" fn airferry_receiver_invalidate_chunk(
+    handle: *mut ReceiverSession,
+    index: u32,
+) -> i32 {
+    if handle.is_null() {
+        return 0;
+    }
+    let session = unsafe { &mut *handle };
+    if session.invalidate_chunk(index) { 1 } else { 0 }
+}
+
 /// Free a string returned by [`airferry_receiver_snapshot_json`].
 /// Passing null is a no-op.
 ///

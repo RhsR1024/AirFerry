@@ -118,6 +118,22 @@ public sealed class ReceiverSession : IDisposable
         }
     }
 
+    /// <summary>
+    /// Evict one chunk from both ledgers after a spill re-verification
+    /// failure (§11/§12): the sender's next epoch re-supplies it.
+    /// </summary>
+    public bool InvalidateChunk(uint index)
+    {
+        lock (_gate)
+        {
+            if (!_initialized || _handle == IntPtr.Zero)
+            {
+                return false;
+            }
+            return NativeBridge.ReceiverInvalidateChunk(_handle, index) == 1;
+        }
+    }
+
     /// <summary>Restore session from stored ROOT frame bytes + completed chunk indices (§12 resume).</summary>
     public bool Resume(byte[] rootFrameBytes, uint[] completedIndices)
     {
@@ -211,6 +227,8 @@ public sealed class ReceiverSession : IDisposable
         public IReadOnlyList<ManifestEntryDto> Entries = Array.Empty<ManifestEntryDto>();
         /// <summary>v1-magic frames rejected so far; &gt; 0 ⇒ the peer runs protocol 1.</summary>
         public uint LegacyPeerFrames;
+        /// <summary>Canonical ROOT frame bytes (for the §12 resume ledger).</summary>
+        public byte[] RootFrameBytes = Array.Empty<byte>();
     }
 
     /// <summary>One AF2 Manifest entry (kind/path/savePath/offset/size).</summary>
@@ -253,6 +271,8 @@ public sealed class ReceiverSession : IDisposable
                     ChunkRawSize = root.TryGetProperty("chunk_raw_size", out var crs) ? (uint)crs.GetUInt64() : 0u,
                     SymbolSize = root.TryGetProperty("symbol_size", out var ss) ? (uint)ss.GetUInt64() : 0u,
                     LegacyPeerFrames = root.TryGetProperty("legacy_peer_frames", out var lpf) ? (uint)lpf.GetUInt64() : 0u,
+                    RootFrameBytes = root.TryGetProperty("root_frame_hex", out var rfh)
+                        ? HexToBytes(rfh.GetString() ?? "") : Array.Empty<byte>(),
                 };
                 if (root.TryGetProperty("entries", out var entriesEl) &&
                     entriesEl.ValueKind == System.Text.Json.JsonValueKind.Array)
@@ -283,6 +303,20 @@ public sealed class ReceiverSession : IDisposable
                 NativeBridge.FreeString(ptr);
             }
         }
+    }
+
+    private static byte[] HexToBytes(string s)
+    {
+        if (s.Length == 0 || s.Length % 2 != 0)
+        {
+            return Array.Empty<byte>();
+        }
+        var b = new byte[s.Length / 2];
+        for (int i = 0; i < b.Length; i++)
+        {
+            b[i] = Convert.ToByte(s.Substring(i * 2, 2), 16);
+        }
+        return b;
     }
 
     public string FileName()

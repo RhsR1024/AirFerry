@@ -148,6 +148,13 @@ class ReceiverSessionManager {
         return initialized && NativeBridge.receiverResume(handle, rootFrameBytes, completedIndices)
     }
 
+    /**
+     * Evict one chunk from both ledgers after a spill re-verification failure
+     * (§11/§12): the sender's next epoch re-supplies it.
+     */
+    fun invalidateChunk(index: Int): Boolean =
+        initialized && NativeBridge.receiverInvalidateChunk(handle, index)
+
     data class ManifestEntry(
         val kind: Int,
         val path: String,
@@ -161,6 +168,8 @@ class ReceiverSessionManager {
         val metaConfirmed: Boolean,
         val transferIdHex: String,
         val contentIdHex: String,
+        /** Canonical ROOT frame bytes (for the §12 resume ledger). */
+        val rootFrameBytes: ByteArray = ByteArray(0),
         val totalRawSize: Long,
         val entryCount: Int,
         val chunkCount: Int,
@@ -173,14 +182,16 @@ class ReceiverSessionManager {
     private var cachedSnapshot: Snapshot? = null
 
     fun snapshot(): Snapshot {
-        if (!initialized) return Snapshot(false, "", "", 0L, 0, 0, 0, emptyList(), 0)
+        if (!initialized) return Snapshot(false, "", "", ByteArray(0), 0L, 0, 0, 0, emptyList(), 0)
         cachedSnapshot?.let { snap ->
             if (snap.metaConfirmed) return snap
         }
         val json = NativeBridge.receiverSnapshotJson(handle)
-            ?: return cachedSnapshot ?: Snapshot(false, "", "", 0L, 0, 0, 0, emptyList(), 0)
+            ?: return cachedSnapshot
+                ?: Snapshot(false, "", "", ByteArray(0), 0L, 0, 0, 0, emptyList(), 0)
         return try {
             val o = JSONObject(json)
+            val rootHex = o.optString("root_frame_hex", "")
             val entriesList = mutableListOf<ManifestEntry>()
             val arr = o.optJSONArray("entries")
             if (arr != null) {
@@ -203,6 +214,7 @@ class ReceiverSessionManager {
                 metaConfirmed = o.optBoolean("meta_confirmed", false),
                 transferIdHex = o.optString("transfer_id_hex", ""),
                 contentIdHex = o.optString("content_id_hex", ""),
+                rootFrameBytes = hexToBytes(rootHex),
                 totalRawSize = o.optLong("total_raw_size", 0L),
                 entryCount = o.optInt("entry_count", 0),
                 chunkCount = o.optInt("chunk_count", 0),
@@ -213,7 +225,16 @@ class ReceiverSessionManager {
             cachedSnapshot = snap
             snap
         } catch (_: Exception) {
-            cachedSnapshot ?: Snapshot(false, "", "", 0L, 0, 0, 0, emptyList(), 0)
+            cachedSnapshot
+                ?: Snapshot(false, "", "", ByteArray(0), 0L, 0, 0, 0, emptyList(), 0)
+        }
+    }
+
+    private fun hexToBytes(s: String): ByteArray {
+        if (s.length % 2 != 0) return ByteArray(0)
+        return ByteArray(s.length / 2) { i ->
+            ((Character.digit(s[i * 2], 16) shl 4) +
+                Character.digit(s[i * 2 + 1], 16)).toByte()
         }
     }
 

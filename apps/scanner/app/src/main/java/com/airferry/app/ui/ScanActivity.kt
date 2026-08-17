@@ -42,6 +42,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.airferry.app.nativelib.NativeBridge
+import com.airferry.app.scan.Af2LedgerStore
 import com.airferry.app.scan.ChunkSpillStore
 import com.airferry.app.scan.QrDecodePool
 import com.airferry.app.scan.QrStreamAnalyzer
@@ -68,6 +69,12 @@ class ScanActivity : ComponentActivity() {
      * single chunk still goes through the same path, keeping one code shape.
      */
     private var chunkSpill: ChunkSpillStore? = null
+    /** §12 resume ledger journal bound to the current transfer (null until
+     *  the first chunk commits, or after a resume with no further activity). */
+    private var ledger: Af2LedgerStore? = null
+    /** Resumed chunk indices awaiting post-manifest re-verification (§12:
+     *  reopen must re-verify completed bits against the manifest table). */
+    private var pendingReverify: MutableSet<Int>? = null
     private val cameraExecutor = Executors.newSingleThreadExecutor()
     /** Dedicated single-thread executor for the post-recovery heavy work
      *  (JNI assemble, CRC, disk writes, bundle unpacking) so it never blocks
@@ -189,6 +196,16 @@ class ScanActivity : ComponentActivity() {
                 jniReady = jniOk,
                 statusText = if (!jniOk) "JNI 加载失败" else idleStatus(),
             )
+        }
+        if (jniOk) {
+            // §12 resume attempt must precede the first ingest (the receiver
+            // accepts resume only while unlocked). Runs on the ingest thread
+            // like every other session mutation.
+            val pool0 = decodePool
+            ioExecutor.execute {
+                val work = { tryResumeFromLedger() }
+                pool0?.runExclusive(work) ?: work()
+            }
         }
         if (!jniOk) {
             setContent {
@@ -551,6 +568,59 @@ class ScanActivity : ComponentActivity() {
         val legacyPeerFrames: Int = 0
     )
 
+    /**
+     * §12 crash recovery: rebuild the session from the most recent ledger
+     * journal before any frame is ingested (resume() requires an unlocked
+     * receiver). Called once from onCreate. A ledger without its spill file
+     * is worthless — the chunk bytes live there — and is dropped.
+     */
+    private fun tryResumeFromLedger() {
+        val led = try {
+            Af2LedgerStore.loadMostRecent(cacheDir)
+        } catch (e: Exception) {
+            Log.w(TAG, "ledger scan failed", e); null
+        } ?: return
+        val spillFile = java.io.File(cacheDir, "af2-${led.transferIdHex}.partial")
+        if (!spillFile.isFile || !session.resume(led.rootFrameBytes, led.completedIndices)) {
+            led.discard()
+            return
+        }
+        ledger = led
+        chunkSpill = ChunkSpillStore(cacheDir, led.transferIdHex)
+        pendingReverify = led.completedIndices.toMutableSet()
+        Log.i(TAG, "resumed transfer ${led.transferIdHex} with ${led.completedIndices.size} chunks")
+    }
+
+    /**
+     * §12 reopen re-verification: once the Manifest is in, every resumed
+     * completed bit is checked against the spill bytes via the core's
+     * manifest-bound verify_chunk; failures are invalidated (the sender's
+     * next epoch re-supplies them) instead of being discovered at publish.
+     */
+    private fun reverifyResumedChunks() {
+        val pend = pendingReverify ?: return
+        val led = ledger ?: return
+        val spill = chunkSpill ?: return
+        val snap = session.snapshot()
+        if (!snap.metaConfirmed || snap.chunkRawSize <= 0) return
+        val crs = snap.chunkRawSize.toLong()
+        val iter = pend.iterator()
+        while (iter.hasNext()) {
+            val i = iter.next()
+            val off = i.toLong() * crs
+            val len = (snap.totalRawSize - off).coerceIn(0, crs)
+            val bytes = spill.readRange(off, len)
+            if (bytes == null) continue // spill short — retry on a later tick
+            iter.remove()
+            if (!session.verifyChunk(i, bytes)) {
+                session.invalidateChunk(i)
+                led.invalidate(i)
+                Log.w(TAG, "resumed chunk $i failed re-verification; invalidated")
+            }
+        }
+        if (pend.isEmpty()) pendingReverify = null
+    }
+
     /** Ingest-thread entry (serialized by the pool): heavy work here, post a snapshot. */
     private fun handleFrameAsync(payload: ByteArray) {
         // After completion, drop further frames: the main thread is (or will be)
@@ -568,15 +638,31 @@ class ScanActivity : ComponentActivity() {
         if (status.accepted && status.receivedSymbols == 0) {
             // Relock (or first lock): a foreign Transfer now owns the session —
             // the old spill's bytes belong to nobody. Discard before any drain.
+            // The ledger journal follows: its ROOT/completed set reference the
+            // abandoned transfer. (A resumed same-transfer session never gets
+            // here — duplicate ROOTs are dropped, not re-locked.)
             chunkSpill?.discard()
             chunkSpill = null
+            ledger?.discard()
+            ledger = null
+            pendingReverify = null
+        }
+        if (status.manifestReady) {
+            reverifyResumedChunks()
         }
         if (status.chunkReady) {
+            val snap = session.snapshot()
             val spill = chunkSpill ?: ChunkSpillStore(
-                cacheDir, session.snapshot().transferIdHex
+                cacheDir, snap.transferIdHex
             ).also { chunkSpill = it }
             session.drainLastChunk { index, chunkRawSize, bytes ->
                 spill.write(index, chunkRawSize, bytes)
+                // §12 commit order: chunk bytes are fsync'd into the spill
+                // above; only then may the ledger journal record the bit.
+                val led = ledger ?: Af2LedgerStore.create(
+                    cacheDir, snap.transferIdHex, snap.chunkRawSize, snap.rootFrameBytes
+                ).also { ledger = it }
+                led.commit(index)
             }
         }
 
@@ -809,12 +895,23 @@ class ScanActivity : ComponentActivity() {
     private fun recoverAndStage(displayName: String): Intent? {
         val intent = stageFromLedger(displayName)
         if (intent != null) {
-            // Entries are in ContentStore now — the spill has been consumed.
+            // Entries are in ContentStore now — the spill AND its ledger
+            // journal have been consumed.
             chunkSpill?.discard()
             chunkSpill = null
+            ledger?.discard()
+            ledger = null
+            pendingReverify = null
         }
         return intent
     }
+
+    /** Transfers up to this size get the full §13 ⑧⑨ final gate (entry hashes
+     *  + UTF-8 + Content ID recompute) over the whole stream; larger ones rely
+     *  on the per-chunk Manifest-table verification below — reading a
+     *  multi-hundred-MiB stream into memory would trade bounded-memory
+     *  receipt for an avoidable OOM at publish. */
+    private val finalVerifyMemoryLimit: Long = 64L * 1024 * 1024
 
     private fun stageFromLedger(displayName: String): Intent? {
         updateRecoveryStage("正在组装数据…")
@@ -838,6 +935,33 @@ class ScanActivity : ComponentActivity() {
                 }
             }
             return null
+        }
+
+        // ── §11/§13 integrity gates before any entry is materialized ──
+        if (spillUsable) {
+            // Every completed chunk is re-checked against the Manifest hash
+            // table (bounded memory: one chunk at a time — this also covers
+            // chunks that completed before the Manifest arrived).
+            val crs = snapshot.chunkRawSize.toLong().coerceAtLeast(1)
+            for (i in 0 until snapshot.chunkCount) {
+                val off = i.toLong() * crs
+                val len = (snapshot.totalRawSize - off).coerceIn(0, crs)
+                val bytes = spill!!.readRange(off, len)
+                if (bytes == null || !session.verifyChunk(i, bytes)) {
+                    session.invalidateChunk(i)
+                    throw IllegalStateException("第 ${i + 1}/${snapshot.chunkCount} 块校验失败，请对准二维码重新接收")
+                }
+            }
+            // §13 ⑧⑨ final gate (entry hashes, UTF-8 text, Content ID) for
+            // transfers small enough to stream through memory once.
+            if (snapshot.totalRawSize in 1..finalVerifyMemoryLimit) {
+                val whole = spill!!.readRange(0, snapshot.totalRawSize)
+                if (whole == null || !session.verifyFinalStream(whole)) {
+                    throw IllegalStateException("最终校验失败，请对准二维码重新接收")
+                }
+            }
+        } else if (stream != null && !session.verifyFinalStream(stream!!)) {
+            throw IllegalStateException("最终校验失败，请对准二维码重新接收")
         }
 
         val nonDirEntries = snapshot.entries.filter { it.kind != 3 } // 3 = DIRECTORY
@@ -975,6 +1099,9 @@ class ScanActivity : ComponentActivity() {
             session = ReceiverSessionManager()
             chunkSpill?.discard()
             chunkSpill = null
+            ledger?.discard()
+            ledger = null
+            pendingReverify = null
             ingestStopped.set(false)
             completedHandled = false
             lastUiUpdate = 0
@@ -1007,6 +1134,9 @@ class ScanActivity : ComponentActivity() {
                 session = ReceiverSessionManager()
                 chunkSpill?.discard()
                 chunkSpill = null
+                ledger?.discard()
+                ledger = null
+                pendingReverify = null
                 ingestStopped.set(false)
             }
             try {
