@@ -29,10 +29,12 @@
     <Compile Include="..\AirFerry.Windows\Scan\IngestStatus.cs" Link="Scan\IngestStatus.cs" />
     <Compile Include="..\AirFerry.Windows\Scan\Crc32.cs" Link="Scan\Crc32.cs" />
     <Compile Include="..\AirFerry.Windows\Scan\ReceiverSession.cs" Link="Scan\ReceiverSession.cs" />
+    <Compile Include="..\AirFerry.Windows\Scan\Af2LedgerStore.cs" Link="Scan\Af2LedgerStore.cs" />
     <Compile Include="..\AirFerry.Windows\Scan\ProgressSnapshot.cs" Link="Scan\ProgressSnapshot.cs" />
     <Compile Include="..\AirFerry.Windows\Scan\PreviewFrame.cs" Link="Scan\PreviewFrame.cs" />
     <Compile Include="..\AirFerry.Windows\Scan\ZxingDecoder.cs" Link="Scan\ZxingDecoder.cs" />
     <Compile Include="..\AirFerry.Windows\Bundle\FileNameUtil.cs" Link="Bundle\FileNameUtil.cs" />
+    <Compile Include="..\AirFerry.Windows\Bundle\BundleFile.cs" Link="Bundle\BundleFile.cs" />
     <Compile Include="..\AirFerry.Windows\Bundle\ShareExport.cs" Link="Bundle\ShareExport.cs" />
     <Compile Include="..\AirFerry.Windows\Bundle\ContinuousSave.cs" Link="Bundle\ContinuousSave.cs" />
     <Compile Include="..\AirFerry.Windows\Bundle\ContentStore.cs" Link="Bundle\ContentStore.cs" />
