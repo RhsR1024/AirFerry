@@ -1,6 +1,6 @@
 /** Shared types for the sender app. */
 
-export type Page = "select" | "params" | "play" | "stats"
+export type Page = "select" | "settings" | "play" | "stats"
 export type CompressPhase = "reading" | "done" | "error"
 
 /**

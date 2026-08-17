@@ -601,6 +601,7 @@ self.addEventListener("message", async (e: MessageEvent) => {
       await dropSession()
       resumeChecked = false
       activeJobId = typeof data.jobId === "number" ? data.jobId : 0
+      post({ type: "ready", jobId: activeJobId })
       post({ type: "init_ok", jobId: activeJobId })
     } catch (err) {
       post({

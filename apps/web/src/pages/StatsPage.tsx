@@ -1,10 +1,12 @@
-/** Page 4: transfer statistics (file size, sent frames, fps, throughput, ETA). */
+/** Post-playback transfer statistics (file size, sent frames, fps, throughput, ETA). */
 import { useEffect, useState } from "react"
 import type { SenderSessionWasm } from "@/wasm/loader"
 
 interface Props {
   session: SenderSessionWasm
   fileSize: number
+  /** Release the session and return to the select page. */
+  onClose: () => void
 }
 
 interface LiveStats {
@@ -27,7 +29,7 @@ function formatDuration(ms: number): string {
   return `${m}m ${s % 60}s`
 }
 
-export function StatsPage({ session, fileSize }: Props) {
+export function StatsPage({ session, fileSize, onClose }: Props) {
   const [stats, setStats] = useState<LiveStats | null>(null)
 
   useEffect(() => {
@@ -97,6 +99,9 @@ export function StatsPage({ session, fileSize }: Props) {
           </tr>
         </tbody>
       </table>
+      <button type="button" className="btn primary page-cta" onClick={onClose}>
+        完成
+      </button>
     </div>
   )
 }

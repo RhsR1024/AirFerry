@@ -621,11 +621,14 @@ export function ReceivePage(): React.ReactElement {
     const recv = createReceiveWorker()
     recvWorkerRef.current = recv
 
-    const recvReady = new Promise<void>((resolve) => {
+    const recvReady = new Promise<void>((resolve, reject) => {
       const h = (e: MessageEvent) => {
-        if (e.data?.type === "ready") {
+        if (e.data?.type === "ready" || e.data?.type === "init_ok") {
           recv.removeEventListener("message", h)
           resolve()
+        } else if (e.data?.type === "error") {
+          recv.removeEventListener("message", h)
+          reject(new Error(e.data?.message || "receive worker 初始化失败"))
         }
       }
       recv.addEventListener("message", h)
@@ -751,17 +754,11 @@ export function ReceivePage(): React.ReactElement {
     // (Each qr worker's `init` was already sent by `spawnQrWorker`.)
     dbg(`[init] init sent to receive worker + ${qrWorkers.length} qr workers; waiting for ready...`)
 
-    // 分开 await + 超时，定位是哪个 worker 卡住
-    const withTimeout = (p: Promise<unknown>, label: string, ms = 8000) =>
-      Promise.race([
-        p.then(() => dbg(`[init] ${label} READY ✓`)),
-        new Promise<void>((_, reject) =>
-          setTimeout(() => reject(new Error(`${label} timeout (${ms}ms)`)), ms)
-        ),
-      ])
     try {
-      await withTimeout(recvReady, "receive worker")
-      await withTimeout(qrReady, "qr worker pool")
+      await Promise.all([
+        recvReady.then(() => dbg("[init] receive worker READY ✓")),
+        qrReady.then(() => dbg("[init] qr worker pool READY ✓")),
+      ])
     } catch (e) {
       dbg(`[init] FAILED: ${e instanceof Error ? e.message : String(e)}`)
       setError(

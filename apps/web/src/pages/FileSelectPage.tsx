@@ -5,8 +5,9 @@
  *    (showDirectoryPicker / <input webkitdirectory>) → recursively walk & append
  *  - 添加文字（上方右侧按钮）：modal → text item (keeps content string)
  *  - 添加文件（下方大拖放区 dropzone，全页拖放/点击）：append file items
- *  - 发送：explicit confirm → parent stages (single pure text → one UTF8_TEXT
- *    manifest entry; otherwise files + text-as-.txt → AF2 Manifest entries)
+ *  - 播放：explicit confirm → parent prepares & encodes, then jumps straight
+ *    to the QR play page (single pure text → one UTF8_TEXT manifest entry;
+ *    otherwise files + text-as-.txt → AF2 Manifest entries)
  */
 import { useCallback, useEffect, useRef, useState } from "react"
 import {
@@ -25,7 +26,9 @@ import { MAX_ORIGINAL_BYTES, MAX_ORIGINAL_MIB, type PendingItem } from "@/types"
 interface Props {
   items: PendingItem[]
   onItemsChange: (items: PendingItem[]) => void
-  onSend: () => void
+  onPlay: () => void
+  /** Non-null while the parent is preparing files / initializing the encoder. */
+  busyLabel: string | null
 }
 
 function formatBytes(n: number): string {
@@ -165,7 +168,7 @@ function isFileDrag(dataTransfer: DataTransfer | null): boolean {
   return Array.from(dataTransfer.types).includes("Files")
 }
 
-export function FileSelectPage({ items, onItemsChange, onSend }: Props) {
+export function FileSelectPage({ items, onItemsChange, onPlay, busyLabel }: Props) {
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const folderInputRef = useRef<HTMLInputElement | null>(null)
   const dragDepthRef = useRef(0)
@@ -409,15 +412,17 @@ export function FileSelectPage({ items, onItemsChange, onSend }: Props) {
     [onItemsChange]
   )
 
-  const canSend = items.length > 0 && !isReadingDrop
+  const busy = busyLabel != null
+  const canSend = items.length > 0 && !isReadingDrop && !busy
   const sendLabel =
-    isReadingDrop
+    busyLabel ??
+    (isReadingDrop
       ? "正在读取拖入内容…"
       : !canSend
-        ? "发送"
+        ? "播放"
         : items.length > 1
-          ? `发送（${items.length} 项）`
-          : "发送"
+          ? `播放（${items.length} 项）`
+          : "播放")
   /** Total original bytes of the selected items (pre-compression). */
   const selectedBytes = totalSize(items)
   /**
@@ -426,8 +431,8 @@ export function FileSelectPage({ items, onItemsChange, onSend }: Props) {
    * protocol capacity with no 256 MiB ceiling.
    */
   const handleSendClick = useCallback(() => {
-    onSend()
-  }, [onSend])
+    onPlay()
+  }, [onPlay])
 
   return (
     <div className="page">

@@ -1,7 +1,7 @@
 /**
  * AirFerry options / sender page (AF2 protocol).
  *
- * Route: select → params → play → stats.
+ * Route: select (with settings modal/page) → play → stats.
  */
 import { useCallback, useEffect, useRef, useState } from "react"
 import {
@@ -11,10 +11,9 @@ import {
   type TransferConfig,
   loadConfig,
   saveConfig,
-  normalizeConfig,
 } from "@/types"
 import { FileSelectPage } from "@/pages/FileSelectPage"
-import { ParamsPage } from "@/pages/ParamsPage"
+import { SettingsPage } from "@/pages/SettingsPage"
 import { PlayPage } from "@/pages/PlayPage"
 import { StatsPage } from "@/pages/StatsPage"
 import {
@@ -27,6 +26,7 @@ import {
   type ChunkEncoding,
   prepareChunkEncodings,
 } from "@/lib/chunk-encode"
+import { SettingsIcon } from "@/components/icons"
 import type { PreparedItem } from "@/workers/compress.worker"
 import "@/assets/app.css"
 
@@ -103,12 +103,19 @@ export default function App() {
     error: null,
   })
 
+  const epoch = useRef(0)
+  const issuedEpoch = useRef(-1)
+  const workerRef = useRef<Worker | null>(null)
+  const restartWorkerRef = useRef<() => void>(() => undefined)
+  const mountedRef = useRef(true)
   const ownedSessionRef = useRef<SenderSessionWasm | null>(null)
-  const mountedRef = useRef(false)
+
   const releaseOwnedSession = useCallback(() => {
-    const session = ownedSessionRef.current
-    ownedSessionRef.current = null
-    freeSenderSession(session)
+    const s = ownedSessionRef.current
+    if (s) {
+      ownedSessionRef.current = null
+      freeSenderSession(s)
+    }
   }, [])
 
   useEffect(() => {
@@ -119,27 +126,8 @@ export default function App() {
     }
   }, [releaseOwnedSession])
 
-  const epoch = useRef(0)
-  const issuedEpoch = useRef(-1)
-  const workerRef = useRef<Worker | null>(null)
-  const restartWorkerRef = useRef<() => void>(() => undefined)
-
-  const go = useCallback((page: Page) => {
-    if (page === "select") {
-      epoch.current += 1
-      if (issuedEpoch.current >= 0) restartWorkerRef.current()
-      issuedEpoch.current = -1
-      setState((s) => ({
-        ...s,
-        page,
-        compressPhase: null,
-      }))
-      return
-    }
-    setState((s) => ({ ...s, page }))
-  }, [])
-
   useEffect(() => {
+    if (typeof window === "undefined") return
     let worker: Worker | null = null
     let disposed = false
     const handler = (e: MessageEvent) => {
@@ -180,10 +168,10 @@ export default function App() {
         setState((s) => ({
           ...s,
           prepared: payload,
-          page: "params",
           compressPhase: null,
           error: null,
         }))
+        void startPlaybackWithPayload(payload, epoch.current)
       }
     }
 
@@ -251,41 +239,8 @@ export default function App() {
     }))
   }, [releaseOwnedSession])
 
-  const onSend = useCallback(() => {
-    const items = state.items
-    if (items.length === 0) return
-    if (state.compressPhase != null) return
-    const worker = workerRef.current
-    if (!worker) {
-      setState((s) => ({ ...s, error: "文件处理线程尚未就绪，请重试" }))
-      return
-    }
-    epoch.current += 1
-    const e = epoch.current
-    issuedEpoch.current = e
-    releaseOwnedSession()
-    setState((s) => ({
-      ...s,
-      session: null,
-      compressPhase: "reading",
-      error: null,
-    }))
-    if (items.length === 1 && items[0].kind === "text") {
-      worker.postMessage({
-        jobId: e,
-        text: items[0].content,
-        name: items[0].name,
-      })
-    } else {
-      worker.postMessage({ jobId: e, files: itemsToFiles(items) })
-    }
-  }, [state.items, state.compressPhase, releaseOwnedSession])
-
-  const onStart = useCallback(async () => {
-    if (!state.prepared) return
-    const startEpoch = epoch.current
+  const startPlaybackWithPayload = useCallback(async (p: PreparedPayload, startEpoch: number) => {
     const cfg = state.config
-    const p = state.prepared
     setState((s) => ({ ...s, initializing: true, error: null }))
     try {
       await ensureWasm()
@@ -295,17 +250,7 @@ export default function App() {
         }
         return
       }
-      // §9.3 resend cache (SPEC §10.2): same selection + chunk_raw_size hits
-      // the stored encoded Manifest and skips the whole BLAKE3 hash pass.
-      // Advisory — every step below falls back to the full build on miss,
-      // stale entry, or any cache error. Note: `build`/`build_cached` consume
-      // the builder (wasm-bindgen by-value), so each attempt needs its own.
       const chunkRawSize = 8 * 1024 * 1024
-      // Balanced chunk pre-encode (SPEC §10.1 sender policy): classify and
-      // compress every chunk NOW so the rAF play loop never compresses.
-      // channelBps = playout payload rate (fps × T × QR count) drives the
-      // p6 escalation; single-chunk transfers escalate unconditionally.
-      // Advisory — any failure falls back to the lazy play-time path.
       const channelBps = Math.round(
         cfg.symbolSize * (cfg.fps || 60) * Math.max(1, cfg.multiQr || 1)
       )
@@ -355,7 +300,6 @@ export default function App() {
               cfg.redundancyPct
             )
           } catch (e) {
-            // Stale/corrupt cache entry — fall through to a full rebuild.
             console.warn("cached manifest unusable, rebuilding:", e)
             session = null
           }
@@ -365,7 +309,6 @@ export default function App() {
       }
       if (!session) {
         session = fillBuilder().build(cfg.symbolSize, chunkRawSize, cfg.redundancyPct)
-        // Only cache what a fresh build produced — never a fallback session.
         try {
           await putCachedManifest(p.items, session.manifest_json(), chunkRawSize)
         } catch {
@@ -391,7 +334,37 @@ export default function App() {
         error: `编码器初始化失败: ${e?.message || e}`,
       }))
     }
-  }, [state.prepared, state.config, releaseOwnedSession])
+  }, [state.config, releaseOwnedSession])
+
+  const onPlay = useCallback(() => {
+    const items = state.items
+    if (items.length === 0) return
+    if (state.compressPhase != null || state.initializing) return
+    const worker = workerRef.current
+    if (!worker) {
+      setState((s) => ({ ...s, error: "文件处理线程尚未就绪，请重试" }))
+      return
+    }
+    epoch.current += 1
+    const e = epoch.current
+    issuedEpoch.current = e
+    releaseOwnedSession()
+    setState((s) => ({
+      ...s,
+      session: null,
+      compressPhase: "reading",
+      error: null,
+    }))
+    if (items.length === 1 && items[0].kind === "text") {
+      worker.postMessage({
+        jobId: e,
+        text: items[0].content,
+        name: items[0].name,
+      })
+    } else {
+      worker.postMessage({ jobId: e, files: itemsToFiles(items) })
+    }
+  }, [state.items, state.compressPhase, state.initializing, releaseOwnedSession])
 
   const updateConfig = useCallback(
     (patch: Partial<TransferConfig>) =>
@@ -404,59 +377,82 @@ export default function App() {
   )
 
   const stopPlayback = useCallback(() => {
+    setState((s) => ({
+      ...s,
+      page: "stats",
+      initializing: false,
+      error: null,
+    }))
+  }, [])
+
+  const closeStats = useCallback(() => {
     releaseOwnedSession()
     setState((s) => ({
       ...s,
       session: null,
-      page: s.prepared ? "params" : "select",
+      page: "select",
+      prepared: null,
       initializing: false,
       error: null,
     }))
   }, [releaseOwnedSession])
 
+  const busyLabel =
+    state.compressPhase === "reading"
+      ? "正在读取文件…"
+      : state.initializing
+      ? "正在准备编码…"
+      : null
+
   return (
     <div className="app">
-      <header className="app-header">
-        <div className="app-logo">
-          <img src={iconUrl} alt="AirFerry" />
+      <header className="app-header" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "14px" }}>
+          <div className="app-logo">
+            <img src={iconUrl} alt="AirFerry" />
+          </div>
+          <div className="app-title">
+            <h1>AirFerry</h1>
+          </div>
         </div>
-        <div className="app-title">
-          <h1>AirFerry</h1>
-        </div>
+        {state.page !== "settings" && (
+          <button
+            type="button"
+            className="btn secondary btn-sm"
+            style={{ display: "flex", alignItems: "center", gap: "6px" }}
+            onClick={() => setState((s) => ({ ...s, page: "settings" }))}
+            title="传输设置"
+          >
+            <SettingsIcon size={16} />
+            <span>设置</span>
+          </button>
+        )}
       </header>
-      <div className="steps">
-        <div
-          className={`step ${state.page === "select" ? "active" : state.prepared ? "done" : ""}`}
-          onClick={() => go("select")}
-        >
-          <span className="step-dot">1</span>
-          <span className="step-label">选择文件</span>
+      {state.page !== "settings" && (
+        <div className="steps">
+          <div
+            className={`step ${state.page === "select" ? "active" : state.session ? "done" : ""}`}
+            onClick={() => state.page !== "play" && setState((s) => ({ ...s, page: "select" }))}
+          >
+            <span className="step-dot">1</span>
+            <span className="step-label">选择文件</span>
+          </div>
+          <div className="step-line" />
+          <div
+            className={`step ${state.page === "play" ? "active" : state.page === "stats" ? "done" : ""}`}
+          >
+            <span className="step-dot">2</span>
+            <span className="step-label">播放传输</span>
+          </div>
+          <div className="step-line" />
+          <div
+            className={`step ${state.page === "stats" ? "active" : ""}`}
+          >
+            <span className="step-dot">3</span>
+            <span className="step-label">传输统计</span>
+          </div>
         </div>
-        <div className="step-line" />
-        <div
-          className={`step ${state.page === "params" ? "active" : state.session ? "done" : ""}`}
-          onClick={() => state.prepared && go("params")}
-        >
-          <span className="step-dot">2</span>
-          <span className="step-label">传输参数</span>
-        </div>
-        <div className="step-line" />
-        <div
-          className={`step ${state.page === "play" ? "active" : ""}`}
-          onClick={() => state.session && go("play")}
-        >
-          <span className="step-dot">3</span>
-          <span className="step-label">播放传输</span>
-        </div>
-        <div className="step-line" />
-        <div
-          className={`step ${state.page === "stats" ? "active" : ""}`}
-          onClick={() => state.session && go("stats")}
-        >
-          <span className="step-dot">4</span>
-          <span className="step-label">统计</span>
-        </div>
-      </div>
+      )}
       <main className="app-main">
         {state.error && (
           <div className="error-banner" role="alert">
@@ -467,20 +463,15 @@ export default function App() {
           <FileSelectPage
             items={state.items}
             onItemsChange={onItemsChange}
-            onSend={onSend}
+            onPlay={onPlay}
+            busyLabel={busyLabel}
           />
         )}
-        {state.page === "params" && state.prepared && (
-          <ParamsPage
-            items={state.items}
-            displayName={state.prepared.displayName}
-            originalSize={state.prepared.totalBytes}
-            isBundle={state.items.length > 1}
-            isText={state.items.length === 1 && state.items[0].kind === "text"}
+        {state.page === "settings" && (
+          <SettingsPage
             config={state.config}
             onChange={updateConfig}
-            onStart={onStart}
-            initializing={state.initializing}
+            onBack={() => setState((s) => ({ ...s, page: "select" }))}
           />
         )}
         {state.page === "play" && state.session && state.prepared && (
@@ -495,6 +486,7 @@ export default function App() {
           <StatsPage
             session={state.session}
             fileSize={state.prepared?.totalBytes ?? 0}
+            onClose={closeStats}
           />
         )}
       </main>
