@@ -7,7 +7,9 @@
  *     → requestVideoFrameCallback captures a frame
  *       → qr-decode.worker (FAST ZXing-C++ WASM) decodes all QR payloads
  *         → receive.worker ingests them (serial; Rust receiver not thread-safe)
- *           → on complete: assemble_raw → JS decompress → CRC → parse
+ *           → on complete: assemble canonical stream → verify_final_stream
+ *             (chunk table + entry hashes + UTF-8 + Content ID) → materialize
+ *             entries per the Manifest
  *
  * The entry screen shows a source selector (camera / screen capture). The
  * screen option is hidden where getDisplayMedia is unavailable (mobile

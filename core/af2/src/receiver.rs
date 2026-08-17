@@ -1381,4 +1381,136 @@ mod tests {
             Err(FinalizeError::ContentId)
         );
     }
+
+    /// Build one self-consistent chunk object (META + symbol frames) for a
+    /// given transfer — the bytes are entirely the caller's choice, so this
+    /// also models a malicious broadcast whose chunks contradict the Manifest.
+    fn build_chunk_object(
+        tid: [u8; 16],
+        index: u32,
+        raw: &[u8],
+        t: usize,
+    ) -> (Vec<u8>, Vec<Vec<u8>>, Vec<u8>) {
+        let (codec, encoded) = crate::chunk::encode_chunk(raw);
+        let (c_meta_obj, c_symbols) = raptorq_encode_object(&encoded, t);
+        let encoded_hash = hash(&encoded);
+        let chunk_oid = crate::id::object_id(
+            &tid,
+            ROLE_CHUNK,
+            index,
+            codec,
+            FEC_ID_RAPTORQ,
+            &c_meta_obj.oti_bytes,
+            &encoded_hash,
+        );
+        let c_meta = ObjectMetaRecord {
+            role: ROLE_CHUNK,
+            transfer_id: tid,
+            object_index: index,
+            codec_id: codec,
+            fec_id: FEC_ID_RAPTORQ,
+            oti: c_meta_obj.oti_bytes,
+            raw_hash: hash(raw),
+            encoded_hash,
+            extensions: vec![],
+        };
+        let meta_frame = Af2Frame {
+            frame_type: FrameType::ObjectMeta,
+            object_id: chunk_oid,
+            sbn: 0,
+            esi: 0,
+            body: c_meta.encode().unwrap(),
+            t,
+        }
+        .to_bytes()
+        .unwrap();
+        let symbol_frames: Vec<Vec<u8>> = c_symbols
+            .iter()
+            .map(|(sbn, esi, body)| {
+                Af2Frame {
+                    frame_type: FrameType::Symbol,
+                    object_id: chunk_oid,
+                    sbn: *sbn,
+                    esi: *esi,
+                    body: body.clone(),
+                    t,
+                }
+                .to_bytes()
+                .unwrap()
+            })
+            .collect();
+        (meta_frame, symbol_frames, raw.to_vec())
+    }
+
+    #[test]
+    fn malicious_chunk_contradicting_manifest_is_rejected() {
+        let good_data = vec![1u8; 4000];
+        let bc = build_broadcast(&good_data, 1 << 20, 1024);
+        let mut rx = Af2Receiver::new();
+        // Lock ROOT and fully recover the Manifest first.
+        assert_eq!(rx.ingest(&bc.root_frame).unwrap(), IngestEvent::RootLocked);
+        assert_eq!(
+            rx.ingest(&bc.manifest_meta_frame).unwrap(),
+            IngestEvent::MetaBound { role: ROLE_MANIFEST, object_index: 0 }
+        );
+        for f in &bc.manifest_symbol_frames {
+            let _ = rx.ingest(f).unwrap();
+        }
+        assert!(rx.manifest().is_some(), "manifest must be ready");
+        // A self-consistent chunk object for the SAME transfer id whose bytes
+        // differ from what the manifest's chunk-hash table declares.
+        let evil = vec![2u8; 4000];
+        let (meta_f, sym_f, evil_raw) = build_chunk_object(bc.tid, 0, &evil, 1024);
+        assert_eq!(
+            rx.ingest(&meta_f).unwrap(),
+            IngestEvent::MetaBound { role: ROLE_CHUNK, object_index: 0 }
+        );
+        let mut rejected = false;
+        for f in &sym_f {
+            if rx.ingest(f).unwrap() == IngestEvent::ChunkRejected {
+                rejected = true;
+            }
+        }
+        assert!(rejected, "chunk contradicting the manifest must be rejected");
+        assert!(!rx.verify_chunk(0, &evil_raw));
+        assert!(rx.verify_chunk(0, &good_data));
+    }
+
+    #[test]
+    fn chunk_staged_before_manifest_is_verified_when_manifest_arrives() {
+        let good_data = vec![1u8; 4000];
+        let bc = build_broadcast(&good_data, 1 << 20, 1024);
+        let mut rx = Af2Receiver::new();
+        assert_eq!(rx.ingest(&bc.root_frame).unwrap(), IngestEvent::RootLocked);
+        // A chunk object arrives BEFORE the Manifest: there is no table to
+        // check against yet, so it is staged (ChunkReady), not rejected.
+        let evil = vec![2u8; 4000];
+        let (meta_f, sym_f, evil_raw) = build_chunk_object(bc.tid, 0, &evil, 1024);
+        assert_eq!(
+            rx.ingest(&meta_f).unwrap(),
+            IngestEvent::MetaBound { role: ROLE_CHUNK, object_index: 0 }
+        );
+        let mut staged = false;
+        for f in &sym_f {
+            if matches!(
+                rx.ingest(f).unwrap(),
+                IngestEvent::ChunkReady { .. } | IngestEvent::ChunkRejected
+            ) {
+                staged = true;
+            }
+        }
+        assert!(staged, "pre-manifest chunk is staged (no table yet)");
+        assert!(!rx.verify_chunk(0, &evil_raw), "no manifest yet");
+        // Manifest arrives: the host can now decide with the ROOT-bound table.
+        assert_eq!(
+            rx.ingest(&bc.manifest_meta_frame).unwrap(),
+            IngestEvent::MetaBound { role: ROLE_MANIFEST, object_index: 0 }
+        );
+        for f in &bc.manifest_symbol_frames {
+            let _ = rx.ingest(f).unwrap();
+        }
+        assert!(rx.manifest().is_some());
+        assert!(!rx.verify_chunk(0, &evil_raw), "evil chunk fails the table");
+        assert!(rx.verify_chunk(0, &good_data), "good chunk passes");
+    }
 }

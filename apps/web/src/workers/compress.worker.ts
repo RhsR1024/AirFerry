@@ -52,7 +52,9 @@ self.addEventListener("message", async (e: MessageEvent) => {
     let displayName = "传输内容"
 
     if (typeof text === "string") {
-      const cleanName = (name || "文字消息.txt").trim()
+      // NFC-normalize: the AF2 manifest validates paths as Unicode NFC and
+      // rejects combining marks (macOS delivers NFD filenames by default).
+      const cleanName = (name || "文字消息.txt").trim().normalize("NFC")
       displayName = cleanName
       const encoded = new TextEncoder().encode(text)
       totalBytes = encoded.byteLength
@@ -75,7 +77,7 @@ self.addEventListener("message", async (e: MessageEvent) => {
         if (buffer.byteLength !== file.size) {
           throw new Error(`文件读取截断: ${file.name} 期望 ${file.size} 字节，实际读取 ${buffer.byteLength} 字节`)
         }
-        let filePath = file.name || "unnamed"
+        let filePath = (file.name || "unnamed").normalize("NFC")
         if (usedPaths.has(filePath)) {
           let counter = 1
           const dotIdx = filePath.lastIndexOf(".")
