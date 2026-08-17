@@ -52,12 +52,11 @@ export interface TransferConfig {
 export type SpeedPreset = "stable" | "fast" | "extreme" | "aggressive" | "turbo" | "max"
 
 /**
- * Receiver budget for the original (post-decompression) size, mirrored from
- * `raptorq_core::MAX_ORIGINAL_BYTES`. What the sender's select page checks
- * against when warning about an oversized selection: a highly compressible
- * object can be under the wire ceiling yet far above it once expanded.
+ * AF2 wire capacity for total raw content (4 TiB, §6/§15).
+ * Per-chunk streaming and OPFS storage have superseded the v1 256 MiB
+ * in-memory receiver ceiling.
  */
-export const MAX_ORIGINAL_BYTES = 256 * 1024 * 1024
+export const MAX_ORIGINAL_BYTES = 4 * 1024 * 1024 * 1024 * 1024
 export const MAX_ORIGINAL_MIB = MAX_ORIGINAL_BYTES / (1024 * 1024)
 
 export interface SpeedPresetDef {

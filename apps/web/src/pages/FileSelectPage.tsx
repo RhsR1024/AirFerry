@@ -421,18 +421,13 @@ export function FileSelectPage({ items, onItemsChange, onSend }: Props) {
   /** Total original bytes of the selected items (pre-compression). */
   const selectedBytes = totalSize(items)
   /**
-   * A single real file is split into bounded chunks by the Rust sender, so it
-   * has no 256 MiB receiver-budget ceiling. Text and multi-file bundles that
-   * would exceed the budget still trigger an oversize confirmation first.
+   * AF2 streams everything in 8 MiB canonical chunks with OPFS/disk spill on
+   * receivers, so all content types (single file, text, bundles) share the 4 TiB
+   * protocol capacity with no 256 MiB ceiling.
    */
   const handleSendClick = useCallback(() => {
-    const isSegmentableSingleFile = items.length === 1 && items[0].kind === "file"
-    if (selectedBytes > MAX_ORIGINAL_BYTES && !isSegmentableSingleFile) {
-      setOversizeConfirm(true)
-      return
-    }
     onSend()
-  }, [items, selectedBytes, onSend])
+  }, [onSend])
 
   return (
     <div className="page">
