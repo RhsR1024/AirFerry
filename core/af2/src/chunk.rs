@@ -9,9 +9,7 @@
 //! (`ZSTD_WINDOW_LOG_MAX=23`) and XZ memory caps via the same decoder stack —
 //! one implementation, three ends.
 
-use crate::meta::CODEC_RAW;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::meta::{CODEC_XZ, CODEC_ZSTD};
+use crate::meta::{CODEC_RAW, CODEC_XZ, CODEC_ZSTD};
 
 pub const MAX_ZSTD_WINDOW_LOG: u32 = 23;
 pub const MAX_XZ_DICT_BYTES: u64 = 32 << 20;
@@ -27,9 +25,6 @@ pub enum ChunkError {
     Decompress(String),
     #[error("chunk: unknown codec id {0}")]
     UnknownCodec(u8),
-    #[cfg(target_arch = "wasm32")]
-    #[error("chunk: codec {0} is not supported on this target")]
-    UnsupportedCodec(u8),
 }
 
 /// Encode one chunk: try Zstd then Xz, keep a compressed tag ONLY when it is
@@ -66,11 +61,17 @@ pub fn encode_chunk(raw: &[u8]) -> (u8, Vec<u8>) {
 
 /// Decode one chunk with full bounded verification. `expected_raw_len` is the
 /// canonical chunk length (from ROOT); the output must match it exactly.
-#[cfg(not(target_arch = "wasm32"))]
+/// `chunk_raw_size` (also from ROOT) bounds the XZ declared dictionary
+/// (§10.1: dict ≤ min(chunk_raw_size, 32 MiB)).
+///
+/// The §10.1 wire structure (single frame/stream, no trailing bytes, bounded
+/// window/dict) is enforced by qr-protocol's decoder stack on every target —
+/// native (libzstd/liblzma) and wasm32 (ruzstd/lzma-rs) alike.
 pub fn decode_chunk(
     codec_id: u8,
     encoded: &[u8],
     expected_raw_len: usize,
+    chunk_raw_size: u32,
 ) -> Result<Vec<u8>, ChunkError> {
     match codec_id {
         CODEC_RAW => {
@@ -82,62 +83,47 @@ pub fn decode_chunk(
             }
             Ok(encoded.to_vec())
         }
-        CODEC_ZSTD | CODEC_XZ => {
-            // Reject a compressed tag that is NOT strictly smaller than the
-            // canonical raw length (protocol invariant, enforced on receipt).
-            if encoded.len() >= expected_raw_len {
-                return Err(ChunkError::NotStrictlySmaller {
-                    encoded: encoded.len(),
-                    raw: expected_raw_len,
-                });
-            }
-            let tag = if codec_id == CODEC_ZSTD {
-                qr_protocol::compress::COMPRESSION_ZSTD
-            } else {
-                qr_protocol::compress::COMPRESSION_XZ
-            };
-            let out = qr_protocol::compress::decompress_with_limit(
-                encoded,
-                tag,
-                // Exact expected length: anything longer is a violation.
-                expected_raw_len,
-            )
-            .map_err(|e| ChunkError::Decompress(e.to_string()))?;
-            if out.len() != expected_raw_len {
-                return Err(ChunkError::SizeMismatch {
-                    expected: expected_raw_len,
-                    got: out.len(),
-                });
-            }
-            Ok(out)
-        }
+        CODEC_ZSTD | CODEC_XZ => decode_compressed(codec_id, encoded, expected_raw_len, chunk_raw_size),
         other => Err(ChunkError::UnknownCodec(other)),
     }
 }
 
-#[cfg(target_arch = "wasm32")]
-pub fn decode_chunk(
+/// Compressed-tag path shared by both targets: the strictly-smaller
+/// invariant, then qr-protocol's §10.1-bounded decoder.
+fn decode_compressed(
     codec_id: u8,
     encoded: &[u8],
     expected_raw_len: usize,
+    chunk_raw_size: u32,
 ) -> Result<Vec<u8>, ChunkError> {
-    // Compressed codecs cannot be decoded on wasm32 (no C library). Fail fast
-    // with an explicit error instead of passing the still-compressed bytes
-    // through as if they were raw — the previous passthrough relied on the
-    // caller's raw_hash check to catch it, which turns a protocol violation
-    // into a generic hash mismatch instead of a clear "unsupported codec".
-    match codec_id {
-        CODEC_RAW => {
-            if encoded.len() != expected_raw_len {
-                return Err(ChunkError::SizeMismatch {
-                    expected: expected_raw_len,
-                    got: encoded.len(),
-                });
-            }
-            Ok(encoded.to_vec())
-        }
-        other => Err(ChunkError::UnsupportedCodec(other)),
+    // Reject a compressed tag that is NOT strictly smaller than the
+    // canonical raw length (protocol invariant, enforced on receipt).
+    if encoded.len() >= expected_raw_len {
+        return Err(ChunkError::NotStrictlySmaller {
+            encoded: encoded.len(),
+            raw: expected_raw_len,
+        });
     }
+    let tag = if codec_id == CODEC_ZSTD {
+        qr_protocol::compress::COMPRESSION_ZSTD
+    } else {
+        qr_protocol::compress::COMPRESSION_XZ
+    };
+    let out = qr_protocol::compress::decompress_chunk(
+        encoded,
+        tag,
+        // Exact expected length: anything longer is a violation.
+        expected_raw_len,
+        chunk_raw_size,
+    )
+    .map_err(|e| ChunkError::Decompress(e.to_string()))?;
+    if out.len() != expected_raw_len {
+        return Err(ChunkError::SizeMismatch {
+            expected: expected_raw_len,
+            got: out.len(),
+        });
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -157,6 +143,9 @@ mod tests {
         v
     }
 
+    /// Round-trip chunk_raw_size used by the tests below.
+    const CRS: u32 = 8 << 20;
+
     #[test]
     fn round_trip_all_codecs_and_boundaries() {
         // {empty, 1B, symbol-ish 1024, chunk-ish} × {incompressible, compressible}.
@@ -170,7 +159,7 @@ mod tests {
         ];
         for raw in cases {
             let (codec, encoded) = encode_chunk(&raw);
-            let out = decode_chunk(codec, &encoded, raw.len()).unwrap();
+            let out = decode_chunk(codec, &encoded, raw.len(), CRS).unwrap();
             assert_eq!(out, raw);
             if codec != CODEC_RAW {
                 assert!(encoded.len() < raw.len(), "strictly-smaller invariant");
@@ -188,19 +177,38 @@ mod tests {
         assert!(z.len() < raw.len());
         // Claim canonical raw == z.len() - 1 (smaller than encoded) → violation.
         assert!(matches!(
-            decode_chunk(CODEC_ZSTD, &z, z.len() - 1),
+            decode_chunk(CODEC_ZSTD, &z, z.len() - 1, CRS),
             Err(ChunkError::NotStrictlySmaller { .. })
         ));
         // Claim a longer canonical length → exact-size mismatch after decode.
         assert!(matches!(
-            decode_chunk(CODEC_ZSTD, &z, raw.len() + 1),
+            decode_chunk(CODEC_ZSTD, &z, raw.len() + 1, CRS),
             Err(ChunkError::SizeMismatch { .. })
         ));
         // Decompression bomb: tiny zstd of huge zeros capped at expected len.
         let bomb = qr_protocol::compress::compress(&vec![0u8; 1 << 22], 1).unwrap();
         assert!(matches!(
-            decode_chunk(CODEC_ZSTD, &bomb, 1024),
+            decode_chunk(CODEC_ZSTD, &bomb, 1024, CRS),
             Err(ChunkError::SizeMismatch { .. }) | Err(ChunkError::Decompress(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_xz_dict_above_chunk_raw_size() {
+        // §10.1: declared dictionary ≤ min(chunk_raw_size, 32 MiB). Build a
+        // stream whose dict (8 MiB at preset 6) exceeds a 1 MiB chunking.
+        let raw = vec![0x5Au8; 300_000];
+        let x = qr_protocol::compress::compress_with(&raw, qr_protocol::compress::COMPRESSION_XZ)
+            .unwrap();
+        assert!(x.len() < raw.len());
+        // The encoder clamps dict ≤ input length (here 256 KiB, the largest
+        // legal size ≤ 300 KB), so a 1 MiB chunking cap passes — but a
+        // fabricated 128 KiB cap (below the declared dict) must be rejected.
+        assert!(decode_chunk(CODEC_XZ, &x, raw.len(), 1 << 20).is_ok());
+        let small_cap = 128 << 10;
+        assert!(matches!(
+            decode_chunk(CODEC_XZ, &x, raw.len(), small_cap),
+            Err(ChunkError::Decompress(_))
         ));
     }
 }

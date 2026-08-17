@@ -25,6 +25,10 @@ zstd = "0.13"
 # compile on wasm32, and the browser compresses in JS anyway, so it stays gated.
 xz2 = "0.1"
 
+[target.wasm32-unknown-unknown.dependencies]
+lzma-rs = "0.3"
+ruzstd = "0.7"
+
 [features]
 default = []
 serde = ["dep:serde", "raptorq-core/serde"]

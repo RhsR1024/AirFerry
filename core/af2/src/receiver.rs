@@ -660,7 +660,8 @@ impl Af2Receiver {
             .total_raw_size
             .saturating_sub(chunk_start)
             .min(u64::from(root.chunk_raw_size)) as usize;
-        let raw = match decode_chunk(meta.codec_id, &encoded, canonical_len) {
+        let raw = match decode_chunk(meta.codec_id, &encoded, canonical_len, root.chunk_raw_size)
+        {
             Ok(v) => v,
             Err(_) => {
                 self.chunk_decoder = None;
