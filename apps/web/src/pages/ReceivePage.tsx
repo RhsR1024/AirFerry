@@ -690,7 +690,7 @@ export function ReceivePage(): React.ReactElement {
               dbg(`[qr#${i}] decoded #${framesDecodedRef.current}: ${n} payload(s)`)
             }
             recv.postMessage({
-              type: "frames",
+              type: "ingest",
               frames: d.payloads,
               jobId: jobIdRef.current,
             })

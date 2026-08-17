@@ -620,8 +620,8 @@ self.addEventListener("message", async (e: MessageEvent) => {
     return
   }
 
-  if (data.type === "ingest") {
-    const frames = data.frames as Uint8Array[]
+  if (data.type === "ingest" || data.type === "frames") {
+    const frames = (data.frames || data.payloads || []) as Uint8Array[]
     const jobId = typeof data.jobId === "number" ? data.jobId : activeJobId
     if (jobId !== activeJobId) return
 

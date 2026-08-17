@@ -121,7 +121,8 @@ function decodeFastY(
           packed[off] | (packed[1 + off] << 8) | (packed[2 + off] << 16) | (packed[3 + off] << 24)
         off += 4
         if (off + len + 16 > packed.length) break
-        if (len >= 64) payloads.push(packed.slice(off, off + len))
+        // AF2 wire frame minimum size is 30 B (Header 26 B + Frame CRC 4 B)
+        if (len >= 30) payloads.push(packed.slice(off, off + len))
         off += len + 16 // payload + 4×s32 bbox
       }
       fastMod._airferry_wasm_free(outPtr)
