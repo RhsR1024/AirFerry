@@ -20,7 +20,11 @@
 
 /// <reference lib="webworker" />
 
-let fastMod: {
+// @ts-expect-error generated emscripten ES6 module has no static d.ts
+import loadAirferryZxing from "@/fastzxing/airferry_zxing.js"
+import zxingWasmUrl from "@/fastzxing/airferry_zxing.wasm?url"
+
+interface FastZxingModule {
   _airferry_wasm_decode_multi_y(
     p: number,
     len: number,
@@ -35,37 +39,19 @@ let fastMod: {
   _free(p: number): void
   HEAPU8: Uint8Array
   HEAPU32: Uint32Array
-} | null = null
+}
+
+let fastMod: FastZxingModule | null = null
 
 /** Load the self-compiled ZXing-C++ WASM (the only backend). */
 async function loadFastBackend(): Promise<void> {
-  // The fast backend is a generated artifact (build-fastzxing.sh,
-  // git-ignored). Its runtime location differs per host build:
-  //  - web receiver PROD copies it to the site root (public/ via
-  //    prepare-wasm.cjs); the worker lives at assets/<hash>.js, so
-  //    "../airferry_zxing.js" resolves to the site root.
-  //  - web DEV serves this worker from its source path via /@fs/, where the
-  //    artifact sits in the sibling ../fastzxing/ output dir of build-fastzxing.sh.
-  // Vite dev answers unknown /@fs/ paths with the SPA index (HTTP 200, HTML
-  // body), so a wrong candidate fails at import() time — try each in order.
-  // Keep @vite-ignore so Vite doesn't try to bundle it (public runtime asset).
-  const candidates = ["../airferry_zxing.js", "../fastzxing/airferry_zxing.js"]
-  let mod: { default: unknown } | undefined
-  let lastErr: unknown
-  for (const rel of candidates) {
-    const moduleUrl = new URL(rel, self.location.href).href
-    try {
-      mod = (await import(/* @vite-ignore */ moduleUrl)) as { default: unknown }
-      break
-    } catch (e) {
-      lastErr = e
-    }
-  }
-  if (!mod) {
-    throw lastErr ?? new Error("FAST ZXing 模块未找到")
-  }
-  const inst = await (mod.default as () => Promise<unknown>)()
-  const m = inst as typeof fastMod
+  if (fastMod) return
+  const initFn = (loadAirferryZxing as unknown as { default?: (opts?: unknown) => Promise<unknown> })
+    .default || (loadAirferryZxing as unknown as (opts?: unknown) => Promise<unknown>)
+  const inst = await initFn({
+    locateFile: (path: string) => (path.endsWith(".wasm") ? zxingWasmUrl : path),
+  })
+  const m = inst as FastZxingModule | null | undefined
   if (!m || m._airferry_wasm_abi_version() !== 1) {
     throw new Error("FAST ZXing ABI 版本不匹配（期望 1）")
   }

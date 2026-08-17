@@ -20,6 +20,7 @@ import init, {
   encode_chunk_balanced,
   plan_chunks,
 } from "@airferry-wasm/transfer_engine.js"
+import wasmUrl from "@airferry-wasm/transfer_engine_bg.wasm?url"
 import { base64ToBuffer } from "./base64"
 
 let initPromise: Promise<void> | null = null
@@ -28,11 +29,12 @@ let initPromise: Promise<void> | null = null
 export function ensureWasm(): Promise<void> {
   if (!initPromise) {
     // Standalone build inlines the wasm as base64 (file:// can't fetch it).
-    // When absent (extension / normal web), pass nothing → the glue derives the
-    // URL from import.meta.url and fetches normally.
+    // When absent (extension / normal web), pass the Vite-resolved asset URL
+    // so both main thread and web workers resolve the .wasm binary accurately.
     const standaloneB64 =
       (globalThis as { __WASM_TRANSFER_ENGINE__?: string }).__WASM_TRANSFER_ENGINE__
-    const pending = init(base64ToBuffer(standaloneB64)).then(() => undefined)
+    const input = standaloneB64 ? base64ToBuffer(standaloneB64) : wasmUrl
+    const pending = init(input).then(() => undefined)
     let retryable: Promise<void>
     retryable = pending.catch((error: unknown) => {
       // A transient fetch/instantiation failure must not poison every later
