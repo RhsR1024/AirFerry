@@ -26,10 +26,9 @@ use jni::JNIEnv;
 
 /// ABI / protocol capability version of this JNI library.
 ///
-/// The outer QR frame format stays at protocol version 1 (`SessionId::derive_segment`
-/// demultiplexes large-file segments by session id); this counter is a
-/// *separate* Android-side capability marker that advances whenever the native
-/// library gains behaviour the Kotlin host depends on.
+/// The wire protocol is AF2 (magic `AF`, wire_version 2, see `docs/SPEC.md`);
+/// this counter is a *separate* Android-side capability marker that advances
+/// whenever the native library gains behaviour the Kotlin host depends on.
 ///
 /// - 1: legacy v1 (pre-AF2) segmented receive path.
 /// - 2: the 16 per-field receiver getters were replaced by the single

@@ -65,46 +65,38 @@ pub fn compress_with(data: &[u8], compression: u8) -> Result<Vec<u8>>;
 pub fn decompress_with(data: &[u8], compression: u8) -> Result<Vec<u8>>;
 ```
 
-### transfer-engine
+### af2 & transfer-engine (Rust)
 
 ```rust
-// 发送端
-pub struct SenderSession { ... }
-impl SenderSession {
+// AF2 发送端（core/af2）
+pub struct Af2Sender { ... }
+impl Af2Sender {
     pub fn new(
-        payload: &[u8],          // 已压缩的负载
-        session_id: SessionId,
-        config: SenderConfig,
-        file_meta: FileMeta,      // 文件名、大小、CRC32、压缩标签
-    ) -> Result<Self>;
-    // 源符号发完后持续产生新鲜修复符号；ESI 达上限时报错停止
-    pub fn next_frame(&mut self) -> Result<Frame>;
-    pub fn stats(&self) -> Stats;
+        items: Vec<(u8, String, Vec<u8>)>, // (kind, path, content); kind: 1=File, 2=UTF8Text, 3=Dir
+        config: SenderConfig,               // symbol_size (256..=2400, %8==0), chunk_raw_size, redundancy_pct
+    ) -> Result<Self, SenderError>;
+    // 自动 playlist：ROOT×4 → META×4 → Manifest symbols → 逐 Chunk (ROOT×1 + META×2 + symbols)
+    // 跨 epoch 循环，持续产生新鲜修复符号（ESI 单调递增永不重复，触 2^24 停止）
+    pub fn next_frame(&mut self) -> Result<Vec<u8>, SenderError>;
+    pub fn transfer_id(&self) -> [u8; 16];
+    pub fn content_id(&self) -> [u8; 32];
 }
 
-pub struct SenderConfig {
-    pub codec: Config,
-    pub redundancy_pct: u8,  // 5–50；仅用于 UI 时长估算，不限制实际修复符号数
-}
-
-// 接收端
+// 传输引擎接收会话（core/transfer-engine）
 pub struct ReceiverSession { ... }
 impl ReceiverSession {
-    pub fn from_first_frame(frame: &Frame) -> Self;     // cache-only 引导
-    pub fn ingest(&mut self, frame: Frame) -> Result<bool>;
+    pub fn new() -> Self;
+    // 摄入单帧字节，返回 packed u64 状态字（bit 0: complete, 1: accepted, 2: manifest_ready, 3: chunk_ready, 8..23: mismatch_streak, 32..63: received_symbols）
+    pub fn ingest(&mut self, frame_bytes: &[u8]) -> u64;
     pub fn is_complete(&self) -> bool;
-    pub fn assemble(&self) -> Option<Vec<u8>>;
-    pub fn progress(&self) -> Progress;                 // 返回快照（按值）
-}
-
-// 文件元数据（携带压缩标签）
-pub struct FileMeta {
-    pub filename: String,
-    pub original_size: u64,
-    pub crc32: u32,
-    pub compression: u8,           // 0=None, 1=Zstd, 2=XZ
-    pub compressed_size: u64,
-    pub compressed_size_known: bool,
+    pub fn snapshot_json(&self) -> String; // Schema 2 快照
+    pub fn progress(&self) -> Progress;
+    pub fn assemble_chunk(&mut self, index: u32) -> Option<Vec<u8>>;
+    pub fn forget_chunk(&mut self, index: u32) -> bool; // 驱逐已落盘 chunk，内存常数化
+    pub fn verify_chunk(&self, index: u32, raw: &[u8]) -> bool; // §11/§12 对 Manifest 哈希表验块
+    pub fn verify_final_stream(&self, stream: &[u8]) -> bool;   // §13 ⑧⑨ 终验（条目哈希、UTF-8、Content ID）
+    pub fn resume(&mut self, root_frame_bytes: &[u8], completed: &[u32]) -> bool; // §12 续传
+    pub fn invalidate_chunk(&mut self, index: u32) -> bool;     // §12 重核失败作废已恢复块
 }
 ```
 
@@ -145,25 +137,29 @@ function encode_qr(frame_bytes: Uint8Array, out_side: Uint32Array): Uint8Array
 class ReceiverSessionWasm {
   constructor()
 
-  // 摄入一帧解码后的 QR 原始字节（26B header + payload + 4B CRC）。返回事件码：
-  //   0=Dropped 1=RootLocked 2=RootMismatch 3=Relocked 4=MetaBound
-  //   5=MetaRejected 6=SymbolAccepted 7=ManifestReady 8=ChunkReady 9=ChunkRejected
-  ingest(frame_bytes: Uint8Array): number
+  // 摄入一帧解码后的 QR 原始字节（26B header + payload + 4B CRC）。
+  // 返回 packed bigint（64位状态字）：bit 0: complete, 1: accepted, 2: manifestReady,
+  // 3: chunkReady, 8..23: mismatchStreak, 32..63: receivedSymbols
+  ingest(frame_bytes: Uint8Array): bigint
 
   // 单 JSON 快照（ReceiverSnapshotV2）：schema_version / meta_confirmed /
-  // transfer_id_hex / content_id_hex / total_raw_size / entry_count / chunk_count /
-  // chunk_raw_size / symbol_size / entries[]。替代旧逐字段 getter。
+  // transfer_id_hex / content_id_hex / root_frame_hex / total_raw_size / entry_count /
+  // chunk_count / chunk_raw_size / symbol_size / legacy_peer_frames / entries[{kind,path,save_path,offset,size}]
   snapshot_json(): string
 
-  // 最近就绪的 chunk（ManifestReady/ChunkReady 后取）：
+  is_complete(): boolean
   last_chunk_index(): number
-  last_chunk_bytes(): Uint8Array
+  assemble_chunk(index: number): Uint8Array
+  forget_chunk(index: number): boolean
+  verify_chunk(index: number, raw: Uint8Array): boolean
+  verify_final_stream(stream: Uint8Array): boolean
+  resume(root_frame_bytes: Uint8Array, completed_indices: Uint32Array): boolean
+  invalidate_chunk(index: number): boolean
 }
 ```
 
-> **WASM 接收端不内置解压**：AF2 下每个 chunk 经 Rust RaptorQ 恢复后由核心按
-> chunk 元数据解压（`chunk_raw_size` 定界），接收 worker 只消费 `last_chunk_bytes`
-> 的已解压字节，不再自选解压器。发送端压缩由 Rust 核心在单趟流水线内完成。
+> **WASM 接收端内置纯 Rust 解压**：AF2 下支持全部三种 codec（RAW、Zstd 经 ruzstd、XZ 经 lzma-rs），
+> Web 接收端已具备解压全部广播的能力；发送端暂以 RAW 发送（单向信道上 RAW 恒合法）。
 
 > **构造参数来源**：条目由 `src/workers/compress.worker.ts`（AF2 file-preparation
 > worker）离线读取产出 `PreparedItem[]`（`{ kind, path, content }`），主线程点「发送」
@@ -185,12 +181,9 @@ object NativeBridge {
     external fun nativeAbiVersion(): Int
 
     /** 创建接收会话；返回不透明指针（Long）。 */
-    external fun receiverCreate(
-        sessionIdLo: Long, sessionIdHi: Long,
-        totalBlocks: Int, totalSymbols: Int, symbolSize: Int
-    ): Long
+    external fun receiverCreate(sessionIdLo: Long, sessionIdHi: Long): Long
 
-    // 摄入一帧；返回 packed Long：完成/接受/mismatch/已收符号数，位布局见 SPEC.md
+    // 摄入一帧；返回 packed Long：完成/接受/manifestReady/chunkReady/mismatch/已收符号数
     external fun receiverIngest(handle: Long, frameBytes: ByteArray): Long
 
     // UI 约 7Hz 拉取完整进度；NUL 结尾 JSON，native 失败可返回 null/空数组
@@ -198,14 +191,18 @@ object NativeBridge {
 
     external fun receiverIsComplete(handle: Long): Int
 
-    // 单 JSON 接收快照（ReceiverSnapshotV1）：文件名/大小/CRC/压缩标签、
-    // 会话 ID 与分段元数据一次取全，替代旧 16 个逐字段 getter
+    // 单 JSON 接收快照（ReceiverSnapshotV2）：文件名/大小/root_frame_hex/
+    // 块大小/符号大小/条目表（含 save_path）/legacy_peer_frames 一次取全
     external fun receiverSnapshotJson(handle: Long): String?
 
     external fun receiverAssembleBytes(handle: Long): ByteArray?
-
-    // 按索引重组 chunk 字节（多文件经 entries + 逐 chunk 还原）
     external fun receiverAssembleChunk(handle: Long, index: Int): ByteArray?
+    external fun receiverLastChunkIndex(handle: Long): Int
+    external fun receiverForgetChunk(handle: Long, index: Int): Boolean
+    external fun receiverVerifyChunk(handle: Long, index: Int, rawBytes: ByteArray): Boolean
+    external fun receiverVerifyFinalStream(handle: Long, streamBytes: ByteArray): Boolean
+    external fun receiverResume(handle: Long, rootFrameBytes: ByteArray, completedIndices: IntArray): Boolean
+    external fun receiverInvalidateChunk(handle: Long, index: Int): Boolean
 
     external fun receiverDestroy(handle: Long)
 }
