@@ -11,12 +11,13 @@
 /// <reference lib="webworker" />
 
 import { ReceiverSessionWasm, ensureWasm } from "@/wasm/loader"
+import { ChunkStore, OpfsJournal, sweepOrphanPartials } from "./receive-storage"
 
 export const KIND_FILE = 1
 export const KIND_UTF8_TEXT = 2
 export const KIND_DIRECTORY = 3
 
-const FINAL_VERIFY_MEM_LIMIT = 64 * 1024 * 1024
+const TEXT_UI_MAX_BYTES = 8 * 1024 * 1024
 
 export interface ManifestEntryDto {
   kind: number
@@ -54,7 +55,7 @@ export interface RecoveredText {
 export interface RecoveredFile {
   kind: "file"
   name: string
-  data: Uint8Array
+  data: Blob
 }
 
 export interface RecoveredBundle {
@@ -63,241 +64,6 @@ export interface RecoveredBundle {
 }
 
 export type Recovered = RecoveredText | RecoveredFile | RecoveredBundle
-
-// ---------------------------------------------------------------------------
-// OPFS / in-memory chunk storage abstraction
-// ---------------------------------------------------------------------------
-
-interface SyncHandleLike {
-  read(buf: ArrayBufferView, options?: { at?: number }): number
-  write(buf: ArrayBufferView, options?: { at?: number }): number
-  flush(): void
-  close(): void
-  getSize(): number
-}
-
-class ChunkStore {
-  private memory = new Map<number, Uint8Array>()
-  private opfsDir: FileSystemDirectoryHandle | null = null
-  private opfsFile: FileSystemFileHandle | null = null
-  private syncHandle: SyncHandleLike | null = null
-  private transferId = ""
-  private completedIndices = new Set<number>()
-
-  async init(dir: FileSystemDirectoryHandle | null, transferIdHex: string): Promise<void> {
-    this.opfsDir = dir
-    this.transferId = transferIdHex
-    if (!dir || !transferIdHex) return
-    try {
-      const fileName = `af2-${transferIdHex}.partial`
-      this.opfsFile = await dir.getFileHandle(fileName, { create: true })
-      // createSyncAccessHandle is synchronous once acquired (Worker-only API).
-      if (typeof (this.opfsFile as any).createSyncAccessHandle === "function") {
-        this.syncHandle = await (this.opfsFile as any).createSyncAccessHandle()
-      }
-    } catch {
-      this.syncHandle = null
-    }
-  }
-
-  writeChunk(index: number, chunkRawSize: number, bytes: Uint8Array): void {
-    this.completedIndices.add(index)
-    if (this.syncHandle && chunkRawSize > 0) {
-      try {
-        const at = index * chunkRawSize
-        this.syncHandle.write(bytes, { at })
-        this.syncHandle.flush()
-        return
-      } catch {
-        // Fall back to memory on write error
-      }
-    }
-    this.memory.set(index, bytes)
-  }
-
-  readRange(offset: number, size: number, totalRawSize: number, chunkRawSize: number): Uint8Array | null {
-    if (size <= 0 || offset < 0) return new Uint8Array(0)
-    if (this.syncHandle) {
-      try {
-        const out = new Uint8Array(size)
-        const read = this.syncHandle.read(out, { at: offset })
-        if (read === size) return out
-      } catch {
-        // fall back to memory
-      }
-    }
-    // In-memory slicing fallback
-    if (this.memory.size === 0) return null
-    const out = new Uint8Array(size)
-    let copied = 0
-    while (copied < size) {
-      const currentOffset = offset + copied
-      const chunkIdx = Math.floor(currentOffset / chunkRawSize)
-      const chunkOffset = currentOffset % chunkRawSize
-      const chunk = this.memory.get(chunkIdx)
-      if (!chunk) return null
-      const toCopy = Math.min(size - copied, chunk.byteLength - chunkOffset)
-      out.set(chunk.subarray(chunkOffset, chunkOffset + toCopy), copied)
-      copied += toCopy
-    }
-    return out
-  }
-
-  readChunk(index: number, chunkRawSize: number, totalRawSize: number): Uint8Array | null {
-    const off = index * chunkRawSize
-    const len = Math.min(chunkRawSize, Math.max(0, totalRawSize - off))
-    return this.readRange(off, len, totalRawSize, chunkRawSize)
-  }
-
-  has(index: number): boolean {
-    return this.completedIndices.has(index)
-  }
-
-  get completedCount(): number {
-    return this.completedIndices.size
-  }
-
-  get completedList(): number[] {
-    return Array.from(this.completedIndices).sort((a, b) => a - b)
-  }
-
-  markResumed(indices: number[]): void {
-    for (const i of indices) this.completedIndices.add(i)
-  }
-
-  invalidate(index: number): void {
-    this.completedIndices.delete(index)
-    this.memory.delete(index)
-  }
-
-  async discard(): Promise<void> {
-    this.memory.clear()
-    this.completedIndices.clear()
-    if (this.syncHandle) {
-      try {
-        this.syncHandle.close()
-      } catch {}
-      this.syncHandle = null
-    }
-    if (this.opfsDir && this.transferId) {
-      try {
-        await this.opfsDir.removeEntry(`af2-${this.transferId}.partial`)
-      } catch {}
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// §12 OPFS Journal
-// ---------------------------------------------------------------------------
-
-class OpfsJournal {
-  private opfsDir: FileSystemDirectoryHandle | null = null
-  private transferId = ""
-  private journalFile: FileSystemFileHandle | null = null
-
-  async init(dir: FileSystemDirectoryHandle | null, transferIdHex: string, crs: number, rootHex: string): Promise<void> {
-    this.opfsDir = dir
-    this.transferId = transferIdHex
-    if (!dir || !transferIdHex) return
-    try {
-      const fileName = `af2-${transferIdHex}.ledger.jsonl`
-      this.journalFile = await dir.getFileHandle(fileName, { create: true })
-      // Header: line 1
-      const header = JSON.stringify({ v: 1, tid: transferIdHex, crs, root: rootHex }) + "\n"
-      const w = await (this.journalFile as any).createWritable({ keepExistingData: false })
-      await w.write(header)
-      await w.close()
-    } catch {
-      this.journalFile = null
-    }
-  }
-
-  async commit(index: number): Promise<void> {
-    if (!this.journalFile) return
-    try {
-      const w = await (this.journalFile as any).createWritable({ keepExistingData: true })
-      const size = (await this.journalFile.getFile()).size
-      await w.seek(size)
-      await w.write(JSON.stringify({ c: index }) + "\n")
-      await w.close()
-    } catch {}
-  }
-
-  async invalidate(index: number): Promise<void> {
-    if (!this.journalFile) return
-    try {
-      const w = await (this.journalFile as any).createWritable({ keepExistingData: true })
-      const size = (await this.journalFile.getFile()).size
-      await w.seek(size)
-      await w.write(JSON.stringify({ i: index }) + "\n")
-      await w.close()
-    } catch {}
-  }
-
-  async discard(): Promise<void> {
-    if (this.opfsDir && this.transferId) {
-      try {
-        await this.opfsDir.removeEntry(`af2-${this.transferId}.ledger.jsonl`)
-      } catch {}
-    }
-  }
-
-  static async loadMostRecent(dir: FileSystemDirectoryHandle | null): Promise<{
-    transferIdHex: string
-    rootFrameBytes: Uint8Array
-    chunkRawSize: number
-    completed: number[]
-  } | null> {
-    if (!dir) return null
-    try {
-      let latestFile: FileSystemFileHandle | null = null
-      let latestMtime = 0
-      for await (const [name, handle] of (dir as any).entries()) {
-        if (typeof name === "string" && name.endsWith(".ledger.jsonl") && handle.kind === "file") {
-          const file = await handle.getFile()
-          if (file.lastModified > latestMtime) {
-            latestMtime = file.lastModified
-            latestFile = handle
-          }
-        }
-      }
-      if (!latestFile) return null
-      const text = await (await latestFile.getFile()).text()
-      const lines = text.split("\n").filter((l) => l.trim().length > 0)
-      if (lines.length === 0) return null
-      const header = JSON.parse(lines[0])
-      if (!header.tid || !header.root) return null
-      const completed = new Set<number>()
-      for (let i = 1; i < lines.length; i++) {
-        try {
-          const o = JSON.parse(lines[i])
-          if (typeof o.c === "number") completed.add(o.c)
-          if (typeof o.i === "number") completed.delete(o.i)
-        } catch {
-          // skip torn line
-        }
-      }
-      return {
-        transferIdHex: header.tid,
-        rootFrameBytes: hexToBytes(header.root),
-        chunkRawSize: header.crs || 8 * 1024 * 1024,
-        completed: Array.from(completed).sort((a, b) => a - b),
-      }
-    } catch {
-      return null
-    }
-  }
-}
-
-function hexToBytes(hex: string): Uint8Array {
-  if (hex.length % 2 !== 0) return new Uint8Array(0)
-  const bytes = new Uint8Array(hex.length / 2)
-  for (let i = 0; i < bytes.length; i++) {
-    bytes[i] = parseInt(hex.substring(i * 2, i * 2 + 2), 16)
-  }
-  return bytes
-}
 
 // ---------------------------------------------------------------------------
 // Worker state
@@ -376,15 +142,33 @@ async function tryResume(): Promise<void> {
   if (resumeChecked || (session && session.is_complete())) return
   resumeChecked = true
   const dir = await getOpfsDir()
-  const latest = await OpfsJournal.loadMostRecent(dir)
-  if (!latest) return
-  if (!session) session = new ReceiverSessionWasm()
-  const ok = session.resume(latest.rootFrameBytes, new Uint32Array(latest.completed))
-  if (ok) {
-    await chunkStore.init(dir, latest.transferIdHex)
+  const attempted = new Set<string>()
+  while (true) {
+    const latest = await OpfsJournal.loadMostRecent(dir)
+    if (!latest) return
+    if (attempted.has(latest.transferIdHex)) return
+    attempted.add(latest.transferIdHex)
+    if (!session) session = new ReceiverSessionWasm()
+    const ok = session.resume(latest.rootFrameBytes, new Uint32Array(latest.completed))
+    if (!ok) {
+      // Structurally valid JSON can still carry a semantically invalid ROOT.
+      // Remove only this unusable candidate, then fall back to the next older
+      // valid journal instead of letting it mask every other resumable task.
+      if (dir) {
+        try { await dir.removeEntry(`af2-${latest.transferIdHex}.ledger.jsonl`) } catch {}
+        try { await dir.removeEntry(`af2-${latest.transferIdHex}.partial`) } catch {}
+      }
+      continue
+    }
+    // Resume must not create an empty .partial file when the durable backing
+    // file has disappeared; reverification below invalidates missing bits so
+    // the sender can re-supply exactly those chunks.
+    await chunkStore.init(dir, latest.transferIdHex, { create: false })
     chunkStore.markResumed(latest.completed)
     pendingReverify = new Set(latest.completed)
-    await journal.init(dir, latest.transferIdHex, latest.chunkRawSize, "")
+    // Rebind without truncating the valid root header / prior commit records.
+    await journal.openExisting(dir, latest.transferIdHex)
+    return
   }
 }
 
@@ -392,9 +176,8 @@ async function reverifyResumedChunks(meta: MetaInfo): Promise<void> {
   if (!pendingReverify || pendingReverify.size === 0 || !session || !meta.metaConfirmed) return
   for (const idx of Array.from(pendingReverify)) {
     const chunkBytes = chunkStore.readChunk(idx, meta.chunkRawSize, meta.totalRawSize)
-    if (!chunkBytes) continue
     pendingReverify.delete(idx)
-    if (!session.verify_chunk(idx, chunkBytes)) {
+    if (!chunkBytes || !session.verify_chunk(idx, chunkBytes)) {
       session.invalidate_chunk(idx)
       chunkStore.invalidate(idx)
       await journal.invalidate(idx)
@@ -426,14 +209,19 @@ async function ingestBatch(frames: Uint8Array[], jobId: number): Promise<{
     const accepted = ((word >> 1n) & 1n) !== 0n
     const manifestReady = ((word >> 2n) & 1n) !== 0n
     const chunkReady = ((word >> 3n) & 1n) !== 0n
+    // Bit 4 is the ONLY relock signal. The old `accepted && received === 0`
+    // heuristic also matched the first accepted META frame of a §12-resumed
+    // session (its received counter is still zero), spuriously deleting the
+    // resumed spill/ledger and making the transfer impossible to finish.
+    const relocked = ((word >> 4n) & 1n) !== 0n
     const receivedSymbols = Number((word >> 32n) & 0xFFFFFFFFn)
 
     if (accepted) {
       acceptedCount++
       totalAcceptedSymbols++
     }
-    if (accepted && receivedSymbols === 0) {
-      // Relocked in native AF2: discard old storage and journal
+    if (relocked) {
+      // A foreign transfer owns the session now: discard old storage and journal
       await chunkStore.discard()
       await journal.discard()
       lastMetaSent = false
@@ -460,11 +248,14 @@ async function ingestBatch(frames: Uint8Array[], jobId: number): Promise<{
         if (!chunkStore.has(idx)) {
           const dir = await getOpfsDir()
           await chunkStore.init(dir, snap.transferIdHex)
-          chunkStore.writeChunk(idx, snap.chunkRawSize, bytes)
-          if (snap.rootFrameHex) {
+          const storage = chunkStore.writeChunk(idx, snap.chunkRawSize, bytes)
+          // Only durable OPFS chunks belong in the crash-resume ledger. A
+          // memory fallback is valid for the current session but must be
+          // retransmitted after a crash.
+          if (storage === "disk" && snap.rootFrameHex) {
             await journal.init(dir, snap.transferIdHex, snap.chunkRawSize, snap.rootFrameHex)
+            await journal.commit(idx)
           }
-          await journal.commit(idx)
         }
         session.forget_chunk(idx)
       }
@@ -599,6 +390,9 @@ self.addEventListener("message", async (e: MessageEvent) => {
     try {
       await ensureWasm()
       await dropSession()
+      // Completed transfers leave their .partial behind (delivered Blobs may
+      // reference it lazily); sweep only old ledger-less backings.
+      await sweepOrphanPartials(await getOpfsDir())
       resumeChecked = false
       activeJobId = typeof data.jobId === "number" ? data.jobId : 0
       post({ type: "ready", jobId: activeJobId })
@@ -615,6 +409,10 @@ self.addEventListener("message", async (e: MessageEvent) => {
 
   if (data.type === "reset") {
     await dropSession()
+    // A completed result's Blob may still be streaming from its OPFS backing
+    // file even though the UI already reset to camera. Reclaim only old
+    // ledger-less spills; freshly released ones get the sweep grace period.
+    await sweepOrphanPartials(await getOpfsDir())
     resumeChecked = false
     activeJobId = typeof data.jobId === "number" ? data.jobId : -1
     return
@@ -660,72 +458,101 @@ self.addEventListener("message", async (e: MessageEvent) => {
         }
       }
 
-      // §11/§13 Integrity Gate:
-      // Transfers ≤ 64 MiB stream through memory for the full §13 ⑧⑨ gate
-      // (entry hashes, UTF-8 text, Content ID). Larger transfers verify each
-      // chunk individually against the Manifest hash table.
-      if (meta.totalRawSize <= FINAL_VERIFY_MEM_LIMIT) {
-        const stream = chunkStore.readRange(0, meta.totalRawSize, meta.totalRawSize, meta.chunkRawSize)
-        if (!stream || !session.verify_final_stream(stream)) {
-          post({
-            type: "error",
-            message: "传输终验失败：条目哈希、UTF-8 或 Content ID 校验未通过",
-            jobId: activeJobId,
-          })
-          return
+      // §11/§13 Integrity Gate: walk the canonical stream one chunk at a time
+      // through the shared Rust incremental final verifier. Large transfers
+      // retain the same entry-hash/UTF-8/Content-ID guarantees as small ones.
+      if (!session.final_verify_begin()) {
+        throw new Error("传输终验初始化失败")
+      }
+      let finalVerifyUsable = true
+      const badChunks: number[] = []
+      for (let i = 0; i < meta.chunkCount; i++) {
+        const chunk = chunkStore.readChunk(i, meta.chunkRawSize, meta.totalRawSize)
+        if (!chunk || !session.verify_chunk(i, chunk)) {
+          // Local spill corruption/missing bytes are repairable: clear all
+          // three completion ledgers and resume scanning so the sender can
+          // re-supply only the affected chunks. Do not tear down OPFS or the
+          // good chunks already received.
+          session.invalidate_chunk(i)
+          chunkStore.invalidate(i)
+          await journal.invalidate(i)
+          badChunks.push(i)
+          finalVerifyUsable = false
+          continue
         }
-      } else {
-        for (let i = 0; i < meta.chunkCount; i++) {
-          const chunk = chunkStore.readChunk(i, meta.chunkRawSize, meta.totalRawSize)
-          if (!chunk || !session.verify_chunk(i, chunk)) {
-            session.invalidate_chunk(i)
-            post({
-              type: "error",
-              message: `分块 ${i + 1}/${meta.chunkCount} 校验失败，请重新接收`,
-              jobId: activeJobId,
-            })
-            return
-          }
+        if (finalVerifyUsable && !session.final_verify_feed(chunk)) {
+          // This is a semantic §13 failure (entry hash / UTF-8 / Content ID),
+          // not evidence that this particular chunk is bad. Keep it distinct
+          // from the repairable chunk-hash path.
+          throw new Error("传输终验失败：条目哈希、UTF-8 或 Content ID 校验未通过")
         }
       }
+      if (badChunks.length > 0) {
+        post({
+          type: "resupply",
+          message: `检测到 ${badChunks.length} 个本地损坏/缺失分块，正在等待发送端重供…`,
+          jobId: activeJobId,
+        })
+        return
+      }
+      if (!session.final_verify_finish()) {
+        post({
+          type: "error",
+          message: "传输终验失败：条目哈希、UTF-8 或 Content ID 校验未通过",
+          jobId: activeJobId,
+        })
+        return
+      }
+
+      // Integrity is final and ingest is stopped. Release the exclusive OPFS
+      // SyncAccessHandle before materializing result Blobs so getFile().slice()
+      // can stay zero/low-copy instead of retaining one ArrayBuffer per chunk.
+      chunkStore.prepareBlobReads()
 
       // 2. Materialize entries from the Manifest entry table using save_path
       const entries = meta.entries.filter((e) => e.kind !== KIND_DIRECTORY)
       let recovered: Recovered
 
-      if (entries.length === 1 && entries[0].kind === KIND_UTF8_TEXT) {
+      if (
+        entries.length === 1 &&
+        entries[0].kind === KIND_UTF8_TEXT &&
+        entries[0].size <= TEXT_UI_MAX_BYTES
+      ) {
         const e0 = entries[0]
-        const slice = chunkStore.readRange(e0.offset, e0.size, meta.totalRawSize, meta.chunkRawSize) || new Uint8Array(0)
-        let text = ""
-        let validUtf8 = true
-        try {
-          text = new TextDecoder("utf-8", { fatal: true }).decode(slice)
-        } catch {
-          text = new TextDecoder("utf-8").decode(slice)
-          validUtf8 = false
-        }
+        const blob = await chunkStore.readRangeBlob(
+          e0.offset, e0.size, meta.totalRawSize, meta.chunkRawSize, "text/plain;charset=utf-8"
+        )
+        if (!blob) throw new Error(`无法读取条目: ${e0.save_path || e0.path}`)
+        // The incremental final gate already proved strict UTF-8 validity.
+        const text = await blob.text()
         recovered = {
           kind: "text",
           text,
-          validUtf8,
+          validUtf8: true,
           name: e0.save_path || e0.path,
         }
       } else if (entries.length === 1) {
         const e0 = entries[0]
-        const slice = chunkStore.readRange(e0.offset, e0.size, meta.totalRawSize, meta.chunkRawSize) || new Uint8Array(0)
+        const blob = await chunkStore.readRangeBlob(
+          e0.offset, e0.size, meta.totalRawSize, meta.chunkRawSize
+        )
+        if (!blob) throw new Error(`无法读取条目: ${e0.save_path || e0.path}`)
         recovered = {
           kind: "file",
           name: e0.save_path || e0.path,
-          data: slice,
+          data: blob,
         }
       } else {
         const files: RecoveredFile[] = []
         for (const e of entries) {
-          const slice = chunkStore.readRange(e.offset, e.size, meta.totalRawSize, meta.chunkRawSize) || new Uint8Array(0)
+          const blob = await chunkStore.readRangeBlob(
+            e.offset, e.size, meta.totalRawSize, meta.chunkRawSize
+          )
+          if (!blob) throw new Error(`无法读取条目: ${e.save_path || e.path}`)
           files.push({
             kind: "file",
             name: e.save_path || e.path,
-            data: slice,
+            data: blob,
           })
         }
         recovered = {
@@ -734,9 +561,12 @@ self.addEventListener("message", async (e: MessageEvent) => {
         }
       }
 
-      // Cleanup OPFS storage on successful assemble
-      await chunkStore.discard()
+      // Delivered Blobs lazily reference the OPFS .partial file — deleting it
+      // now would break the user's download. Drop only the resume ledger and
+      // release the exclusive handle; the .partial is removed on the next
+      // init/reset (dropSession) or by the init-time orphan sweep.
       await journal.discard()
+      chunkStore.release()
 
       post({
         type: "result",

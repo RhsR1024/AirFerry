@@ -240,6 +240,18 @@ internal static class NativeBridge
         EntryPoint = "airferry_receiver_verify_final_stream")]
     public static extern int ReceiverVerifyFinalStream(IntPtr handle, byte[] streamBytes, nuint streamLen);
 
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl,
+        EntryPoint = "airferry_receiver_final_verify_begin")]
+    public static extern int ReceiverFinalVerifyBegin(IntPtr handle);
+
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl,
+        EntryPoint = "airferry_receiver_final_verify_feed")]
+    public static extern int ReceiverFinalVerifyFeed(IntPtr handle, byte[] streamBytes, nuint streamLen);
+
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl,
+        EntryPoint = "airferry_receiver_final_verify_finish")]
+    public static extern int ReceiverFinalVerifyFinish(IntPtr handle);
+
     /// <summary>Restore receiver from stored ROOT frame bytes + completed chunk indices (§12 resume).</summary>
     [DllImport(LibName, CallingConvention = CallingConvention.Cdecl,
         EntryPoint = "airferry_receiver_resume")]
@@ -268,4 +280,6 @@ internal static class NativeBridge
 
     /// <summary>Snapshot ABI: the 16 per-field getters were folded into one JSON.</summary>
     public const uint NativeAbiVersion2 = 2;
+    /// <summary>Bounded-memory incremental final-verification ABI.</summary>
+    public const uint NativeAbiVersion3 = 3;
 }

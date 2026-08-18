@@ -345,6 +345,17 @@ impl Af2Sender {
                 }
             }
         }
+        // The manifest is authoritative for total_raw_size; a silently-skipped
+        // item (e.g. a stale §9.3 cached manifest replayed against a mutated
+        // selection) must fail the build loudly instead of producing tail
+        // chunks sliced from `&[]` that only die at play time.
+        if stream.len() as u64 != manifest.total_raw_size {
+            return Err(SenderError::Config(format!(
+                "assembled stream length {} != manifest total_raw_size {} — item set inconsistent with manifest",
+                stream.len(),
+                manifest.total_raw_size
+            )));
+        }
 
         let chunk_count = manifest.chunk_count as usize;
         let mut chunk_encoders = Vec::with_capacity(chunk_count);

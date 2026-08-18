@@ -189,26 +189,60 @@ public sealed class Af2LedgerStore
         catch { }
     }
 
-    /// <summary>Resume source: the most recent journal in <paramref name="dir"/> (by mtime).</summary>
+    /// <summary>Resume source: the newest valid journal in <paramref name="dir"/>.</summary>
     public static Af2LedgerStore? LoadMostRecent(string dir)
     {
         try
         {
-            FileInfo? latest = new DirectoryInfo(dir)
-                .EnumerateFiles("*.ledger.jsonl")
-                .OrderByDescending(f => f.LastWriteTimeUtc)
-                .FirstOrDefault();
-            if (latest is null)
+            if (!Directory.Exists(dir))
             {
                 return null;
             }
-            var store = new Af2LedgerStore(latest.FullName);
-            return store.Reload() ? store : null;
+            foreach (FileInfo candidate in new DirectoryInfo(dir)
+                         .EnumerateFiles("*.ledger.jsonl")
+                         .OrderByDescending(f => f.LastWriteTimeUtc))
+            {
+                var store = new Af2LedgerStore(candidate.FullName);
+                if (store.Reload()) return store;
+            }
+            return null;
         }
         catch (Exception)
         {
             return null;
         }
+    }
+
+    /// <summary>Remove spill files that have no parseable resume journal.</summary>
+    public static void SweepOrphanPartials(string dir)
+    {
+        if (!Directory.Exists(dir)) return;
+        try
+        {
+            var validTids = new HashSet<string>(StringComparer.Ordinal);
+            foreach (string journal in Directory.EnumerateFiles(dir, "*.ledger.jsonl"))
+            {
+                var store = new Af2LedgerStore(journal);
+                if (store.Reload())
+                {
+                    validTids.Add(store.TransferIdHex);
+                }
+                else
+                {
+                    try { File.Delete(journal); } catch { }
+                }
+            }
+            foreach (string partial in Directory.EnumerateFiles(dir, "af2-*.partial"))
+            {
+                string name = Path.GetFileName(partial);
+                string tid = name.Substring(4, name.Length - 4 - ".partial".Length);
+                if (!validTids.Contains(tid))
+                {
+                    try { File.Delete(partial); } catch { }
+                }
+            }
+        }
+        catch { }
     }
 
     /// <summary>Create + atomically write the header for a fresh transfer's journal.</summary>

@@ -1,6 +1,7 @@
 package com.airferry.app.scan
 
 import java.io.File
+import java.io.FileOutputStream
 import java.io.RandomAccessFile
 
 /**
@@ -22,18 +23,28 @@ class ChunkSpillStore(dir: File, transferIdHex: String) {
 
     private val path = File(dir, "af2-${transferIdHex.ifEmpty { "session" }}.partial")
     private var raf: RandomAccessFile? = null
+    /** Sparse-file length cannot prove which ranges are real (holes read as
+     * zeroes), so track chunks known durable this session / from §12 resume. */
+    private val knownChunks = mutableSetOf<Int>()
 
     /** pwrite one completed chunk at its canonical-stream offset + fsync. */
     fun write(index: Int, chunkRawSize: Int, bytes: ByteArray) {
-        if (index < 0 || chunkRawSize <= 0 || bytes.isEmpty()) return
+        require(index >= 0 && chunkRawSize > 0 && bytes.isNotEmpty()) {
+            "invalid spill chunk"
+        }
         val f = raf ?: RandomAccessFile(path, "rw").also { raf = it }
         f.seek(index.toLong() * chunkRawSize.toLong())
         f.write(bytes)
-        try {
-            f.fd.sync()
-        } catch (e: Exception) {
-            android.util.Log.w("ChunkSpillStore", "flush failed", e)
-        }
+        // §12 durability invariant: the caller may journal + forget the native
+        // chunk only after this returns. Never swallow sync failures here.
+        f.fd.sync()
+        knownChunks.add(index)
+    }
+
+    fun hasChunk(index: Int): Boolean = index in knownChunks
+
+    fun markResumed(indices: IntArray) {
+        for (index in indices) knownChunks.add(index)
     }
 
     /** Current spill size in bytes (0 when nothing was spilled yet). */
@@ -47,8 +58,11 @@ class ChunkSpillStore(dir: File, transferIdHex: String) {
     fun readRange(offset: Long, size: Long): ByteArray? {
         if (offset < 0 || size < 0 || size > Int.MAX_VALUE) return null
         if (!path.isFile && raf == null) return null
+        // Open read-write even for reads: the cached handle is shared with
+        // [write], and a read-only handle cached first would poison every
+        // later chunk spill after a resume re-verify.
         val f = raf ?: try {
-            RandomAccessFile(path, "r").also { raf = it }
+            RandomAccessFile(path, "rw").also { raf = it }
         } catch (_: Exception) {
             return null
         }
@@ -64,6 +78,53 @@ class ChunkSpillStore(dir: File, transferIdHex: String) {
         return out
     }
 
+    /**
+     * Copy one canonical-stream range to a file with bounded memory. The
+     * destination is replaced atomically from the caller's perspective only
+     * after this method returns true; on failure the partial destination is
+     * removed.
+     */
+    fun copyRangeToFile(
+        offset: Long,
+        size: Long,
+        destination: File,
+        bufferSize: Int = 1024 * 1024,
+    ): Boolean {
+        if (offset < 0 || size < 0 || bufferSize <= 0) return false
+        if (!path.isFile && raf == null) return false
+        // Same read-write rationale as [readRange]: the cached handle must
+        // stay writable for subsequent chunk spills.
+        val f = raf ?: try {
+            RandomAccessFile(path, "rw").also { raf = it }
+        } catch (_: Exception) {
+            return false
+        }
+        if (offset > f.length() || size > f.length() - offset) return false
+        destination.parentFile?.mkdirs()
+        return try {
+            f.seek(offset)
+            FileOutputStream(destination, false).use { out ->
+                val buffer = ByteArray(
+                    minOf(bufferSize.toLong(), size.coerceAtLeast(1L)).toInt()
+                )
+                var remaining = size
+                while (remaining > 0) {
+                    val want = minOf(buffer.size.toLong(), remaining).toInt()
+                    val n = f.read(buffer, 0, want)
+                    if (n <= 0) throw java.io.EOFException("spill range truncated")
+                    out.write(buffer, 0, n)
+                    remaining -= n.toLong()
+                }
+                out.fd.sync()
+            }
+            destination.isFile && destination.length() == size
+        } catch (e: Exception) {
+            android.util.Log.w("ChunkSpillStore", "copyRangeToFile failed", e)
+            destination.delete()
+            false
+        }
+    }
+
     /** Close and delete the spill (transfer relocked / consumed / abandoned). */
     fun discard() {
         try {
@@ -71,6 +132,7 @@ class ChunkSpillStore(dir: File, transferIdHex: String) {
         } catch (_: Exception) {
         }
         raf = null
+        knownChunks.clear()
         path.delete()
     }
 }

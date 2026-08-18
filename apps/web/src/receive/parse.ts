@@ -16,7 +16,7 @@ export interface RecoveredText {
 export interface RecoveredFile {
   kind: "file"
   name: string
-  data: Uint8Array
+  data: Blob
 }
 
 export interface RecoveredBundle {

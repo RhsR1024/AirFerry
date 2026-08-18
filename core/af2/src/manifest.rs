@@ -37,6 +37,81 @@ pub struct ManifestEntry {
     pub extensions: Vec<Tlv>,
 }
 
+/// Build a Manifest from precomputed entry/chunk hashes.
+///
+/// This is the bounded-memory sender path used by browser hosts: file bytes
+/// are streamed once to incremental BLAKE3 hashers outside the protocol core,
+/// then only metadata and 32-byte digests cross into the manifest builder.
+/// The resulting Manifest is validated with the same path/order/chunk-count
+/// invariants as [`build_manifest`].
+pub fn build_manifest_from_hashes(
+    items: impl IntoIterator<Item = (u8, String, u64, [u8; 32])>,
+    chunk_raw_size: u32,
+    chunk_hashes: Vec<[u8; 32]>,
+) -> Result<Manifest, ManifestError> {
+    use unicode_normalization::UnicodeNormalization;
+    let mut items: Vec<(u8, String, u64, [u8; 32])> = items
+        .into_iter()
+        .map(|(kind, path, size, digest)| (kind, path.nfc().collect(), size, digest))
+        .collect();
+    items.sort_by(|a, b| a.1.as_bytes().cmp(b.1.as_bytes()));
+
+    let mut entries = Vec::with_capacity(items.len());
+    let mut stream_end = 0u64;
+    for (kind, path, size, digest) in items {
+        validate_path(&path).map_err(|reason| ManifestError::BadEntry {
+            index: entries.len(),
+            reason,
+        })?;
+        let (offset, content_size, content_hash) = if kind == KIND_DIRECTORY {
+            if size != 0 || digest != empty_hash() {
+                return Err(ManifestError::BadEntry {
+                    index: entries.len(),
+                    reason: "directory entry must carry zero size and H(empty)",
+                });
+            }
+            (0, 0, empty_hash())
+        } else {
+            let offset = stream_end;
+            stream_end = stream_end.checked_add(size).ok_or(ManifestError::BadEntry {
+                index: entries.len(),
+                reason: "canonical stream size overflow",
+            })?;
+            (offset, size, digest)
+        };
+        entries.push(ManifestEntry {
+            kind,
+            path,
+            content_offset: offset,
+            content_size,
+            content_hash,
+            extensions: vec![],
+        });
+    }
+    if stream_end == 0 {
+        return Err(ManifestError::EmptyStream);
+    }
+    let chunk_count = crate::root::expected_chunk_count(stream_end, chunk_raw_size);
+    if chunk_hashes.len() != chunk_count as usize {
+        return Err(ManifestError::BadChunkHashesLen(
+            u32::try_from(chunk_hashes.len().saturating_mul(32)).unwrap_or(u32::MAX),
+        ));
+    }
+    let manifest = Manifest {
+        entries,
+        chunk_count,
+        chunk_raw_size,
+        total_raw_size: stream_end,
+        chunk_hashes,
+        extensions: vec![],
+    };
+    // Encode exercises all structural invariants (path uniqueness/order,
+    // stream chaining, chunk geometry and size caps) before this is trusted.
+    let bytes = manifest.encode()?;
+    let (validated, _) = Manifest::parse(&bytes)?;
+    Ok(validated)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
     pub entries: Vec<ManifestEntry>,

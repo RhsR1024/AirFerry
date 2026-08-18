@@ -27,7 +27,7 @@ pub use id::{
     content_id, empty_hash, hash, object_id, transfer_id, EntryIdInput, ROLE_CHUNK, ROLE_MANIFEST,
 };
 pub use manifest::sanitize_save_paths;
-pub use receiver::{Af2Receiver, IngestEvent};
+pub use receiver::{Af2Receiver, FinalStreamVerifier, IngestEvent};
 pub use sender::{
     Af2Sender, ChunkSegment, PreencodedChunk, SenderConfig, SenderError, plan_chunks,
 };

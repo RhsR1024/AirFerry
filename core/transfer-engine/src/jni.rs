@@ -34,12 +34,13 @@ use jni::JNIEnv;
 /// - 2: the 16 per-field receiver getters were replaced by the single
 ///      `receiverSnapshotJson` (`ReceiverSnapshotV2`); old hosts calling the
 ///      removed symbols get an `UnsatisfiedLinkError` instead of silent zeros.
+/// - 3: bounded-memory incremental §13 final verification was added.
 ///
 /// The host (`NativeBridge.nativeAbiVersion`) handshakes on startup: if the
 /// loaded `.so` predates this symbol (`UnsatisfiedLinkError`) or reports a
 /// lower version, the app refuses to run as a receiver instead of silently
 /// "staying synchronising" on >32 MiB transfers with a stale library.
-pub const AIRFERRY_NATIVE_ABI_VERSION: jint = 2;
+pub const AIRFERRY_NATIVE_ABI_VERSION: jint = 3;
 
 /// Report the native ABI / protocol capability version. Returns
 /// [`AIRFERRY_NATIVE_ABI_VERSION`].
@@ -329,6 +330,55 @@ pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverVeri
     };
     let slice = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u8, bytes.len()) };
     session.verify_final_stream(slice) as jni::sys::jboolean
+}
+
+/// Begin bounded-memory §13 ⑧⑨ verification.
+#[no_mangle]
+pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverFinalVerifyBegin(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jni::sys::jboolean {
+    if handle == 0 {
+        return false as jni::sys::jboolean;
+    }
+    let session = unsafe { &mut *(handle as *mut ReceiverSession) };
+    session.final_verify_begin() as jni::sys::jboolean
+}
+
+/// Feed the next contiguous canonical-stream block to the incremental gate.
+#[no_mangle]
+pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverFinalVerifyFeed(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    stream_bytes: jni::sys::jbyteArray,
+) -> jni::sys::jboolean {
+    if handle == 0 || stream_bytes.is_null() {
+        return false as jni::sys::jboolean;
+    }
+    let session = unsafe { &mut *(handle as *mut ReceiverSession) };
+    let arr = unsafe { jni::objects::JByteArray::from_raw(stream_bytes) };
+    let bytes = match unsafe { env.get_array_elements(&arr, jni::objects::ReleaseMode::NoCopyBack) } {
+        Ok(elems) => elems,
+        Err(_) => return false as jni::sys::jboolean,
+    };
+    let slice = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u8, bytes.len()) };
+    session.final_verify_feed(slice) as jni::sys::jboolean
+}
+
+/// Finish bounded-memory §13 ⑧⑨ verification.
+#[no_mangle]
+pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverFinalVerifyFinish(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jni::sys::jboolean {
+    if handle == 0 {
+        return false as jni::sys::jboolean;
+    }
+    let session = unsafe { &mut *(handle as *mut ReceiverSession) };
+    session.final_verify_finish() as jni::sys::jboolean
 }
 
 /// Restore receiver from stored ROOT frame bytes + completed chunk indices (§12 resume).

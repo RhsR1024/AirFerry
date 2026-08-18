@@ -2,7 +2,9 @@ package com.airferry.app.scan
 
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
@@ -70,5 +72,35 @@ class Af2LedgerStoreTest {
         // loadMostRecent only considers the real `.ledger.jsonl` suffix.
         File(tmp.root, "af2-tid-e.ledger.jsonl.tmp").writeText("{\"v\":1}\n")
         assertNull(Af2LedgerStore.loadMostRecent(tmp.root))
+    }
+
+    @Test
+    fun corruptNewestJournalFallsBackToOlderValidOne() {
+        val old = Af2LedgerStore.create(tmp.root, "tid-old", 8192, root)
+        old.commit(1)
+        File(tmp.root, "af2-tid-old.ledger.jsonl").setLastModified(1_000L)
+        val corrupt = File(tmp.root, "af2-tid-new.ledger.jsonl")
+        corrupt.writeText("not-json\n")
+        corrupt.setLastModified(2_000L)
+
+        val loaded = Af2LedgerStore.loadMostRecent(tmp.root)!!
+        assertEquals("tid-old", loaded.transferIdHex)
+        assertArrayEquals(intArrayOf(1), loaded.completedIndices)
+    }
+
+    @Test
+    fun orphanSweepKeepsOnlyPartialsReferencedByValidLedgers() {
+        Af2LedgerStore.create(tmp.root, "tid-live", 8192, root)
+        val live = File(tmp.root, "af2-tid-live.partial").apply { writeBytes(byteArrayOf(1)) }
+        val orphan = File(tmp.root, "af2-tid-orphan.partial").apply { writeBytes(byteArrayOf(2)) }
+        val badJournal = File(tmp.root, "af2-tid-bad.ledger.jsonl").apply { writeText("bad") }
+        val badPartial = File(tmp.root, "af2-tid-bad.partial").apply { writeBytes(byteArrayOf(3)) }
+
+        Af2LedgerStore.sweepOrphanPartials(tmp.root)
+
+        assertTrue(live.exists())
+        assertFalse(orphan.exists())
+        assertFalse(badJournal.exists())
+        assertFalse(badPartial.exists())
     }
 }

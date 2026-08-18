@@ -37,6 +37,39 @@ public class ContinuousSaverTests
     }
 
     [Fact]
+    public void SaveBundle_PreservesRelativeDirectoryHierarchy()
+    {
+        string root = TempRoot();
+        Directory.CreateDirectory(root);
+        try
+        {
+            var saver = new ContinuousSaver(root);
+            var files = new List<BundleFile>
+            {
+                new("docs/a.txt", new byte[] { 1 }),
+                new("images/raw/b.bin", new byte[] { 2, 3 }),
+            };
+
+            var report = saver.SaveBundle(files, title: "包");
+
+            Assert.Equal(ContinuousSaveStatus.Saved, report.Status);
+            Assert.Equal(new byte[] { 1 },
+                File.ReadAllBytes(Path.Combine(root, "包", "docs", "a.txt")));
+            Assert.Equal(new byte[] { 2, 3 },
+                File.ReadAllBytes(Path.Combine(root, "包", "images", "raw", "b.bin")));
+
+            // Marker verification must also understand relative member paths,
+            // otherwise a replay after restart would save a duplicate bundle.
+            var replay = new ContinuousSaver(root).SaveBundle(files, title: "包2");
+            Assert.Equal(ContinuousSaveStatus.SkippedDuplicate, replay.Status);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
     public void SaveSingle_SameContentDifferentName_Skips()
     {
         string root = TempRoot();

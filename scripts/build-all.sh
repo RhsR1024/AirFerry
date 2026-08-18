@@ -61,10 +61,34 @@ read_version() {
 }
 VER="$(read_version)"
 
-# Chrome 二进制路径（macOS 标准安装位置）。找不到时跳过 crx 签名，仅留 zip。
-CHROME_BIN="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+# Chrome 二进制：允许显式 CHROME_BIN 覆盖，并自动探测 macOS/Linux 常见路径。
+# 普通 `dist` 可以在无签名环境只产 zip；`release` 必须 fail-closed 产出 CRX。
+CHROME_BIN="${CHROME_BIN:-}"
+REQUIRE_SIGNED_ARTIFACTS="${AIRFERRY_REQUIRE_SIGNED_RELEASE:-0}"
+if [[ "$TARGET" == "release" ]]; then
+  REQUIRE_SIGNED_ARTIFACTS=1
+fi
 EXPECTED_ANDROID_CERT_SHA256="44577EDA2C6D4F44638C9D61DC161F08FDB30FCEE6A3410AADAEB7CE65A97FDD"
 EXPECTED_CHROME_PUBLIC_KEY_SHA256="b6059f0bf2184bbdb153013b15eee99cf8176fd653e46fcda4123868a05e2986"
+
+detect_chrome_bin() {
+  if [[ -n "$CHROME_BIN" && -x "$CHROME_BIN" ]]; then
+    return 0
+  fi
+  local candidate=""
+  for candidate in \
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+    "/usr/bin/google-chrome-stable" \
+    "/usr/bin/google-chrome" \
+    "/usr/bin/chromium" \
+    "/usr/bin/chromium-browser"; do
+    if [[ -x "$candidate" ]]; then
+      CHROME_BIN="$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
 
 verify_apk_signature() {
   local apk="$1"
@@ -93,8 +117,7 @@ verify_apk_signature() {
     fi
   fi
   if [[ -z "$apksigner_bin" ]]; then
-    warn "未找到 apksigner，跳过 APK 签名验证"
-    return 0
+    error "未找到 apksigner，无法验证 APK 发布证书；拒绝打包: $apk"
   fi
   local cert_info
   cert_info="$("$apksigner_bin" verify --verbose --print-certs "$apk")" || \
@@ -269,12 +292,23 @@ pack_chrome_crx() {
   local plat="${prod_dir%-prod}"   # chrome-mv3
   local key="$ROOT/dist/airferry-extension.pem"
 
-  if [[ ! -x "$CHROME_BIN" ]]; then
-    warn "未找到 Chrome（${CHROME_BIN}），跳过 ${plat} 的 .crx 签名，仅保留 .zip"
+  if ! detect_chrome_bin; then
+    # 与 verify-dist.mjs 对齐：签名私钥存在本身就是签名意图，dist 模式也
+    # 必须 fail-closed（否则 build 过了、verify 门禁才失败，两个门禁打架）。
+    if [[ "$REQUIRE_SIGNED_ARTIFACTS" == "1" || -f "$key" ]]; then
+      error "未找到可用于打包 CRX 的 Chrome；签名私钥存在（$key），必须产出已签名 ${plat}.crx。可通过 CHROME_BIN 指定。"
+    fi
+    warn "未找到 Chrome，跳过 ${plat} 的 .crx 签名，仅保留 .zip（release 模式会失败）"
     return 0
   fi
 
-  [[ -f "$key" ]] || error "缺少固定 Chrome 签名私钥: $key（拒绝生成新扩展 ID）"
+  if [[ ! -f "$key" ]]; then
+    if [[ "$REQUIRE_SIGNED_ARTIFACTS" == "1" ]]; then
+      error "缺少固定 Chrome 签名私钥: $key（release 必须复用固定扩展 ID）"
+    fi
+    warn "缺少固定 Chrome 签名私钥，跳过 ${plat}.crx，仅保留 .zip（release 模式会失败）"
+    return 0
+  fi
   command -v openssl >/dev/null 2>&1 || error "找不到 openssl，无法核对 Chrome 公钥指纹"
   local actual_key_sha
   actual_key_sha="$(openssl rsa -in "$key" -pubout -outform DER 2>/dev/null | shasum -a 256 | awk '{print $1}')"
@@ -282,7 +316,10 @@ pack_chrome_crx() {
     error "Chrome 签名密钥不是 AirFerry 固定发布密钥（实际公钥 SHA-256: $actual_key_sha）"
   "$CHROME_BIN" --pack-extension="$ROOT/apps/web/build/$prod_dir" \
                 --pack-extension-key="$key" >/dev/null 2>&1 || {
-    warn "${plat} 的 .crx 打包失败，仅保留 .zip"
+    if [[ "$REQUIRE_SIGNED_ARTIFACTS" == "1" ]]; then
+      error "${plat} 的 .crx 打包失败；release 拒绝继续"
+    fi
+    warn "${plat} 的 .crx 打包失败，仅保留 .zip（release 模式会失败）"
     return 0
   }
 

@@ -58,6 +58,12 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     private volatile bool _producerRunning;
     private bool _disposed;
     private int _recoveryStarted;
+    /// <summary>
+    /// Set when staging invalidated locally-corrupt spill chunks and returned
+    /// None: the receiver stays armed awaiting the sender's next epoch to
+    /// re-supply exactly those chunks (NOT a failed assembly).
+    /// </summary>
+    private bool _awaitingChunkResupply;
     private int _sessionEpoch;
     private readonly object _lifecycleGate = new();
     private Task<RecoveryOutcome>? _recoveryCoreTask;
@@ -247,10 +253,10 @@ public partial class ScanViewModel : ObservableObject, IDisposable
                     $"二维码解码库 ABI 不兼容（期望 1，实际 {zxingAbi}）");
             }
             uint nativeAbi = NativeBridge.NativeAbiVersion();
-            if (nativeAbi < NativeBridge.NativeAbiVersion2)
+            if (nativeAbi < NativeBridge.NativeAbiVersion3)
             {
                 throw new InvalidOperationException(
-                    $"传输引擎 ABI 不兼容（期望 >= {NativeBridge.NativeAbiVersion2}，实际 {nativeAbi}）");
+                    $"传输引擎 ABI 不兼容（期望 >= {NativeBridge.NativeAbiVersion3}，实际 {nativeAbi}）");
             }
             // §12 resume attempt BEFORE the first frame is ingested (the
             // receiver accepts resume only while unlocked). On success the
@@ -582,28 +588,36 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     /// </summary>
     private bool TryResumeFromLedger()
     {
-        Af2LedgerStore? ledger = Af2LedgerStore.LoadMostRecent(TempDir);
-        if (ledger is null)
-        {
-            return false;
-        }
+        Af2LedgerStore.SweepOrphanPartials(TempDir);
         ReceiverSession? session = _session;
         if (session is null)
         {
             return false;
         }
-        string spillPath = Path.Combine(
-            TempDir, $"af2-{ledger.TransferIdHex}.partial");
-        uint[] completed = ledger.CompletedIndices.Select(i => (uint)i).ToArray();
-        if (!File.Exists(spillPath) || !session.Resume(ledger.RootFrameBytes, completed))
+        var attempted = new HashSet<string>(StringComparer.Ordinal);
+        while (true)
         {
-            ledger.Discard();
-            return false;
+            Af2LedgerStore? ledger = Af2LedgerStore.LoadMostRecent(TempDir);
+            if (ledger is null) return false;
+            if (!attempted.Add(ledger.TransferIdHex)) return false;
+            string spillPath = Path.Combine(
+                TempDir, $"af2-{ledger.TransferIdHex}.partial");
+            uint[] completed = ledger.CompletedIndices.Select(i => (uint)i).ToArray();
+            if (!File.Exists(spillPath) || !session.Resume(ledger.RootFrameBytes, completed))
+            {
+                ledger.Discard();
+                try { File.Delete(spillPath); } catch { }
+                continue;
+            }
+            _af2Ledger = ledger;
+            // deleteExisting: false — the spill file holds this transfer's durable
+            // chunk bytes; the ctor's orphan-wipe must not destroy it. The ledger
+            // bits say which chunks are physically present in it.
+            _chunkSpill = new ChunkSpillStore(TempDir, ledger.TransferIdHex, deleteExisting: false);
+            _chunkSpill.MarkResumed(ledger.CompletedIndices);
+            _pendingReverify = new SortedSet<int>(ledger.CompletedIndices);
+            return true;
         }
-        _af2Ledger = ledger;
-        _chunkSpill = new ChunkSpillStore(TempDir, ledger.TransferIdHex);
-        _pendingReverify = new SortedSet<int>(ledger.CompletedIndices);
-        return true;
     }
 
     /// <summary>
@@ -632,17 +646,17 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             long off = i * crs;
             long len = Math.Clamp((long)snap.TotalRawSize - off, 0, crs);
             byte[]? bytes = spill.ReadRange(off, len);
-            if (bytes is null)
-            {
-                continue; // spill short — retry on a later tick
-            }
             pending.Remove(i);
-            if (!session.VerifyChunk((uint)i, bytes))
+            if (bytes is null || !session.VerifyChunk((uint)i, bytes))
             {
+                // resume() already marked this index complete in native state;
+                // leaving a missing spill range pending would deadlock because
+                // replayed META for an already-done chunk is dropped. Clear the
+                // bit now so the next sender epoch can really re-supply it.
                 session.InvalidateChunk((uint)i);
                 ledger.Invalidate(i);
                 System.Diagnostics.Debug.WriteLine(
-                    $"[Af2] resumed chunk {i} failed re-verification; invalidated");
+                    $"[Af2] resumed chunk {i} missing/corrupt; invalidated for re-supply");
             }
         }
         if (pending.Count == 0)
@@ -675,18 +689,27 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         // and evict it from native memory, so peak native usage stays O(chunk)
         // instead of O(whole object). The serialized ingest thread drains it —
         // no extra synchronization.
-        if (s.Accepted && s.ReceivedSymbols == 0)
+        if (s.Relocked)
         {
-            // Relock (or first lock): a foreign Transfer owns the session now,
-            // so the old spill's bytes belong to nobody. The ledger journal
-            // follows — its ROOT/completed set reference the abandoned
-            // transfer. (A resumed same-transfer session never gets here:
-            // duplicate ROOTs are dropped, not re-locked.)
+            // A foreign Transfer owns the session now, so the old spill's
+            // bytes belong to nobody. The ledger journal follows — its
+            // ROOT/completed set reference the abandoned transfer. The
+            // explicit bit is the only trigger: the historical
+            // `Accepted && ReceivedSymbols == 0` heuristic also matched the
+            // first accepted META of a §12-resumed session (counter still 0),
+            // destroying the resumed spill and making completion impossible.
             _chunkSpill?.Discard();
             _chunkSpill = null;
             _af2Ledger?.Discard();
             _af2Ledger = null;
             _pendingReverify = null;
+            // A failed continuous-folder save intentionally leaves the
+            // completed receiver armed with _recoveryStarted == 1 so the same
+            // completed transfer is not retried every frame. A genuine relock
+            // is the point where a NEW transfer takes ownership, so re-arm the
+            // recovery gate here for that new transfer.
+            Interlocked.Exchange(ref _recoveryStarted, 0);
+            _awaitingChunkResupply = false;
         }
         if (s.ManifestReady)
         {
@@ -862,6 +885,21 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     {
         pool.IngestStopped = true;
 
+        // Fast path for the normal bounded-memory receiver: completed chunks
+        // already live in the sparse spill file, so verify and stage directly
+        // from disk instead of ReadAll(total) + per-entry byte[] slicing.
+        // The old extra `spill.Length() >= TotalRawSize` gate was dropped:
+        // length only proves the HIGHEST chunk was written (holes read as
+        // zeros); per-chunk completeness is decided inside the verify loop,
+        // which repairs holes from the still-native chunks.
+        ReceiverSession.Snapshot spillSnapshot = pool.RunExclusive(() => session.GetSnapshot());
+        ChunkSpillStore? spill = _chunkSpill;
+        if (spill is not null && spillSnapshot.TotalRawSize > 0 &&
+            spillSnapshot.ChunkCount > 0)
+        {
+            return RecoverAndStageFromSpill(session, pool, saver, spill, spillSnapshot);
+        }
+
         // Take one coherent native snapshot under the ingest lock. No metadata
         // getter is allowed to outlive or race disposal of the native handle.
         AssembledPayload? payload = pool.RunExclusive<AssembledPayload?>(() =>
@@ -904,6 +942,247 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         }
         return RecoveryOutcome.Single(StageClassified(
             classified, payload.ExpectedCrc, payload.CrcKnown, receivedCrc));
+    }
+
+    /// <summary>
+    /// Bounded-memory completion path. The spill is walked one chunk at a time
+    /// through the shared incremental §13 verifier, then each Manifest entry is
+    /// copied to a task-owned file and either moved into ContentStore or streamed
+    /// to the continuous destination. Peak managed memory is O(chunk size).
+    /// </summary>
+    private RecoveryOutcome RecoverAndStageFromSpill(
+        ReceiverSession session,
+        QrDecodePool pool,
+        AirFerry.Windows.Bundle.ContinuousSaver? saver,
+        ChunkSpillStore spill,
+        ReceiverSession.Snapshot snapshot)
+    {
+        var badChunks = new List<uint>();
+        bool verified = pool.RunExclusive(() =>
+        {
+            if (!session.FinalVerifyBegin()) return false;
+            long chunkRawSize = Math.Max(1L, snapshot.ChunkRawSize);
+            bool finalVerifyUsable = true;
+            for (uint i = 0; i < snapshot.ChunkCount; i++)
+            {
+                long offset = checked((long)i * chunkRawSize);
+                long length = Math.Min(
+                    chunkRawSize,
+                    Math.Max(0L, checked((long)snapshot.TotalRawSize - offset)));
+                // Only trust ranges the spill is KNOWN to hold: the sparse file
+                // would happily hand back zeros for a hole. A chunk whose spill
+                // write once failed is still native-resident (eviction only
+                // happens after a successful write) — repair it into the spill
+                // so the staging pass below never slices holes.
+                byte[]? bytes = spill.HasChunk((int)i)
+                    ? spill.ReadRange(offset, length)
+                    : null;
+                if (bytes is null)
+                {
+                    bytes = session.AssembleChunk(i);
+                    if (bytes is null)
+                    {
+                        // Unjournaled pre-crash spill data (written durably,
+                        // never committed to the ledger): last-resort read.
+                        // The §11 hash gate below still validates the bytes.
+                        bytes = spill.ReadRange(offset, length);
+                    }
+                    else
+                    {
+                        spill.Write((int)i, (int)chunkRawSize, bytes);
+                    }
+                }
+                if (bytes is null)
+                {
+                    return false; // missing everywhere despite repair
+                }
+                if (!session.VerifyChunk(i, bytes))
+                {
+                    // Local corruption in ONE chunk must not cost the whole
+                    // transfer: invalidate just this chunk and keep every other
+                    // verified chunk plus the spill/ledger. The sender's next
+                    // epoch re-supplies exactly this chunk; failing here would
+                    // reset the receiver and force a complete re-receive.
+                    session.InvalidateChunk(i);
+                    // Keep the crash-resume journal in lockstep with native
+                    // completion state. Otherwise an app exit before re-supply
+                    // would resurrect this corrupt spill chunk as completed.
+                    _af2Ledger?.Invalidate((int)i);
+                    badChunks.Add(i);
+                    // FinalVerifyFeed consumes a contiguous canonical stream.
+                    // After skipping one corrupt chunk, feeding later chunks
+                    // would advance the verifier with the wrong logical bytes
+                    // and can transform a local spill fault into a false final
+                    // verification failure that resets the whole transfer.
+                    finalVerifyUsable = false;
+                    continue;
+                }
+                if (finalVerifyUsable && !session.FinalVerifyFeed(bytes))
+                {
+                    return false;
+                }
+            }
+            return badChunks.Count == 0 && session.FinalVerifyFinish();
+        });
+        if (badChunks.Count > 0)
+        {
+            // Re-arm the decode pipeline: the transfer re-completes once the
+            // re-supplied chunks arrive and staging retries from the spill.
+            pool.IngestStopped = false;
+            Interlocked.Exchange(ref _recoveryStarted, 0);
+            _awaitingChunkResupply = true;
+            return RecoveryOutcome.None();
+        }
+        if (!verified)
+        {
+            throw new InvalidOperationException("最终校验失败，请对准二维码重新接收");
+        }
+
+        IReadOnlyList<ReceiverSession.ManifestEntryDto> entries = snapshot.Entries
+            .Where(e => e.Kind != 3)
+            .ToList();
+        string stageDir = Path.Combine(
+            Path.GetTempPath(), "AirFerry", "recovery", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(stageDir);
+
+        BundleFile StageEntry(ReceiverSession.ManifestEntryDto e, int ordinal)
+        {
+            if (e.Offset > snapshot.TotalRawSize ||
+                e.Size > snapshot.TotalRawSize - e.Offset ||
+                e.Offset > long.MaxValue || e.Size > long.MaxValue)
+            {
+                throw new InvalidDataException("Manifest entry range out of bounds");
+            }
+            string temp = Path.Combine(stageDir, $"{ordinal:D6}.partial");
+            if (!spill.CopyRangeToFile((long)e.Offset, (long)e.Size, temp))
+            {
+                throw new IOException($"无法从恢复缓存写出文件: {e.SavePath}");
+            }
+            string name = string.IsNullOrEmpty(e.SavePath) ? e.Path : e.SavePath;
+            return new BundleFile(name, temp, (long)e.Size);
+        }
+
+        try
+        {
+            if (entries.Count == 0)
+            {
+                // Defensive parity with the whole-stream path: a directory-only
+                // manifest carries no bytes; degrade to one empty file entry
+                // instead of failing recovery and resetting the receiver.
+                // (Unreachable via the TotalRawSize > 0 gate — kept for safety.)
+                string fallbackName = string.IsNullOrWhiteSpace(session.FileName())
+                    ? "接收内容" : session.FileName();
+                entries = new List<ReceiverSession.ManifestEntryDto>
+                {
+                    new(1, fallbackName, fallbackName, 0, 0),
+                };
+            }
+
+            // Keep the text preview feature bounded: only the UI-sized entry
+            // is materialized. Oversized UTF8_TEXT is stored as an ordinary file.
+            if (entries.Count == 1 && entries[0].Kind == 2 &&
+                entries[0].Size <= int.MaxValue &&
+                FileNameUtil.FitsTextUi((long)entries[0].Size))
+            {
+                byte[]? bytes = spill.ReadRange((long)entries[0].Offset, (long)entries[0].Size);
+                if (bytes is not null && FileNameUtil.DecodeUtf8Strict(bytes) is { } text)
+                {
+                    string name = string.IsNullOrEmpty(entries[0].SavePath)
+                        ? entries[0].Path
+                        : entries[0].SavePath;
+                    RecoveryOutcome outcome = saver is not null
+                        ? RecoveryOutcome.Continuous(GuardedContinuousSave(
+                            saver, name, () => saver.SaveText(name, text)))
+                        : RecoveryOutcome.Single(StageText(text, name, 0, false, 0));
+                    ConsumeSpillAfterSuccessfulStage(outcome.ContinuousReport);
+                    return outcome;
+                }
+            }
+
+            if (entries.Count == 1)
+            {
+                BundleFile file = StageEntry(entries[0], 0);
+                RecoveryOutcome outcome;
+                if (saver is not null)
+                {
+                    outcome = RecoveryOutcome.Continuous(GuardedContinuousSave(
+                        saver, file.Name, () => saver.SaveSingle(file)));
+                }
+                else
+                {
+                    ContentStore.PutResult put = ContentStore.PutFile(
+                        file.Name, file.StoredPath!,
+                        crcHex: "unknown", crcUnknown: true, kind: "file",
+                        expectedSize: file.Size);
+                    outcome = RecoveryOutcome.Single(new RecoveryResult(
+                        SingleFilePath: put.Path,
+                        SingleFileSize: (ulong)file.Size,
+                        ExpectedCrc32: 0,
+                        Crc32Known: false,
+                        ReceivedCrc32: 0,
+                        Bundle: null,
+                        BundleDir: null,
+                        DisplayName: file.Name));
+                }
+                ConsumeSpillAfterSuccessfulStage(outcome.ContinuousReport);
+                return outcome;
+            }
+
+            var staged = entries.Select(StageEntry).ToList();
+            if (saver is not null)
+            {
+                RecoveryOutcome outcome = RecoveryOutcome.Continuous(GuardedContinuousSave(
+                    saver, session.FileName(), () => saver.SaveBundle(staged, null)));
+                ConsumeSpillAfterSuccessfulStage(outcome.ContinuousReport);
+                return outcome;
+            }
+
+            string bundleId = Guid.NewGuid().ToString("N");
+            string bundleTitle = $"发送_{DateTime.Now:MMdd_HHmmss}";
+            // One index write for the whole bundle: a mid-bundle disk failure
+            // must not leave a truncated bundle committed to history.
+            var stored = ContentStore.PutFileBatch(
+                staged.Select(f => new ContentStore.PutFileRequest(
+                    f.Name, f.StoredPath!,
+                    crcHex: "unknown", crcUnknown: true, kind: "file",
+                    bundleId: bundleId, bundleTitle: bundleTitle,
+                    expectedSize: f.Size)).ToList())
+                .Select(put => new BundleFile(
+                    put.Entry.Name, put.Path, put.Entry.Size))
+                .ToList();
+            ConsumeSpillAfterSuccessfulStage();
+            return RecoveryOutcome.Single(new RecoveryResult(
+                SingleFilePath: null,
+                SingleFileSize: null,
+                ExpectedCrc32: 0,
+                Crc32Known: false,
+                ReceivedCrc32: 0,
+                Bundle: stored,
+                BundleDir: null,
+                DisplayName: session.FileName()));
+        }
+        finally
+        {
+            try { if (Directory.Exists(stageDir)) Directory.Delete(stageDir, recursive: true); }
+            catch { /* ContentStore/continuous save already owns successful copies. */ }
+        }
+
+        void ConsumeSpillAfterSuccessfulStage(ContinuousSaveReport? report = null)
+        {
+            if (report is { Status: ContinuousSaveStatus.Failed })
+            {
+                // A FAILED folder save must not consume the §12 material: the
+                // transfer was fully received and the spill/ledger are its only
+                // recoverable copy (an app restart resumes from them, and the
+                // receiver stays armed until the next transfer relocks).
+                return;
+            }
+            spill.Discard();
+            if (ReferenceEquals(_chunkSpill, spill)) _chunkSpill = null;
+            _af2Ledger?.Discard();
+            _af2Ledger = null;
+            _pendingReverify = null;
+        }
     }
 
     /// <summary>
@@ -1011,6 +1290,26 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             _ => StageSingleFile(c.Bytes, c.DisplayName, c.OriginalSize,
                 expectedCrc, crcKnown, receivedCrc),
         };
+    }
+
+    /// <summary>
+    /// Wrap one bounded-memory continuous save so a disk failure becomes a
+    /// Failed report (same contract as <see cref="TrySaveContinuous"/>) instead
+    /// of an exception that resets the whole receiver.
+    /// </summary>
+    private ContinuousSaveReport GuardedContinuousSave(
+        AirFerry.Windows.Bundle.ContinuousSaver saver,
+        string displayName,
+        Func<ContinuousSaveReport> save)
+    {
+        try
+        {
+            return save();
+        }
+        catch (Exception ex)
+        {
+            return ContinuousSaveReport.Failed(displayName, ex.Message);
+        }
     }
 
     /// <summary>
@@ -1143,6 +1442,12 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         if (outcome.Result is null && outcome.ContinuousReport is null)
         {
             IsComplete = false;
+            if (_awaitingChunkResupply)
+            {
+                _awaitingChunkResupply = false;
+                StatusText = "个别数据块校验失败，等待发送端重供…";
+                return;
+            }
             StatusText = "组装失败";
             return;
         }
@@ -1155,11 +1460,20 @@ public partial class ScanViewModel : ObservableObject, IDisposable
                 saver.MarkTransfer(
                     pool.RunExclusive(() => TransferProbeOf(session)),
                     outcome.ContinuousReport);
+                // Continuous mode: record the folder save, re-arm a fresh receiver
+                // and keep scanning — no navigation, no teardown.
+                RecordContinuousOutcome(saver, outcome.ContinuousReport);
+                ContinueNextTransfer(session, pool, epoch);
+                return;
             }
-            // Continuous mode: record the folder save, re-arm a fresh receiver
-            // and keep scanning — no navigation, no teardown.
+            // Failed folder save: keep the receiver AND the §12 spill/ledger —
+            // the transfer was fully received and they are its only recoverable
+            // copy (an app restart resumes and re-stages from them). Only
+            // re-arm the decode pipeline so the next file still scans; the
+            // material survives until the next transfer relocks.
+            pool.IngestStopped = false;
             RecordContinuousOutcome(saver, outcome.ContinuousReport);
-            ContinueNextTransfer(session, pool, epoch);
+            ResetScanProgressUi();
             return;
         }
         StatusText = "接收完成";
@@ -1257,6 +1571,13 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     /// </summary>
     private void ContinueNextTransfer(ReceiverSession session, QrDecodePool pool, int epoch)
     {
+        ResetScanProgressUi();
+        SwapReceiverForNextSegment(session, pool);
+    }
+
+    /// <summary>Reset the scan progress UI without touching the receiver.</summary>
+    private void ResetScanProgressUi()
+    {
         IsComplete = false;
         Progress = 0;
         ReceivedSymbolsText = "0";
@@ -1266,7 +1587,6 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         _transferStartTimestamp = 0;
         _decodePerSecond = 0;
         _recentWireBytesPerSecond = 0;
-        SwapReceiverForNextSegment(session, pool);
     }
 
     private RecoveryResult StageSingleFile(byte[] bytes, string displayName,

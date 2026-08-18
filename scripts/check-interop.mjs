@@ -19,13 +19,20 @@ import path from "node:path"
 import { fileURLToPath } from "node:url"
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
+const isWin = process.platform === "win32"
 
 const results = []
 
 function run(name, cmd, args, opts = {}) {
   const start = Date.now()
   try {
-    execFileSync(cmd, args, {
+    // Windows cannot exec .cmd/.bat files directly through execFileSync.
+    // Route those wrappers through cmd.exe while keeping native executables
+    // (cargo/node/dotnet) shell-free on every platform.
+    const needsCmd = isWin && /\.(?:cmd|bat)$/i.test(cmd)
+    const actualCmd = needsCmd ? (process.env.ComSpec || "cmd.exe") : cmd
+    const actualArgs = needsCmd ? ["/d", "/s", "/c", cmd, ...args] : args
+    execFileSync(actualCmd, actualArgs, {
       cwd: root,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
@@ -46,13 +53,33 @@ console.log("▶ AF2 四端互操作矩阵检查\n")
 
 run("Rust 核心 + golden vectors", "cargo", ["test", "--workspace"], { timeout: 600000 })
 run("Rust clippy 门禁", "cargo", ["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"], { timeout: 600000 })
-run("Web 类型检查", "npm", ["--prefix", "apps/web", "run", "typecheck"], { timeout: 300000 })
-run("Web 单测（golden 帧头）", "npm", ["--prefix", "apps/web", "test"], { timeout: 300000 })
-run("Android 单测", "apps/scanner/gradlew", ["--project-dir", "apps/scanner", ":app:testDebugUnitTest"], { timeout: 600000 })
-if (process.platform === "win32" || existsSync("/usr/local/share/dotnet/dotnet")) {
-  run("Windows 单测", "dotnet", ["test", "apps/windows/AirFerry.Windows.Tests"], { timeout: 600000 })
+run("Web 类型检查", isWin ? "npm.cmd" : "npm", ["--prefix", "apps/web", "run", "typecheck"], { timeout: 300000 })
+run("Web 单测（golden 帧头）", isWin ? "npm.cmd" : "npm", ["--prefix", "apps/web", "test"], { timeout: 300000 })
+run(
+  "Android 单测",
+  isWin ? path.join(root, "apps/scanner/gradlew.bat") : "apps/scanner/gradlew",
+  ["--project-dir", "apps/scanner", ":app:testDebugUnitTest"],
+  { timeout: 600000 }
+)
+
+// .NET SDK probe: the real binary may exist at /usr/local/share/dotnet/dotnet
+// without being on PATH (common on arm64 macOS); resolve the usable spelling
+// first so the probe and the test run use the same binary — otherwise a
+// PATH-missing dotnet turns a legitimate SKIP into a FAIL.
+let dotnetBin = null
+for (const candidate of ["dotnet", "/usr/local/share/dotnet/dotnet"]) {
+  try {
+    const sdkList = execFileSync(candidate, ["--list-sdks"], { cwd: root, encoding: "utf8" })
+    if (sdkList.trim().length > 0) {
+      dotnetBin = candidate
+      break
+    }
+  } catch {}
+}
+if (dotnetBin) {
+  run("Windows 单测", dotnetBin, ["test", "apps/windows/AirFerry.Windows.Tests"], { timeout: 600000 })
 } else {
-  results.push({ name: "Windows 单测", ok: null, ms: 0, detail: "dotnet 不可用，跳过（CI windows-latest 覆盖）" })
+  results.push({ name: "Windows 单测", ok: null, ms: 0, detail: ".NET SDK 不可用，跳过（CI windows-latest 覆盖）" })
 }
 run("版本门禁", "node", ["scripts/version.mjs", "check"], { timeout: 120000 })
 

@@ -62,6 +62,21 @@ object FileNameUtil {
     }
 
     /**
+     * Sanitize a logical bundle-relative path while preserving its directory
+     * hierarchy. Each component is independently reduced with [sanitize], so
+     * traversal (`.`/`..`), separators inside a component and control chars
+     * can never escape the logical bundle root.
+     */
+    fun sanitizeRelativePath(path: String): String {
+        val parts = path
+            .replace('\\', '/')
+            .split('/')
+            .filter { it.isNotBlank() && it != "." && it != ".." }
+            .map(::sanitize)
+        return if (parts.isEmpty()) "received_file" else parts.joinToString("/")
+    }
+
+    /**
      * Return a non-existing file in `dir` named `name` (after sanitizing),
      * appending `(1)`, `(2)`, … before the extension on collisions so the
      * original name is never silently overwritten:

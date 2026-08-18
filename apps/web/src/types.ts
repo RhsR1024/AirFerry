@@ -12,7 +12,18 @@ export type CompressPhase = "reading" | "done" | "error"
  *    entry in the same AF2 Manifest.
  */
 export type PendingItem =
-  | { id: string; kind: "file"; file: File }
+  | {
+      id: string
+      kind: "file"
+      file: File
+      /**
+       * Sender-resolved AF2 path (directory picks / drop walks carry
+       * hierarchy). Kept as a sibling field because a `webkitRelativePath`
+       * own-property override on the File is lost when the File is cloned
+       * into the compress worker.
+       */
+      path?: string
+    }
   | { id: string; kind: "text"; name: string; content: string }
 
 export interface TransferConfig {
@@ -51,12 +62,23 @@ export interface TransferConfig {
  */
 export type SpeedPreset = "stable" | "fast" | "extreme" | "aggressive" | "turbo" | "max"
 
+/** AF2 protocol wire capacity for total raw content (4 TiB, §6/§15). */
+export const AF2_MAX_ORIGINAL_BYTES = 4 * 1024 * 1024 * 1024 * 1024
+
 /**
- * AF2 wire capacity for total raw content (4 TiB, §6/§15).
- * Per-chunk streaming and OPFS storage have superseded the v1 256 MiB
- * in-memory receiver ceiling.
+ * Current Web sender host cap.
+ *
+ * The protocol/receivers can address 4 TiB, but the browser sender still
+ * materializes each selected File as ArrayBuffer and copies entries into WASM.
+ * Until that path becomes genuinely streaming, advertise/enforce the host's
+ * real bounded capability instead of the wire-format maximum.
  */
-export const MAX_ORIGINAL_BYTES = 4 * 1024 * 1024 * 1024 * 1024
+// The current sender transiently holds the selection in JS ArrayBuffers,
+// copies entries into wasm-bindgen Vecs, then builds one canonical stream in
+// WASM. A 1 GiB host cap can therefore require several GiB of live memory and
+// still OOM on mainstream browsers. Keep the advertised host limit
+// conservative until SenderBuilderWasm becomes genuinely streaming.
+export const MAX_ORIGINAL_BYTES = 256 * 1024 * 1024
 export const MAX_ORIGINAL_MIB = MAX_ORIGINAL_BYTES / (1024 * 1024)
 
 export interface SpeedPresetDef {

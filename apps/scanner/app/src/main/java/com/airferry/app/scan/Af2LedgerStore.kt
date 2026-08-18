@@ -140,13 +140,33 @@ class Af2LedgerStore private constructor(private val path: File) {
             }?.forEach { it.delete() }
         }
 
-        /** Resume source: the most recent ledger in `dir` (by mtime), or null. */
+        /** Resume source: newest valid ledger in `dir` (by mtime), or null. */
         fun loadMostRecent(dir: File): Af2LedgerStore? {
             val candidates = dir.listFiles { f -> f.name.endsWith(".ledger.jsonl") }
                 ?: return null
-            val latest = candidates.maxByOrNull { it.lastModified() } ?: return null
-            val store = Af2LedgerStore(latest)
-            return if (store.reload()) store else null
+            for (candidate in candidates.sortedByDescending { it.lastModified() }) {
+                val store = Af2LedgerStore(candidate)
+                if (store.reload()) return store
+            }
+            return null
+        }
+
+        /** Remove unrecoverable spill files that have no valid resume journal. */
+        fun sweepOrphanPartials(dir: File) {
+            val validTids = mutableSetOf<String>()
+            dir.listFiles { f -> f.name.endsWith(".ledger.jsonl") }?.forEach { file ->
+                val store = Af2LedgerStore(file)
+                if (store.reload()) {
+                    validTids.add(store.transferIdHex)
+                } else {
+                    file.delete()
+                }
+            }
+            dir.listFiles { f -> f.name.startsWith("af2-") && f.name.endsWith(".partial") }
+                ?.forEach { partial ->
+                    val tid = partial.name.removePrefix("af2-").removeSuffix(".partial")
+                    if (tid !in validTids) partial.delete()
+                }
         }
 
         /** Create + write the header for a fresh transfer's journal. */

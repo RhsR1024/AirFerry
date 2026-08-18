@@ -42,6 +42,40 @@ public sealed class ReceiverSession : IDisposable
                 (snap.TotalRawSize + snap.SymbolSize - 1) / snap.SymbolSize);
         }
     }
+
+    /// <summary>Begin bounded-memory §13 ⑧⑨ final verification.</summary>
+    public bool FinalVerifyBegin()
+    {
+        lock (_gate)
+        {
+            return _initialized && _handle != IntPtr.Zero &&
+                NativeBridge.ReceiverFinalVerifyBegin(_handle) == 1;
+        }
+    }
+
+    /// <summary>Feed the next contiguous canonical-stream block.</summary>
+    public bool FinalVerifyFeed(byte[] streamBytes)
+    {
+        lock (_gate)
+        {
+            if (!_initialized || _handle == IntPtr.Zero || streamBytes is null)
+            {
+                return false;
+            }
+            return NativeBridge.ReceiverFinalVerifyFeed(
+                _handle, streamBytes, (nuint)streamBytes.Length) == 1;
+        }
+    }
+
+    /// <summary>Finish bounded-memory §13 ⑧⑨ final verification.</summary>
+    public bool FinalVerifyFinish()
+    {
+        lock (_gate)
+        {
+            return _initialized && _handle != IntPtr.Zero &&
+                NativeBridge.ReceiverFinalVerifyFinish(_handle) == 1;
+        }
+    }
     /// <summary>Wire symbol size T reported by Rust (0 before lock).</summary>
     public uint SymbolSizeBytes { get { var snap = GetSnapshot(); return snap.SymbolSize; } }
 
@@ -76,9 +110,12 @@ public sealed class ReceiverSession : IDisposable
             }
             IngestStatus s = status.Value;
 
-            if (s.Accepted && s.ReceivedSymbols == 0)
+            if (s.Relocked)
             {
-                // Relocked in native AF2: clear stale snapshot cache.
+                // A foreign transfer owns the session: clear the stale snapshot
+                // cache. (Never infer this from Accepted && ReceivedSymbols == 0
+                // — that signature also matches the first accepted META of a
+                // §12-resumed session.)
                 _cachedSnapshot = null;
             }
 

@@ -28,6 +28,7 @@ import {
 } from "@/lib/chunk-encode"
 import { SettingsIcon } from "@/components/icons"
 import type { PreparedItem } from "@/workers/compress.worker"
+import { senderPathForFile, type SenderFileItem } from "@/lib/sender-path"
 import "@/assets/app.css"
 
 const iconUrl = new URL("../assets/icon.png", import.meta.url).href
@@ -47,15 +48,20 @@ async function initializeCompressWorker(worker: Worker): Promise<void> {
   worker.postMessage({ type: "wasm-init" })
 }
 
-function itemsToFiles(items: PendingItem[]): File[] {
-  return items.map((it) => {
-    if (it.kind === "file") return it.file
+function itemsToFiles(items: PendingItem[]): SenderFileItem[] {
+  return items.map((it): SenderFileItem => {
+    if (it.kind === "file") {
+      return { file: it.file, path: it.path ?? senderPathForFile(it.file) }
+    }
     const name = it.name?.trim() ? it.name.trim() : "文字消息.txt"
     const finalName = name.toLowerCase().endsWith(".txt") ? name : `${name}.txt`
-    return new File([it.content], finalName, {
-      type: "text/plain;charset=utf-8",
-      lastModified: Date.now(),
-    })
+    return {
+      file: new File([it.content], finalName, {
+        type: "text/plain;charset=utf-8",
+        lastModified: Date.now(),
+      }),
+      path: finalName,
+    }
   })
 }
 

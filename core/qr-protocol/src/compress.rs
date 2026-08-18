@@ -547,8 +547,12 @@ pub fn decompress_stream_to_file(
 /// pre-checked against 2^23 by [`zstd_window_log_ok`], single frame, no
 /// trailing bytes (ruzstd EOFs after the first frame; the source reader's
 /// remaining length is the trailing check), output capped.
-#[cfg(target_arch = "wasm32")]
-fn zstd_decode_bounded(data: &[u8], max_output: usize) -> Result<Vec<u8>> {
+///
+/// Also compiled under `cfg(test)` so native `cargo test` exercises the
+/// web receiver's actual decode stack against native-produced frames —
+/// otherwise half of the cross-end codec matrix has no CI coverage.
+#[cfg(any(target_arch = "wasm32", test))]
+fn wasm_zstd_decode_bounded(data: &[u8], max_output: usize) -> Result<Vec<u8>> {
     if !zstd_window_log_ok(data) {
         return Err(Error::Compress(
             "zstd frame malformed or window exceeds 2^23 (§10.1)".into(),
@@ -566,12 +570,41 @@ fn zstd_decode_bounded(data: &[u8], max_output: usize) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Sink that aborts the lzma-rs decoder the moment its output would exceed
+/// the expected cap: lzma-rs writes decoded bytes through incrementally, so a
+/// hostile "larger than declared" stream cannot transiently allocate its full
+/// expansion before rejection (mirrors `read_capped` on the zstd paths).
+#[cfg(any(target_arch = "wasm32", test))]
+struct CappedWriter {
+    out: Vec<u8>,
+    cap: usize,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl std::io::Write for CappedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.out.len().saturating_add(buf.len()) > self.cap {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "decompressed output exceeds expected size",
+            ));
+        }
+        self.out.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// wasm32 XZ decode via `lzma-rs` (pure Rust). §10.1 bounds: declared
 /// dictionary parsed and capped before the decoder runs, single stream, no
 /// trailing bytes (lzma-rs stops at the footer; the remaining slice length
-/// is the trailing check), output capped.
-#[cfg(target_arch = "wasm32")]
-fn xz_decode_bounded(data: &[u8], max_output: usize, dict_cap: u64) -> Result<Vec<u8>> {
+/// is the trailing check), output capped by [`CappedWriter`] while decoding.
+///
+/// Also compiled under `cfg(test)` — see [`zstd_decode_bounded`].
+#[cfg(any(target_arch = "wasm32", test))]
+fn wasm_xz_decode_bounded(data: &[u8], max_output: usize, dict_cap: u64) -> Result<Vec<u8>> {
     let dict = xz_declared_dict_size(data).map_err(Error::Compress)?;
     if dict > dict_cap {
         return Err(Error::Compress(format!(
@@ -579,8 +612,12 @@ fn xz_decode_bounded(data: &[u8], max_output: usize, dict_cap: u64) -> Result<Ve
         )));
     }
     let mut input = data;
-    let mut out = Vec::new();
-    lzma_rs::xz_decompress(&mut input, &mut out).map_err(|e| Error::Compress(e.to_string()))?;
+    let mut sink = CappedWriter {
+        out: Vec::new(),
+        cap: max_output,
+    };
+    lzma_rs::xz_decompress(&mut input, &mut sink).map_err(|e| Error::Compress(e.to_string()))?;
+    let out = sink.out;
     if out.len() > max_output {
         return Err(Error::Compress(
             "decompressed output exceeds expected size".into(),
@@ -600,8 +637,8 @@ fn xz_decode_bounded(data: &[u8], max_output: usize, dict_cap: u64) -> Result<Ve
 #[cfg(target_arch = "wasm32")]
 pub fn decompress_with_limit(data: &[u8], compression: u8, max_output: usize) -> Result<Vec<u8>> {
     match compression {
-        COMPRESSION_ZSTD => zstd_decode_bounded(data, max_output),
-        COMPRESSION_XZ => xz_decode_bounded(data, max_output, MAX_XZ_DICT_BYTES),
+        COMPRESSION_ZSTD => wasm_zstd_decode_bounded(data, max_output),
+        COMPRESSION_XZ => wasm_xz_decode_bounded(data, max_output, MAX_XZ_DICT_BYTES),
         _ => {
             if !is_known_compression_tag(compression) && !data.is_empty() {
                 return Err(Error::Compress(format!(
@@ -626,7 +663,7 @@ pub fn decompress_chunk(
     chunk_raw_size: u32,
 ) -> Result<Vec<u8>> {
     match compression {
-        COMPRESSION_XZ => xz_decode_bounded(
+        COMPRESSION_XZ => wasm_xz_decode_bounded(
             data,
             max_output,
             u64::from(chunk_raw_size).min(MAX_XZ_DICT_BYTES),
@@ -1031,5 +1068,62 @@ mod tests {
         assert!(xz_out.len() < data.len());
         let xz_dec = decompress_with(&xz_out, COMPRESSION_XZ).unwrap();
         assert_eq!(xz_dec, data);
+    }
+
+    /// The REVERSE cross-end direction: frames produced by the NATIVE C
+    /// encoders (what Android/Windows senders emit) must decode through the
+    /// pure-Rust wasm decoder stack (what the web receiver runs) under the
+    /// same §10.1 bounds. Together with
+    /// [`zrip_and_lzma_rust2_roundtrip_with_decoders`] this closes the whole
+    /// cross-end codec matrix inside plain `cargo test`.
+    #[test]
+    fn native_frames_decode_through_wasm_decoder_stack() {
+        let text: Vec<u8> =
+            b"The quick brown fox jumps over the lazy dog. 1234567890\n".repeat(1000);
+        let zeros = vec![0u8; 300_000];
+
+        // 1. native zstd (fast L1 and max level) → wasm ruzstd decode.
+        for level in [1, 22] {
+            let z = compress(&text, level).unwrap();
+            assert!(
+                zstd_window_log_ok(&z),
+                "native L{level} frame must pass the window pre-check"
+            );
+            assert_eq!(wasm_zstd_decode_bounded(&z, text.len()).unwrap(), text);
+        }
+        assert_eq!(
+            wasm_zstd_decode_bounded(&compress(&zeros, 1).unwrap(), zeros.len()).unwrap(),
+            zeros
+        );
+        // Over-cap rejection fires AT the cap (read_capped stops at max+1).
+        let z = compress(&text, 1).unwrap();
+        assert!(wasm_zstd_decode_bounded(&z, text.len() - 1).is_err());
+        // Trailing garbage after the frame is rejected (single-frame rule).
+        let mut trailed = compress(&text, 1).unwrap();
+        trailed.extend_from_slice(&[0xDE, 0xAD]);
+        assert!(wasm_zstd_decode_bounded(&trailed, text.len()).is_err());
+
+        // 2. native xz (fast p2 + standard preset) → wasm lzma-rs decode.
+        let x2 = compress_xz_preset(&text, 2).unwrap();
+        let x6 = compress_xz_standard(&text).unwrap();
+        for x in [&x2, &x6] {
+            assert_eq!(
+                wasm_xz_decode_bounded(x, text.len(), MAX_XZ_DICT_BYTES).unwrap(),
+                text
+            );
+        }
+        let x0 = compress_xz_preset(&zeros, 2).unwrap();
+        assert!(xz_declared_dict_size(&x0).unwrap() <= MAX_XZ_DICT_BYTES);
+        assert_eq!(
+            wasm_xz_decode_bounded(&x0, zeros.len(), MAX_XZ_DICT_BYTES).unwrap(),
+            zeros
+        );
+        // Over-cap rejection aborts the decoder via the capped writer.
+        assert!(wasm_xz_decode_bounded(&x2, text.len() - 1, MAX_XZ_DICT_BYTES).is_err());
+
+        // 3. web↔web: the pure-Rust wasm encoders through the wasm decoder stack.
+        let opts = zrip::Options::default().window_log(ZSTD_WINDOW_LOG_MAX);
+        let zrip_out = zrip::compress_opts(&text, 2, &opts).unwrap();
+        assert_eq!(wasm_zstd_decode_bounded(&zrip_out, text.len()).unwrap(), text);
     }
 }

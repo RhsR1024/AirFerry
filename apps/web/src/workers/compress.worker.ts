@@ -7,6 +7,9 @@
 
 /// <reference lib="webworker" />
 
+import { senderPathForFile, uniqueSenderPath, type SenderFileItem } from "@/lib/sender-path"
+import { MAX_ORIGINAL_BYTES, MAX_ORIGINAL_MIB } from "@/types"
+
 export const KIND_FILE = 1
 export const KIND_UTF8_TEXT = 2
 export const KIND_DIRECTORY = 3
@@ -60,7 +63,7 @@ self.addEventListener("message", async (e: MessageEvent) => {
 
   const { jobId, files, text, name } = data as {
     jobId: number
-    files?: File[]
+    files?: SenderFileItem[]
     text?: string
     name?: string
   }
@@ -78,6 +81,9 @@ self.addEventListener("message", async (e: MessageEvent) => {
       const cleanName = (name || "文字消息.txt").trim().normalize("NFC")
       displayName = cleanName
       const encoded = new TextEncoder().encode(text)
+      if (encoded.byteLength > MAX_ORIGINAL_BYTES) {
+        throw new Error(`文字内容超过当前网页发送端 ${MAX_ORIGINAL_MIB} MiB 宿主上限`)
+      }
       totalBytes = encoded.byteLength
       items.push({
         kind: KIND_UTF8_TEXT,
@@ -86,30 +92,28 @@ self.addEventListener("message", async (e: MessageEvent) => {
         fingerprint: `t:${encoded.byteLength}:${fnv1a32(encoded)}`,
       })
     } else if (Array.isArray(files) && files.length > 0) {
-      displayName = files[0].name
+      const first = files[0].file
+      displayName = first.name
       if (files.length > 1) {
-        displayName = `${files[0].name} 等 ${files.length} 个文件`
+        displayName = `${first.name} 等 ${files.length} 个文件`
       }
       const usedPaths = new Set<string>()
-      for (const file of files) {
-        if (file.size > 1024 * 1024 * 1024) {
-          throw new Error(`单文件大小超过 1 GiB 上限: ${file.name} (${(file.size / (1024 * 1024)).toFixed(1)} MiB)`)
+      for (const item of files) {
+        const file = item.file
+        if (file.size > MAX_ORIGINAL_BYTES || totalBytes + file.size > MAX_ORIGINAL_BYTES) {
+          throw new Error(
+            `所选内容超过当前网页发送端 ${MAX_ORIGINAL_MIB} MiB 宿主上限: ${file.name}`
+          )
         }
         const buffer = await file.arrayBuffer()
         if (buffer.byteLength !== file.size) {
           throw new Error(`文件读取截断: ${file.name} 期望 ${file.size} 字节，实际读取 ${buffer.byteLength} 字节`)
         }
-        let filePath = (file.name || "unnamed").normalize("NFC")
-        if (usedPaths.has(filePath)) {
-          let counter = 1
-          const dotIdx = filePath.lastIndexOf(".")
-          const stem = dotIdx > 0 ? filePath.substring(0, dotIdx) : filePath
-          const ext = dotIdx > 0 ? filePath.substring(dotIdx) : ""
-          while (usedPaths.has(`${stem} (${counter})${ext}`)) {
-            counter++
-          }
-          filePath = `${stem} (${counter})${ext}`
-        }
+        // Directory hierarchy arrives in item.path: a webkitRelativePath
+        // own-property override on the File does not survive the structured
+        // clone into this worker (the clone re-serializes the browser-native
+        // field, which is empty for picked/walked files).
+        const filePath = uniqueSenderPath(usedPaths, senderPathForFile(file, item.path))
         usedPaths.add(filePath)
         totalBytes += buffer.byteLength
         items.push({

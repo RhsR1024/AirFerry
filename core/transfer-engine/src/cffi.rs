@@ -41,11 +41,12 @@ use std::os::raw::c_char;
 ///
 /// - 1: legacy v1 (pre-AF2) segmented receive path.
 /// - 2: the 16 per-field receiver getters were replaced by the single
-///      [`airferry_receiver_snapshot_json`] (`ReceiverSnapshotV2`).
+///   [`airferry_receiver_snapshot_json`] (`ReceiverSnapshotV2`).
+/// - 3: bounded-memory incremental §13 final verification was added.
 ///
 /// The Windows host (`NativeBridge.NativeAbiVersion`) must verify this at
 /// startup and refuse to run against an older DLL.
-pub const AIRFERRY_NATIVE_ABI_VERSION: u32 = 2;
+pub const AIRFERRY_NATIVE_ABI_VERSION: u32 = 3;
 
 /// Report the native ABI / capability version ([`AIRFERRY_NATIVE_ABI_VERSION`]).
 #[no_mangle]
@@ -209,6 +210,12 @@ pub unsafe extern "C" fn airferry_buffer_free(ptr: *mut u8, len: usize) {
 
 /// Reassemble chunk `index` into a freshly-allocated Rust buffer. Free with
 /// [`airferry_buffer_free`].
+///
+/// # Safety
+/// `handle` must be null or a live receiver created by
+/// [`airferry_receiver_create`], externally serialized against other calls.
+/// `out_buf`/`out_len` must be null or valid for writes. On success the
+/// returned buffer must be freed exactly once via [`airferry_buffer_free`].
 #[no_mangle]
 pub unsafe extern "C" fn airferry_receiver_assemble_chunk(
     handle: *mut ReceiverSession,
@@ -243,6 +250,10 @@ pub unsafe extern "C" fn airferry_receiver_assemble_chunk(
 /// The host persists that chunk via [`airferry_receiver_assemble_chunk`] and
 /// forgets it via [`airferry_receiver_forget_chunk`] to keep native memory
 /// bounded by one chunk instead of the whole object.
+///
+/// # Safety
+/// `handle` must be null or a live receiver created by
+/// [`airferry_receiver_create`], externally serialized against other calls.
 #[no_mangle]
 pub unsafe extern "C" fn airferry_receiver_last_chunk_index(
     handle: *const ReceiverSession,
@@ -257,6 +268,10 @@ pub unsafe extern "C" fn airferry_receiver_last_chunk_index(
 /// Release a persisted chunk from native memory (eviction). Returns 1 when the
 /// chunk was resident, 0 otherwise. Completion tracking is unaffected — the
 /// ledger counts every ChunkReady, not what is still resident.
+///
+/// # Safety
+/// `handle` must be null or a live receiver created by
+/// [`airferry_receiver_create`], externally serialized against other calls.
 #[no_mangle]
 pub unsafe extern "C" fn airferry_receiver_forget_chunk(
     handle: *mut ReceiverSession,
@@ -456,6 +471,11 @@ pub unsafe extern "C" fn airferry_receiver_snapshot_json(
 
 /// Verify a staged raw chunk against the ROOT-bound Manifest chunk table (§11).
 /// Returns 1 on match, 0 on mismatch / manifest not ready yet.
+///
+/// # Safety
+/// `handle` must be null or a live receiver created by
+/// [`airferry_receiver_create`], externally serialized against other calls.
+/// `raw_ptr` must be null or valid for reads of `raw_len` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn airferry_receiver_verify_chunk(
     handle: *const ReceiverSession,
@@ -477,6 +497,11 @@ pub unsafe extern "C" fn airferry_receiver_verify_chunk(
 
 /// Run §13 ⑧⑨ integrity chain over the reassembled canonical stream.
 /// Returns 1 on success, 0 on any verification failure.
+///
+/// # Safety
+/// `handle` must be null or a live receiver created by
+/// [`airferry_receiver_create`], externally serialized against other calls.
+/// `stream_ptr` must be null or valid for reads of `stream_len` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn airferry_receiver_verify_final_stream(
     handle: *const ReceiverSession,
@@ -495,8 +520,70 @@ pub unsafe extern "C" fn airferry_receiver_verify_final_stream(
     if session.verify_final_stream(slice) { 1 } else { 0 }
 }
 
+/// Begin incremental §13 ⑧⑨ verification for spill-backed recovery.
+///
+/// # Safety
+/// `handle` must be null or a live receiver created by
+/// [`airferry_receiver_create`], externally serialized against other calls.
+#[no_mangle]
+pub unsafe extern "C" fn airferry_receiver_final_verify_begin(
+    handle: *mut ReceiverSession,
+) -> i32 {
+    if handle.is_null() {
+        return 0;
+    }
+    let session = unsafe { &mut *handle };
+    if session.final_verify_begin() { 1 } else { 0 }
+}
+
+/// Feed the next contiguous canonical-stream block to the incremental gate.
+///
+/// # Safety
+/// `handle` must be null or a live receiver created by
+/// [`airferry_receiver_create`], externally serialized against other calls.
+/// `stream_ptr` must be null or valid for reads of `stream_len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn airferry_receiver_final_verify_feed(
+    handle: *mut ReceiverSession,
+    stream_ptr: *const u8,
+    stream_len: usize,
+) -> i32 {
+    if handle.is_null() || (stream_ptr.is_null() && stream_len != 0) {
+        return 0;
+    }
+    let session = unsafe { &mut *handle };
+    let slice = if stream_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(stream_ptr, stream_len) }
+    };
+    if session.final_verify_feed(slice) { 1 } else { 0 }
+}
+
+/// Finish incremental §13 ⑧⑨ verification.
+///
+/// # Safety
+/// `handle` must be null or a live receiver created by
+/// [`airferry_receiver_create`], externally serialized against other calls.
+#[no_mangle]
+pub unsafe extern "C" fn airferry_receiver_final_verify_finish(
+    handle: *mut ReceiverSession,
+) -> i32 {
+    if handle.is_null() {
+        return 0;
+    }
+    let session = unsafe { &mut *handle };
+    if session.final_verify_finish() { 1 } else { 0 }
+}
+
 /// Restore receiver from stored ROOT frame bytes + completed chunk indices (§12 resume).
 /// Returns 1 on success, 0 on error.
+///
+/// # Safety
+/// `handle` must be null or a live receiver created by
+/// [`airferry_receiver_create`], externally serialized against other calls.
+/// `root_ptr` must be null or valid for reads of `root_len` bytes;
+/// `completed_ptr` must be null or valid for reads of `completed_len` u32s.
 #[no_mangle]
 pub unsafe extern "C" fn airferry_receiver_resume(
     handle: *mut ReceiverSession,
@@ -521,6 +608,10 @@ pub unsafe extern "C" fn airferry_receiver_resume(
 /// Evict one chunk from both ledgers after a host-side spill re-verification
 /// failure (§11/§12): the sender's next epoch re-supplies it. Returns 1 when
 /// the index was resident in either ledger.
+///
+/// # Safety
+/// `handle` must be null or a live receiver created by
+/// [`airferry_receiver_create`], externally serialized against other calls.
 #[no_mangle]
 pub unsafe extern "C" fn airferry_receiver_invalidate_chunk(
     handle: *mut ReceiverSession,
@@ -703,7 +794,7 @@ mod tests {
     #[test]
     fn abi_version_is_reported() {
         assert_eq!(airferry_native_abi_version(), AIRFERRY_NATIVE_ABI_VERSION);
-        assert_eq!(AIRFERRY_NATIVE_ABI_VERSION, 2);
+        assert_eq!(AIRFERRY_NATIVE_ABI_VERSION, 3);
     }
 
     #[test]

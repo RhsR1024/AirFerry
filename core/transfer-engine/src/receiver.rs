@@ -3,7 +3,7 @@
 //! Provides the shared API consumed by the JNI (Android) and C-ABI (Windows)
 //! native bindings.
 
-use af2::{Af2Receiver, IngestEvent};
+use af2::{Af2Receiver, FinalStreamVerifier, IngestEvent};
 use crate::ingest_status::pack;
 use std::collections::HashMap;
 
@@ -19,6 +19,7 @@ pub struct ReceiverSession {
     /// via [`ReceiverSession::forget_chunk`] — completion is defined by this
     /// ledger, not by what is still resident.
     completed_count: u32,
+    final_verifier: Option<FinalStreamVerifier>,
 }
 
 fn escape_json(s: &str) -> String {
@@ -55,6 +56,7 @@ impl ReceiverSession {
             last_chunk: None,
             completed_chunks: HashMap::new(),
             completed_count: 0,
+            final_verifier: None,
         }
     }
 
@@ -81,7 +83,12 @@ impl ReceiverSession {
                 self.completed_chunks.clear();
                 self.completed_count = 0;
                 self.last_chunk = None;
-                pack(false, true, false, false, 0, 0)
+                self.final_verifier = None;
+                // The explicit relock bit is the ONLY signal hosts may use to
+                // discard transfer artifacts (MetaBound/InstanceSwitched can
+                // legitimately carry received_symbols == 0 right after a
+                // §12 resume).
+                pack(false, true, false, false, 0, 0) | crate::ingest_status::RELOCKED_BIT
             }
             Ok(IngestEvent::MetaBound { .. }) => {
                 pack(self.is_complete(), true, false, false, 0, self.received_symbols)
@@ -164,10 +171,44 @@ impl ReceiverSession {
         self.inner.verify_final_stream(stream).is_ok()
     }
 
+    /// Begin bounded-memory §13 ⑧⑨ verification.
+    pub fn final_verify_begin(&mut self) -> bool {
+        match self.inner.final_stream_verifier() {
+            Ok(v) => {
+                self.final_verifier = Some(v);
+                true
+            }
+            Err(_) => {
+                self.final_verifier = None;
+                false
+            }
+        }
+    }
+
+    /// Feed the next contiguous canonical-stream block into the final gate.
+    pub fn final_verify_feed(&mut self, bytes: &[u8]) -> bool {
+        let Some(v) = self.final_verifier.as_mut() else {
+            return false;
+        };
+        if v.feed(bytes).is_err() {
+            self.final_verifier = None;
+            return false;
+        }
+        true
+    }
+
+    /// Finish bounded-memory §13 ⑧⑨ verification.
+    pub fn final_verify_finish(&mut self) -> bool {
+        self.final_verifier
+            .take()
+            .is_some_and(|v| v.finish().is_ok())
+    }
+
     /// Restore session state from stored ROOT frame bytes + completed chunk indices.
     /// Returns false (leaving the session untouched) when the stored ROOT fails
     /// the full parse + id-binding path.
     pub fn resume(&mut self, root_frame_bytes: &[u8], completed: &[u32]) -> bool {
+        self.final_verifier = None;
         match self.inner.resume(root_frame_bytes, completed) {
             Ok(accepted) => {
                 // Only indices actually inside the transfer count (af2 drops
@@ -241,9 +282,15 @@ impl ReceiverSession {
                 if let Some(m) = self.inner.manifest() {
                     // §7.2 save-time sanitization: hosts materialize with
                     // `save_path`; canonical `path` stays the verification
-                    // identity. The web (wasm) cannot know its client OS, so
-                    // it always gets Windows-safe names — safe everywhere.
-                    let windows_rules = cfg!(windows) || cfg!(target_arch = "wasm32");
+                    // identity. Windows-safe component rules are also used on
+                    // Android: ContentStore/SAF exports may target FAT/exFAT or
+                    // cloud providers whose filename rules are stricter than
+                    // Android's internal ext4 storage. Using the same portable
+                    // save-name set also makes collision disambiguation
+                    // deterministic across all three receiver hosts.
+                    let windows_rules = cfg!(windows)
+                        || cfg!(target_arch = "wasm32")
+                        || cfg!(target_os = "android");
                     let paths: Vec<&str> = m.entries.iter().map(|e| e.path.as_str()).collect();
                     let save_paths = af2::sanitize_save_paths(&paths, windows_rules);
                     for (i, (e, save)) in m.entries.iter().zip(save_paths.iter()).enumerate() {
@@ -425,6 +472,93 @@ mod tests {
             })
             .collect();
         (meta_frame, symbols)
+    }
+
+    #[test]
+    fn resumed_session_first_meta_is_not_relock() {
+        // Regression (§12): after resume() the received-symbol counter is 0, so
+        // the first ACCEPTED frame of the resumed session — always a
+        // MANIFEST/CHUNK META, since same-transfer ROOTs are dropped — carries
+        // exactly the `accepted && received_symbols == 0` signature hosts
+        // historically misread as RELOCK, destroying the resumed spill/ledger.
+        // The explicit RELOCKED_BIT must be the only discriminator.
+        let mut sender = Af2Sender::new(
+            vec![
+                (KIND_FILE, "a.bin".to_string(), vec![0x41u8; 2_000_000]),
+                (KIND_FILE, "b.bin".to_string(), vec![0x42u8; 500_000]),
+            ],
+            SenderConfig {
+                chunk_raw_size: 1 << 20,
+                ..SenderConfig::default()
+            },
+        )
+        .unwrap();
+        let root = sender.next_frame().unwrap(); // bootstrap ROOT
+
+        // Fresh lock: accepted, no relock bit.
+        let mut session = ReceiverSession::new();
+        let word = session.ingest(&root);
+        assert!(word & (1 << 1) != 0, "fresh ROOT locks + accepts");
+        assert_eq!(word & crate::ingest_status::RELOCKED_BIT, 0);
+
+        // §12 resume into a fresh session with one ledger bit.
+        let mut resumed = ReceiverSession::new();
+        assert!(resumed.resume(&root, &[0]));
+
+        // Duplicate same-transfer ROOT: dropped, never a relock.
+        let word = resumed.ingest(&root);
+        assert_eq!(word & (1 << 1), 0, "duplicate ROOT must be dropped");
+        assert_eq!(word & crate::ingest_status::RELOCKED_BIT, 0);
+
+        // Feed the broadcast: the first accepted frame must NOT set the relock
+        // bit even though its received count is still 0 — and the resumed
+        // transfer must still be able to complete.
+        let mut saw_first_accepted = false;
+        let mut completed = false;
+        for _ in 0..20_000 {
+            let word = resumed.ingest(&sender.next_frame().unwrap());
+            if !saw_first_accepted && word & (1 << 1) != 0 {
+                saw_first_accepted = true;
+                assert_eq!(
+                    (word >> 32) & 0xFFFF_FFFF,
+                    0,
+                    "first accepted frame after resume still has a zero counter"
+                );
+                assert_eq!(
+                    word & crate::ingest_status::RELOCKED_BIT,
+                    0,
+                    "MetaBound after resume must NOT look like a relock"
+                );
+            }
+            if word & 1 != 0 {
+                completed = true;
+                break;
+            }
+        }
+        assert!(saw_first_accepted);
+        assert!(completed, "resumed session (chunk 0 from ledger) must complete");
+
+        // A genuinely foreign transfer must set the bit — after the ≥3-frame
+        // mismatch debounce (a single foreign ROOT only counts a streak).
+        let mut foreign = Af2Sender::new(
+            vec![(KIND_FILE, "z.bin".to_string(), vec![0x5Au8; 3000])],
+            SenderConfig {
+                chunk_raw_size: 1 << 20,
+                ..SenderConfig::default()
+            },
+        )
+        .unwrap();
+        let foreign_root = foreign.next_frame().unwrap();
+        let mut word = 0;
+        for _ in 0..3 {
+            word = resumed.ingest(&foreign_root);
+        }
+        assert!(word & (1 << 1) != 0, "foreign ROOT relocks + accepts");
+        assert_ne!(
+            word & crate::ingest_status::RELOCKED_BIT,
+            0,
+            "genuine relock must set RELOCKED_BIT"
+        );
     }
 
     #[test]

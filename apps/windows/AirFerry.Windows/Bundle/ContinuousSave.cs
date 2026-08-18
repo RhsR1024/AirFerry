@@ -207,6 +207,31 @@ public sealed class ContinuousSaver
     public ContinuousSaveReport SaveSingle(string displayName, byte[] bytes) =>
         SaveBytes(displayName, bytes);
 
+    /// <summary>Save a recovered path-backed file without loading it into memory.</summary>
+    public ContinuousSaveReport SaveSingle(BundleFile file)
+    {
+        using Stream input = file.OpenRead();
+        string hash = Convert.ToHexString(SHA256.HashData(input)).ToLowerInvariant();
+        if (_saved.TryGetValue(hash, out SavedRecord? seen) &&
+            VerifySavedRecord(seen, hash))
+        {
+            return Skip(file.Name, file.Size, hash);
+        }
+        _saved.Remove(hash);
+        string? target = ResolveTarget(file.Name, file.Size, hash);
+        if (target is null)
+        {
+            _saved[hash] = new SavedRecord(
+                Path.Combine(_dir, FileNameUtil.Sanitize(file.Name)),
+                IsBundle: false);
+            return Skip(file.Name, file.Size, hash);
+        }
+        WriteAtomic(target, file);
+        _saved[hash] = new SavedRecord(target, IsBundle: false);
+        return new ContinuousSaveReport(
+            ContinuousSaveStatus.Saved, target, Path.GetFileName(target), file.Size, hash);
+    }
+
     /// <summary>
     /// Save a text message as UTF-8 (no BOM) under the (already normalized)
     /// descriptor name — the same encoding ReceiveTextView's save-as uses.
@@ -219,9 +244,9 @@ public sealed class ContinuousSaver
     /// same 发送_MMdd_HHmmss pattern the ContentStore history uses).
     /// Transactional: members are staged in a hidden temp sibling directory
     /// and revealed with one rename, so a mid-bundle failure never leaves a
-    /// normal-looking partial folder behind. Members whose sanitized names
-    /// collide (e.g. "a:b.txt" and "a*b.txt" → "a_b.txt") get the usual
-    /// "(N)" suffix instead of overwriting each other.
+    /// normal-looking partial folder behind. Safe relative directories from
+    /// the Manifest are preserved; collisions within the same directory get
+    /// the usual "(N)" suffix instead of overwriting each other.
     /// Whole-bundle dedup survives restarts via <see cref="BundleMarkerFileName"/>
     /// and is re-verified against the members on disk on every hit.
     /// </summary>
@@ -235,7 +260,7 @@ public sealed class ContinuousSaver
         string name = string.IsNullOrWhiteSpace(title)
             ? $"发送_{DateTime.Now:MMdd_HHmmss}"
             : title!;
-        long total = files.Sum(f => (long)f.Data.LongLength);
+        long total = files.Sum(f => f.Size);
         string digest = BundleDigest(files);
         if (_saved.TryGetValue(digest, out SavedRecord? seen) &&
             VerifySavedRecord(seen, digest))
@@ -258,22 +283,17 @@ public sealed class ContinuousSaver
         try
         {
             Directory.CreateDirectory(stagingDir);
-            // Sanitize is not injective: track the names already used so a
-            // second member with the same sanitized name lands on "(1)".
-            var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var manifest = new List<BundleMemberManifestEntry>(files.Count);
             foreach (BundleFile f in files)
             {
-                string safeMember = FileNameUtil.Sanitize(f.Name);
-                string memberPath = used.Contains(safeMember)
-                    ? FileNameUtil.UniqueTarget(stagingDir, safeMember)
-                    : Path.Combine(stagingDir, safeMember);
-                used.Add(Path.GetFileName(memberPath));
-                WriteAtomic(memberPath, f.Data);
+                string memberPath = FileNameUtil.UniqueRelativeTarget(stagingDir, f.Name);
+                WriteAtomic(memberPath, f);
+                string relative = Path.GetRelativePath(stagingDir, memberPath)
+                    .Replace('\\', '/');
                 manifest.Add(new BundleMemberManifestEntry(
-                    Path.GetFileName(memberPath),
-                    f.Data.LongLength,
-                    ContentStoreSha256(f.Data)));
+                    relative,
+                    f.Size,
+                    ContentStoreSha256(f)));
             }
             WriteBundleMarker(stagingDir, new BundleMarker(digest, manifest));
             Directory.Move(stagingDir, finalDir);
@@ -438,13 +458,18 @@ public sealed class ContinuousSaver
         }
         foreach (BundleMemberManifestEntry m in marker.Members)
         {
-            // Recorded names are our own sanitized final names; reject any
-            // path-shaped entry defensively anyway.
-            if (Path.GetFileName(m.Name) != m.Name)
+            // Marker paths are our own sanitized bundle-relative names. Any
+            // traversal or illegal component changes under re-sanitization and
+            // therefore fails closed before Path.Combine is used.
+            string normalized = m.Name.Replace('\\', '/');
+            if (!string.Equals(
+                    FileNameUtil.SanitizeRelativePath(normalized),
+                    normalized,
+                    StringComparison.Ordinal))
             {
                 return false;
             }
-            string path = Path.Combine(dir, m.Name);
+            string path = Path.Combine(dir, normalized.Replace('/', Path.DirectorySeparatorChar));
             if (!File.Exists(path) ||
                 new FileInfo(path).Length != m.Size ||
                 HashFile(path) != m.Sha256)
@@ -701,12 +726,14 @@ public sealed class ContinuousSaver
     private static ContinuousSaveReport Skip(string name, long size, string hash) =>
         new(ContinuousSaveStatus.SkippedDuplicate, null, name, size, hash);
 
-    private static string ContentStoreSha256(byte[] bytes)
+    private static string ContentStoreSha256(BundleFile file)
     {
-        // Same digest form as ContentStore.Sha256Hex so hashes stay comparable
-        // across the store and the continuous folder.
-        return Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
+        using Stream stream = file.OpenRead();
+        return Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
     }
+
+    private static string ContentStoreSha256(byte[] bytes) =>
+        Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
 
     private static string HashFile(string path)
     {
@@ -731,11 +758,40 @@ public sealed class ContinuousSaver
             BinaryPrimitives.WriteUInt64BigEndian(len, (ulong)f.Name.Length);
             sha.AppendData(len);
             sha.AppendData(Encoding.UTF8.GetBytes(f.Name));
-            BinaryPrimitives.WriteUInt64BigEndian(len, (ulong)f.Data.LongLength);
+            BinaryPrimitives.WriteUInt64BigEndian(len, (ulong)f.Size);
             sha.AppendData(len);
-            sha.AppendData(f.Data);
+            using Stream input = f.OpenRead();
+            byte[] buffer = new byte[1024 * 1024];
+            int read;
+            while ((read = input.Read(buffer, 0, buffer.Length)) > 0)
+            {
+                sha.AppendData(buffer.AsSpan(0, read));
+            }
         }
         return Convert.ToHexString(sha.GetHashAndReset()).ToLowerInvariant();
+    }
+
+    private static void WriteAtomic(string path, BundleFile file)
+    {
+        string? dir = Path.GetDirectoryName(path);
+        if (dir is null) throw new IOException("目标路径没有目录");
+        Directory.CreateDirectory(dir);
+        string temp = Path.Combine(dir, $".{Path.GetFileName(path)}.{Guid.NewGuid():N}.tmp");
+        try
+        {
+            using Stream input = file.OpenRead();
+            using (var output = new FileStream(temp, FileMode.CreateNew, FileAccess.Write,
+                       FileShare.None, 1024 * 1024, FileOptions.WriteThrough))
+            {
+                input.CopyTo(output, 1024 * 1024);
+                output.Flush(flushToDisk: true);
+            }
+            File.Move(temp, path, overwrite: false);
+        }
+        finally
+        {
+            if (File.Exists(temp)) File.Delete(temp);
+        }
     }
 
     private static void WriteAtomic(string path, byte[] bytes)

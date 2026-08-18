@@ -4,6 +4,7 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
@@ -60,6 +61,19 @@ class ChunkSpillStoreTest {
         store.write(0, 8192, ByteArray(8192) { 0x11 })
         store.write(0, 8192, ByteArray(8192) { 0x22 })
         assertArrayEquals(ByteArray(8192) { 0x22 }, store.readRange(0, 8192)!!)
+    }
+
+    @Test
+    fun durableBitmapDistinguishesSparseHolesAndResumeBits() {
+        val store = ChunkSpillStore(tmp.root, "tid-known")
+        store.write(2, 8192, ByteArray(8192) { 3 })
+        assertFalse(store.hasChunk(0))
+        assertTrue(store.hasChunk(2))
+
+        val reopened = ChunkSpillStore(tmp.root, "tid-known")
+        assertFalse(reopened.hasChunk(2)) // file length alone proves nothing
+        reopened.markResumed(intArrayOf(2))
+        assertTrue(reopened.hasChunk(2))
     }
 
     @Test

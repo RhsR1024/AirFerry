@@ -18,11 +18,12 @@ object NativeBridge {
      * - 1: legacy v1 (pre-AF2) segmented / large-file receive path.
      * - 2: the 16 per-field receiver getters were replaced by the single
      *   [receiverSnapshotJson] (`ReceiverSnapshotV2`).
+     * - 3: bounded-memory incremental §13 final verification.
      * A stale `.so` either lacks this symbol (calling it throws
      * `UnsatisfiedLinkError`) or reports an older version — either way the
      * host must refuse to run instead of silently "staying synchronising".
      */
-    const val NATIVE_ABI_VERSION = 2
+    const val NATIVE_ABI_VERSION = 3
 
     /** Report the native ABI / protocol capability version. */
     external fun nativeAbiVersion(): Int
@@ -89,6 +90,15 @@ object NativeBridge {
 
     /** Run §13 ⑧⑨ integrity chain over the reassembled canonical stream. */
     external fun receiverVerifyFinalStream(handle: Long, streamBytes: ByteArray): Boolean
+
+    /** Begin bounded-memory §13 ⑧⑨ final verification. */
+    external fun receiverFinalVerifyBegin(handle: Long): Boolean
+
+    /** Feed the next contiguous canonical-stream block. */
+    external fun receiverFinalVerifyFeed(handle: Long, streamBytes: ByteArray): Boolean
+
+    /** Finish bounded-memory §13 ⑧⑨ final verification. */
+    external fun receiverFinalVerifyFinish(handle: Long): Boolean
 
     /** Restore receiver from stored ROOT frame bytes + completed chunk indices (§12 resume). */
     external fun receiverResume(handle: Long, rootFrameBytes: ByteArray, completedIndices: IntArray): Boolean

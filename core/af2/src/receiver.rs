@@ -92,6 +92,202 @@ pub enum FinalizeError {
     ContentId,
 }
 
+/// Incremental form of the §13 ⑧⑨ finalization gate.
+///
+/// Hosts that spill completed chunks to disk can feed the canonical content
+/// stream in bounded blocks instead of materializing the whole transfer in
+/// memory. This preserves the same guarantees as
+/// [`Af2Receiver::verify_final_stream`].
+///
+/// A verifier that has returned an error is POISONED: internal counters may
+/// have advanced past the rejected bytes. Callers must treat any `Err` as
+/// terminal and drop the verifier (the transfer-engine bindings do exactly
+/// that); continuing to feed after an error produces a hash mismatch, never
+/// a false accept.
+pub struct FinalStreamVerifier {
+    root: RootRecord,
+    manifest: Manifest,
+    position: u64,
+    entry_index: usize,
+    entry_consumed: u64,
+    entry_hasher: blake3::Hasher,
+    utf8_carry: [u8; 4],
+    utf8_carry_len: usize,
+}
+
+impl FinalStreamVerifier {
+    fn new(root: RootRecord, manifest: Manifest) -> Self {
+        Self {
+            root,
+            manifest,
+            position: 0,
+            entry_index: 0,
+            entry_consumed: 0,
+            entry_hasher: blake3::Hasher::new(),
+            utf8_carry: [0; 4],
+            utf8_carry_len: 0,
+        }
+    }
+
+    pub fn feed(&mut self, bytes: &[u8]) -> Result<(), FinalizeError> {
+        let got = self
+            .position
+            .checked_add(bytes.len() as u64)
+            .ok_or(FinalizeError::Length {
+                want: self.root.total_raw_size,
+                got: u64::MAX,
+            })?;
+        if got > self.root.total_raw_size {
+            return Err(FinalizeError::Length {
+                want: self.root.total_raw_size,
+                got,
+            });
+        }
+
+        let mut rest = bytes;
+        self.advance_zero_sized_entries()?;
+        while !rest.is_empty() {
+            if self.entry_index >= self.manifest.entries.len() {
+                return Err(FinalizeError::Length {
+                    want: self.root.total_raw_size,
+                    got,
+                });
+            }
+            let (kind, content_size) = {
+                let e = &self.manifest.entries[self.entry_index];
+                (e.kind, e.content_size)
+            };
+            if kind == KIND_DIRECTORY {
+                self.entry_index += 1;
+                self.advance_zero_sized_entries()?;
+                continue;
+            }
+            let remaining = content_size.saturating_sub(self.entry_consumed);
+            let take = remaining.min(rest.len() as u64) as usize;
+            let part = &rest[..take];
+            self.entry_hasher.update(part);
+            if kind == KIND_UTF8_TEXT && !self.feed_utf8(part) {
+                return Err(FinalizeError::NotUtf8 {
+                    index: self.entry_index,
+                });
+            }
+            self.entry_consumed += take as u64;
+            self.position += take as u64;
+            rest = &rest[take..];
+            if self.entry_consumed == content_size {
+                self.finalize_current_entry()?;
+                self.entry_index += 1;
+                self.entry_consumed = 0;
+                self.entry_hasher = blake3::Hasher::new();
+                self.utf8_carry_len = 0;
+                self.advance_zero_sized_entries()?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<(), FinalizeError> {
+        self.advance_zero_sized_entries()?;
+        if self.position != self.root.total_raw_size ||
+            self.entry_index != self.manifest.entries.len()
+        {
+            return Err(FinalizeError::Length {
+                want: self.root.total_raw_size,
+                got: self.position,
+            });
+        }
+        verify_manifest_identity(&self.root, &self.manifest)
+    }
+
+    fn advance_zero_sized_entries(&mut self) -> Result<(), FinalizeError> {
+        while self.entry_index < self.manifest.entries.len() {
+            let (kind, content_size) = {
+                let e = &self.manifest.entries[self.entry_index];
+                (e.kind, e.content_size)
+            };
+            if kind == KIND_DIRECTORY {
+                self.entry_index += 1;
+                continue;
+            }
+            if content_size != 0 {
+                break;
+            }
+            self.finalize_current_entry()?;
+            self.entry_index += 1;
+            self.entry_consumed = 0;
+            self.entry_hasher = blake3::Hasher::new();
+            self.utf8_carry_len = 0;
+        }
+        Ok(())
+    }
+
+    fn finalize_current_entry(&self) -> Result<(), FinalizeError> {
+        let e = &self.manifest.entries[self.entry_index];
+        if self.entry_hasher.finalize().as_bytes() != &e.content_hash {
+            return Err(FinalizeError::EntryHash {
+                index: self.entry_index,
+            });
+        }
+        if e.kind == KIND_UTF8_TEXT && self.utf8_carry_len != 0 {
+            return Err(FinalizeError::NotUtf8 {
+                index: self.entry_index,
+            });
+        }
+        Ok(())
+    }
+
+    fn feed_utf8(&mut self, mut bytes: &[u8]) -> bool {
+        if self.utf8_carry_len != 0 {
+            let expected = match utf8_sequence_len(self.utf8_carry[0]) {
+                Some(n) => n,
+                None => return false,
+            };
+            let need = expected.saturating_sub(self.utf8_carry_len);
+            let take = need.min(bytes.len());
+            self.utf8_carry[self.utf8_carry_len..self.utf8_carry_len + take]
+                .copy_from_slice(&bytes[..take]);
+            self.utf8_carry_len += take;
+            bytes = &bytes[take..];
+            if self.utf8_carry_len < expected {
+                return true;
+            }
+            if core::str::from_utf8(&self.utf8_carry[..expected]).is_err() {
+                return false;
+            }
+            self.utf8_carry_len = 0;
+        }
+
+        if bytes.is_empty() {
+            return true;
+        }
+        match core::str::from_utf8(bytes) {
+            Ok(_) => true,
+            Err(err) => {
+                if err.error_len().is_some() {
+                    return false;
+                }
+                let tail = &bytes[err.valid_up_to()..];
+                if tail.is_empty() || tail.len() > 3 {
+                    return false;
+                }
+                self.utf8_carry[..tail.len()].copy_from_slice(tail);
+                self.utf8_carry_len = tail.len();
+                true
+            }
+        }
+    }
+}
+
+fn utf8_sequence_len(first: u8) -> Option<usize> {
+    match first {
+        0x00..=0x7f => Some(1),
+        0xc2..=0xdf => Some(2),
+        0xe0..=0xef => Some(3),
+        0xf0..=0xf4 => Some(4),
+        _ => None,
+    }
+}
+
 /// Session-mismatch debounce: 3 consistent foreign ROOTs re-lock (v1 lesson).
 const MISMATCH_RELOCK_THRESHOLD: u32 = 3;
 
@@ -657,6 +853,17 @@ impl Af2Receiver {
         verify_stream(root, manifest, stream)
     }
 
+    /// Start an incremental §13 ⑧⑨ verifier for bounded-memory hosts.
+    pub fn final_stream_verifier(&self) -> Result<FinalStreamVerifier, FinalizeError> {
+        let root = self.root.as_ref().ok_or(FinalizeError::NotReady)?.clone();
+        let manifest = self
+            .manifest
+            .as_ref()
+            .ok_or(FinalizeError::NotReady)?
+            .clone();
+        Ok(FinalStreamVerifier::new(root, manifest))
+    }
+
     fn finish_chunk(
         &mut self,
         index: u32,
@@ -752,6 +959,13 @@ pub fn verify_stream(
             return Err(FinalizeError::NotUtf8 { index });
         }
     }
+    verify_manifest_identity(root, manifest)
+}
+
+fn verify_manifest_identity(
+    root: &RootRecord,
+    manifest: &Manifest,
+) -> Result<(), FinalizeError> {
     let recomputed = content_id(
         &manifest
             .entries
@@ -1609,5 +1823,89 @@ mod tests {
         assert!(rx.manifest().is_some());
         assert!(!rx.verify_chunk(0, &evil_raw), "evil chunk fails the table");
         assert!(rx.verify_chunk(0, &good_data), "good chunk passes");
+    }
+
+    /// Hosts (Web/Android/Windows) now finish a transfer by feeding the
+    /// canonical stream chunk-by-chunk into [`FinalStreamVerifier`] instead
+    /// of materializing the whole stream. This walks the exact same sequence
+    /// for a multi-entry bundle (directories, an empty file, a UTF-8 text
+    /// whose multibyte char straddles a chunk boundary, and a binary file)
+    /// and requires the same verdicts as the whole-stream gate.
+    #[test]
+    fn incremental_final_verifier_accepts_bundle_and_rejects_corruption() {
+        use crate::sender::{Af2Sender, SenderConfig};
+
+        let chunk_raw_size: u32 = 1 << 20; // minimum legal chunk size
+        // "é" (0xC3 0xA9) must straddle the first 1 MiB chunk boundary.
+        let mut note = vec![b'x'; (chunk_raw_size - 1) as usize];
+        note.extend_from_slice("é跨块边界 tail".as_bytes());
+        note.extend_from_slice(b";");
+        note.extend(std::iter::repeat(b'n').take(100_000));
+        let bin: Vec<u8> = (0..1_300_000u32).map(|i| (i % 251) as u8).collect();
+
+        let items = vec![
+            (crate::id::KIND_DIRECTORY, "a".to_string(), Vec::new()),
+            (crate::id::KIND_FILE, "a/empty.dat".to_string(), Vec::new()),
+            (crate::id::KIND_DIRECTORY, "a/sub".to_string(), Vec::new()),
+            (crate::id::KIND_UTF8_TEXT, "a/sub/note.txt".to_string(), note),
+            (crate::id::KIND_FILE, "b/data.bin".to_string(), bin),
+        ];
+        let config = SenderConfig {
+            chunk_raw_size,
+            ..SenderConfig::default()
+        };
+        let mut sender = Af2Sender::new(items, config).unwrap();
+        let expected_chunks = {
+            let (_m, rest) = crate::manifest::Manifest::parse(sender.manifest_bytes()).unwrap();
+            let _ = rest;
+            _m.chunk_count as usize
+        };
+        assert!(expected_chunks >= 3, "bundle must span several chunks");
+
+        let mut rx = Af2Receiver::new();
+        let mut chunks: Vec<Option<Vec<u8>>> = vec![None; expected_chunks];
+        let mut done = false;
+        for _ in 0..20000 {
+            let f = sender.next_frame().unwrap();
+            if let IngestEvent::ChunkReady { index, raw } = rx.ingest(&f).unwrap() {
+                chunks[index as usize] = Some(raw);
+            }
+            done = rx.manifest().is_some() && chunks.iter().all(|c| c.is_some());
+            if done {
+                break;
+            }
+        }
+        assert!(done, "manifest and all chunks must decode");
+        let chunks: Vec<Vec<u8>> = chunks.into_iter().map(Option::unwrap).collect();
+
+        // The host assemble flow: begin → per-chunk feed → finish.
+        let mut verifier = rx.final_stream_verifier().unwrap();
+        for c in &chunks {
+            verifier.feed(c).unwrap();
+        }
+        verifier.finish().unwrap();
+
+        // Identical verdict to the whole-stream §13 gate.
+        let stream = chunks.concat();
+        assert!(rx.verify_final_stream(&stream).is_ok());
+
+        // A corrupted staged copy (e.g. storage bit rot after verify_chunk)
+        // must fail the incremental entry-hash gate — either during feed (the
+        // entry completes inside the flipped chunk) or at finish.
+        let mut bad = chunks.clone();
+        let last = bad.last_mut().unwrap();
+        last[16] ^= 0xFF;
+        let mut verifier = rx.final_stream_verifier().unwrap();
+        let mut rejected = false;
+        for c in &bad {
+            if verifier.feed(c).is_err() {
+                rejected = true;
+                break;
+            }
+        }
+        assert!(
+            rejected || verifier.finish().is_err(),
+            "corrupt bundle must fail"
+        );
     }
 }

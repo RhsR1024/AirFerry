@@ -6,6 +6,7 @@ import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
@@ -39,6 +40,7 @@ import com.airferry.app.scan.Af2LedgerStore
 import com.airferry.app.scan.ContentStore
 import com.airferry.app.scan.CreateNamedDocument
 import com.airferry.app.scan.FileTransfer
+import com.airferry.app.scan.SafTreeExporter
 import com.airferry.app.scan.TextLike
 import java.io.File
 import java.util.concurrent.Executors
@@ -80,6 +82,7 @@ class FileListActivity : ComponentActivity() {
 
     private val saveQueue = ArrayDeque<Pair<File, String>>()
     private var pendingSave: Pair<File, String>? = null
+    private var pendingTreeSave: List<Pair<File, String>> = emptyList()
     private var indexErrorShown = false
 
     /**
@@ -122,6 +125,39 @@ class FileListActivity : ComponentActivity() {
             }
         } else {
             advanceSaveQueue()
+        }
+    }
+
+    private val openSaveTree = registerForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri: Uri? ->
+        val jobs = pendingTreeSave
+        pendingTreeSave = emptyList()
+        if (uri == null || jobs.isEmpty()) return@registerForActivityResult
+        Toast.makeText(this, "正在保存 ${jobs.size} 个文件…", Toast.LENGTH_SHORT).show()
+        try {
+            bgExecutor.execute {
+                var saved = 0
+                val error = try {
+                    saved = SafTreeExporter.copyAll(
+                        this,
+                        uri,
+                        jobs.map { (file, name) -> SafTreeExporter.Item(file, name) },
+                    )
+                    null
+                } catch (e: Exception) {
+                    e.message ?: e.javaClass.simpleName
+                }
+                runOnUiThread {
+                    if (error == null) {
+                        Toast.makeText(this, "已保存 $saved 个文件", Toast.LENGTH_LONG).show()
+                    } else {
+                        Toast.makeText(this, "保存失败（已保存 $saved 个）: $error", Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+        } catch (_: RejectedExecutionException) {
+            // Activity is already being destroyed.
         }
     }
 
@@ -524,6 +560,16 @@ class FileListActivity : ComponentActivity() {
         val pairs = flatten(rows)
         if (pairs.isEmpty()) {
             Toast.makeText(this, "没有可保存的文件", Toast.LENGTH_SHORT).show()
+            return
+        }
+        // A directory picker is both less tedious for multi-save and the only
+        // SAF flow that can preserve a bundle member such as `dir/a.txt` as an
+        // actual subdirectory. Keep ACTION_CREATE_DOCUMENT for a lone flat file.
+        if (pairs.size > 1 || pairs.any { (_, name) -> '/' in name || '\\' in name }) {
+            saveQueue.clear()
+            pendingSave = null
+            pendingTreeSave = pairs
+            openSaveTree.launch(null)
             return
         }
         saveQueue.clear()

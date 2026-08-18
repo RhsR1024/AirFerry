@@ -18,6 +18,13 @@
 //! - bit  3      : `chunk_ready` (1 on the frame that completed a chunk —
 //!   fetch it with `receiver_assemble_chunk(last_chunk_index)`
 //!   then release it with `receiver_forget_chunk`)
+//! - bit  4      : `relocked` (1 ONLY on [`RELOCKED_BIT`]: a foreign transfer
+//!   now owns the session and every host-side transfer artifact — chunk
+//!   spill, resume ledger, pending re-verify set — belongs to nobody.
+//!   Hosts must react to THIS bit, never to the `accepted && received == 0`
+//!   heuristic: after a §12 resume `received_symbols` is still 0, so the
+//!   first accepted META frame of the resumed session carries exactly that
+//!   heuristic signature and would spuriously destroy the resumed data.)
 //! - bits 8..23  : `session_mismatch_streak` (0..=0xFFFF, clamped)
 //! - bits 32..63 : `received_symbols` (low 32 bits; real transfers stay well
 //!   below 2^32)
@@ -33,6 +40,14 @@ const CHUNK_READY_BIT: u32 = 3;
 const STREAK_OFFSET: u32 = 8;
 const STREAK_WIDTH: u32 = 16;
 const RECEIVED_OFFSET: u32 = 32;
+
+/// Set on the one frame where a foreign transfer took over the session
+/// (`Relocked`). The ONLY signal hosts may use to discard transfer-owned
+/// artifacts — see the module-level layout notes for why the historical
+/// `accepted && received_symbols == 0` heuristic is wrong (it also matches
+/// `MetaBound`/`InstanceSwitched` on a freshly §12-resumed session whose
+/// counter is still zero).
+pub const RELOCKED_BIT: u64 = 1u64 << 4;
 
 /// Error sentinel: `received_symbols = u32::MAX` with all flags clear. The host
 /// treats this as "frame rejected / nothing to do". Kept bit-for-bit identical
@@ -128,5 +143,16 @@ mod tests {
         // The sentinel must keep all flag bits clear so the host can't mistake
         // it for a normal "complete + accepted" frame.
         assert_eq!(INGEST_ERROR & 0b11, 0);
+    }
+
+    #[test]
+    fn relocked_bit_is_independent_and_outside_existing_fields() {
+        assert_eq!(RELOCKED_BIT, 1u64 << 4);
+        // Orthogonal to the event flags and every packed field.
+        assert_eq!(RELOCKED_BIT & 0b1111, 0);
+        assert_eq!((RELOCKED_BIT >> 8) & 0xFFFF, 0);
+        assert_eq!(RELOCKED_BIT >> 32, 0);
+        // A Relocked word packs accepted + the bit and nothing else.
+        assert_eq!(pack(false, true, false, false, 0, 0) | RELOCKED_BIT, 0b1_0010);
     }
 }

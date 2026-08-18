@@ -25,10 +25,10 @@ public partial class App : Application
             // airferry_receiver_snapshot_json and would otherwise fail on the
             // first decoded QR frame with an EntryPointNotFoundException.
             uint abi = NativeBridge.NativeAbiVersion();
-            if (abi < NativeBridge.NativeAbiVersion2)
+            if (abi < NativeBridge.NativeAbiVersion3)
             {
                 Services.UiMessages.ErrorAsync(
-                    $"原生引擎版本过旧（ABI v{abi}，需要 v{NativeBridge.NativeAbiVersion2}）。" +
+                    $"原生引擎版本过旧（ABI v{abi}，需要 v{NativeBridge.NativeAbiVersion3}）。" +
                     "请重新安装最新版 AirFerry。");
                 Shutdown(-1);
                 return;

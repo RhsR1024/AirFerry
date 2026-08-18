@@ -144,4 +144,58 @@ public class Af2LedgerStoreTests
             Directory.Delete(dir, recursive: true);
         }
     }
+
+    [Fact]
+    public void CorruptNewestJournalFallsBackToOlderValidOne()
+    {
+        string dir = TempRoot();
+        try
+        {
+            var old = Af2LedgerStore.Create(dir, "tid-old", 8192, RootFrame);
+            old.Commit(1);
+            File.SetLastWriteTimeUtc(Path.Combine(dir, "af2-tid-old.ledger.jsonl"),
+                DateTime.UtcNow.AddMinutes(-2));
+            string corrupt = Path.Combine(dir, "af2-tid-new.ledger.jsonl");
+            File.WriteAllText(corrupt, "not-json\n");
+            File.SetLastWriteTimeUtc(corrupt, DateTime.UtcNow);
+
+            var loaded = Af2LedgerStore.LoadMostRecent(dir);
+            Assert.NotNull(loaded);
+            Assert.Equal("tid-old", loaded!.TransferIdHex);
+            Assert.Equal(new[] { 1 }, loaded.CompletedIndices);
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void SweepOrphanPartialsKeepsOnlyValidJournalBackings()
+    {
+        string dir = TempRoot();
+        try
+        {
+            Af2LedgerStore.Create(dir, "tid-live", 8192, RootFrame);
+            string live = Path.Combine(dir, "af2-tid-live.partial");
+            string orphan = Path.Combine(dir, "af2-tid-orphan.partial");
+            string badJournal = Path.Combine(dir, "af2-tid-bad.ledger.jsonl");
+            string badPartial = Path.Combine(dir, "af2-tid-bad.partial");
+            File.WriteAllBytes(live, [1]);
+            File.WriteAllBytes(orphan, [2]);
+            File.WriteAllText(badJournal, "bad");
+            File.WriteAllBytes(badPartial, [3]);
+
+            Af2LedgerStore.SweepOrphanPartials(dir);
+
+            Assert.True(File.Exists(live));
+            Assert.False(File.Exists(orphan));
+            Assert.False(File.Exists(badJournal));
+            Assert.False(File.Exists(badPartial));
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
 }

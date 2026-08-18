@@ -35,6 +35,11 @@ lzma-rust2 = { version = "0.19", default-features = false, features = ["std", "e
 # Host tests cross-verify the pure-Rust wasm32 codecs against native decoders
 zrip = { version = "0.8", default-features = false, features = ["std", "frame"] }
 lzma-rust2 = { version = "0.19", default-features = false, features = ["std", "encoder", "xz"] }
+# ...and the wasm32 DECODER stack against native-produced frames: ruzstd /
+# lzma-rs only build as wasm32 target deps normally, so mirror them here to
+# give the web receiver's decode path real CI coverage on native test runs.
+ruzstd = "0.7"
+lzma-rs = "0.3"
 
 [features]
 default = []

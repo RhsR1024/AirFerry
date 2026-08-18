@@ -575,20 +575,34 @@ class ScanActivity : ComponentActivity() {
      * is worthless — the chunk bytes live there — and is dropped.
      */
     private fun tryResumeFromLedger() {
-        val led = try {
-            Af2LedgerStore.loadMostRecent(cacheDir)
+        try {
+            Af2LedgerStore.sweepOrphanPartials(cacheDir)
         } catch (e: Exception) {
-            Log.w(TAG, "ledger scan failed", e); null
-        } ?: return
-        val spillFile = java.io.File(cacheDir, "af2-${led.transferIdHex}.partial")
-        if (!spillFile.isFile || !session.resume(led.rootFrameBytes, led.completedIndices)) {
-            led.discard()
+            Log.w(TAG, "resume orphan sweep failed", e)
+        }
+        val attempted = mutableSetOf<String>()
+        while (true) {
+            val led = try {
+                Af2LedgerStore.loadMostRecent(cacheDir)
+            } catch (e: Exception) {
+                Log.w(TAG, "ledger scan failed", e); null
+            } ?: return
+            if (!attempted.add(led.transferIdHex)) return
+            val spillFile = java.io.File(cacheDir, "af2-${led.transferIdHex}.partial")
+            if (!spillFile.isFile || !session.resume(led.rootFrameBytes, led.completedIndices)) {
+                // A structurally parseable but semantically invalid ROOT (or a
+                // missing spill) must not mask an older valid resume task.
+                led.discard()
+                spillFile.delete()
+                continue
+            }
+            ledger = led
+            chunkSpill = ChunkSpillStore(cacheDir, led.transferIdHex)
+            chunkSpill?.markResumed(led.completedIndices)
+            pendingReverify = led.completedIndices.toMutableSet()
+            Log.i(TAG, "resumed transfer ${led.transferIdHex} with ${led.completedIndices.size} chunks")
             return
         }
-        ledger = led
-        chunkSpill = ChunkSpillStore(cacheDir, led.transferIdHex)
-        pendingReverify = led.completedIndices.toMutableSet()
-        Log.i(TAG, "resumed transfer ${led.transferIdHex} with ${led.completedIndices.size} chunks")
     }
 
     /**
@@ -610,12 +624,16 @@ class ScanActivity : ComponentActivity() {
             val off = i.toLong() * crs
             val len = (snap.totalRawSize - off).coerceIn(0, crs)
             val bytes = spill.readRange(off, len)
-            if (bytes == null) continue // spill short — retry on a later tick
             iter.remove()
-            if (!session.verifyChunk(i, bytes)) {
+            if (bytes == null || !session.verifyChunk(i, bytes)) {
+                // resume() already marked this index complete in the native
+                // chunk ledger. A missing/short spill range cannot repair
+                // itself while that bit remains set: replayed chunk META is
+                // dropped as already done. Invalidate immediately so the next
+                // sender epoch can actually re-supply it.
                 session.invalidateChunk(i)
                 led.invalidate(i)
-                Log.w(TAG, "resumed chunk $i failed re-verification; invalidated")
+                Log.w(TAG, "resumed chunk $i missing/corrupt; invalidated for re-supply")
             }
         }
         if (pend.isEmpty()) pendingReverify = null
@@ -635,12 +653,14 @@ class ScanActivity : ComponentActivity() {
         // Bounded-memory ledger: spill + evict the chunk this frame completed so
         // native memory stays O(chunk) instead of O(whole object). The same
         // serialized ingest thread drains it, so no extra synchronization.
-        if (status.accepted && status.receivedSymbols == 0) {
-            // Relock (or first lock): a foreign Transfer now owns the session —
-            // the old spill's bytes belong to nobody. Discard before any drain.
-            // The ledger journal follows: its ROOT/completed set reference the
-            // abandoned transfer. (A resumed same-transfer session never gets
-            // here — duplicate ROOTs are dropped, not re-locked.)
+        if (status.relocked) {
+            // A foreign Transfer now owns the session — the old spill's bytes
+            // belong to nobody. Discard before any drain. The ledger journal
+            // follows: its ROOT/completed set reference the abandoned transfer.
+            // The explicit bit is the only trigger: the historical
+            // `accepted && receivedSymbols == 0` heuristic also matched the
+            // first accepted META of a §12-resumed session (counter still 0),
+            // destroying the resumed spill and making completion impossible.
             chunkSpill?.discard()
             chunkSpill = null
             ledger?.discard()
@@ -925,15 +945,13 @@ class ScanActivity : ComponentActivity() {
         return intent
     }
 
-    /** Transfers up to this size get the full §13 ⑧⑨ final gate (entry hashes
-     *  + UTF-8 + Content ID recompute) over the whole stream; larger ones rely
-     *  on the per-chunk Manifest-table verification below — reading a
-     *  multi-hundred-MiB stream into memory would trade bounded-memory
-     *  receipt for an avoidable OOM at publish. */
-    private val finalVerifyMemoryLimit: Long = 64L * 1024 * 1024
-
     private fun stageFromLedger(displayName: String): Intent? {
         updateRecoveryStage("正在组装数据…")
+        // Entry staging is exclusive to this recovery pass (ingest lock);
+        // wipe orphans a process kill may have left from a previous staging.
+        val stageDir = java.io.File(cacheDir, "af2-entry-stage")
+        if (stageDir.exists()) stageDir.deleteRecursively()
+        stageDir.mkdirs()
         val snapshot = session.snapshot()
 
         // Prefer the on-disk chunk spill: every completed chunk was pwrite'd
@@ -943,8 +961,7 @@ class ScanActivity : ComponentActivity() {
         // sessions that completed without a spill (defensive).
         val spill = chunkSpill
         val spillUsable =
-            spill != null && snapshot.totalRawSize > 0 &&
-                spill.length() >= snapshot.totalRawSize
+            spill != null && snapshot.totalRawSize > 0 && snapshot.chunkCount > 0
         val stream: ByteArray? = if (spillUsable) null else session.assemble()
         if (stream == null && !spillUsable) {
             clearRecoveryStage()
@@ -959,25 +976,80 @@ class ScanActivity : ComponentActivity() {
         // ── §11/§13 integrity gates before any entry is materialized ──
         if (spillUsable) {
             // Every completed chunk is re-checked against the Manifest hash
-            // table (bounded memory: one chunk at a time — this also covers
-            // chunks that completed before the Manifest arrived).
+            // table, while the same bounded chunk buffer is fed into the
+            // incremental §13 ⑧⑨ verifier. This preserves entry hashes,
+            // strict UTF-8 and Content ID verification for arbitrarily large
+            // transfers without ever constructing the whole stream.
+            if (!session.finalVerifyBegin()) {
+                throw IllegalStateException("最终校验初始化失败，请对准二维码重新接收")
+            }
             val crs = snapshot.chunkRawSize.toLong().coerceAtLeast(1)
+            val badChunks = ArrayList<Int>()
+            var finalVerifyUsable = true
             for (i in 0 until snapshot.chunkCount) {
                 val off = i.toLong() * crs
                 val len = (snapshot.totalRawSize - off).coerceIn(0, crs)
-                val bytes = spill!!.readRange(off, len)
-                if (bytes == null || !session.verifyChunk(i, bytes)) {
-                    session.invalidateChunk(i)
-                    throw IllegalStateException("第 ${i + 1}/${snapshot.chunkCount} 块校验失败，请对准二维码重新接收")
+                var bytes = if (spill!!.hasChunk(i)) spill.readRange(off, len) else null
+                if (bytes == null) {
+                    // A failed spill write deliberately leaves the native chunk
+                    // resident. Repair that one range before staging. This also
+                    // handles the final-chunk fsync failure case where the spill
+                    // file is shorter than total_raw_size but earlier chunks have
+                    // already been evicted from native memory.
+                    bytes = session.assembleChunk(i)
+                    if (bytes != null) {
+                        spill.write(i, snapshot.chunkRawSize, bytes)
+                    } else {
+                        // Crash gap: bytes may have reached disk before the
+                        // journal commit. Read as a last resort; the Manifest
+                        // hash gate below decides whether they are trustworthy.
+                        bytes = spill.readRange(off, len)
+                    }
                 }
-            }
-            // §13 ⑧⑨ final gate (entry hashes, UTF-8 text, Content ID) for
-            // transfers small enough to stream through memory once.
-            if (snapshot.totalRawSize in 1..finalVerifyMemoryLimit) {
-                val whole = spill!!.readRange(0, snapshot.totalRawSize)
-                if (whole == null || !session.verifyFinalStream(whole)) {
+                if (bytes == null) {
+                    session.invalidateChunk(i)
+                    ledger?.invalidate(i)
+                    badChunks.add(i)
+                    finalVerifyUsable = false
+                    continue
+                }
+                if (!session.verifyChunk(i, bytes)) {
+                    // Local corruption in ONE chunk must not cost the whole
+                    // transfer: invalidate just this chunk and keep every other
+                    // verified chunk plus the spill/ledger. The sender's next
+                    // epoch re-supplies exactly this chunk; throwing here would
+                    // trigger a full resetReceiverAfterRecoveryFailure and a
+                    // complete re-receive.
+                    session.invalidateChunk(i)
+                    // Persist the same invalidation. If the app exits before
+                    // the sender re-supplies this chunk, §12 resume must not
+                    // resurrect the corrupt spill range as completed.
+                    ledger?.invalidate(i)
+                    badChunks.add(i)
+                    // Incremental final verification requires one contiguous
+                    // canonical stream. Once a chunk is skipped, feeding any
+                    // later chunk would shift the verifier's logical position
+                    // and can turn a local spill corruption into a false
+                    // entry-hash/UTF-8 failure followed by a full receiver reset.
+                    finalVerifyUsable = false
+                    continue
+                }
+                if (finalVerifyUsable && !session.finalVerifyFeed(bytes)) {
                     throw IllegalStateException("最终校验失败，请对准二维码重新接收")
                 }
+            }
+            if (badChunks.isNotEmpty()) {
+                // Drop the completion latches so ingest resumes; the transfer
+                // re-completes once the re-supplied chunks arrive and staging
+                // retries from the still-intact spill.
+                ingestStopped.set(false)
+                completedHandled = false
+                clearRecoveryStage()
+                Log.w(TAG, "spill re-verify failed for chunks $badChunks; awaiting re-supply")
+                return null
+            }
+            if (!session.finalVerifyFinish()) {
+                throw IllegalStateException("最终校验失败，请对准二维码重新接收")
             }
         } else if (stream != null && !session.verifyFinalStream(stream!!)) {
             throw IllegalStateException("最终校验失败，请对准二维码重新接收")
@@ -1000,20 +1072,56 @@ class ScanActivity : ComponentActivity() {
             ) st.copyOfRange(off.toInt(), (off + sz).toInt()) else ByteArray(0)
         }
 
+        // Persist one Manifest entry without ever materializing it as a whole
+        // ByteArray when the canonical spill is available. ContentStore.putFile
+        // hashes and atomically moves the staged file into the blob tree.
+        fun putRange(
+            off: Long,
+            sz: Long,
+            name: String,
+            kind: String,
+            bundleId: String? = null,
+            bundleTitle: String? = null,
+        ): com.airferry.app.scan.ContentStore.PutResult {
+            if (!spillUsable) {
+                return store.putBytes(
+                    this, name, sliceAt(off, sz),
+                    crcUnknown = true, kind = kind,
+                    bundleId = bundleId, bundleTitle = bundleTitle,
+                )
+            }
+            require(off >= 0 && sz >= 0 && off <= snapshot.totalRawSize &&
+                sz <= snapshot.totalRawSize - off) { "Manifest entry range out of bounds" }
+            val temp = java.io.File(stageDir, "${java.util.UUID.randomUUID()}.partial")
+            if (!spill!!.copyRangeToFile(off, sz, temp)) {
+                throw java.io.IOException("无法从恢复缓存写出文件: $name")
+            }
+            return try {
+                store.putFile(
+                    this, name, temp,
+                    crcUnknown = true, kind = kind,
+                    bundleId = bundleId, bundleTitle = bundleTitle,
+                    expectedSize = sz,
+                )
+            } finally {
+                // putFile normally moves the source. Clean up only when a
+                // failed publication left a task-owned temporary behind.
+                if (temp.exists()) temp.delete()
+            }
+        }
+
         // ── Single UTF8_TEXT entry → text view (AF2 kind, no magic sniffing) ──
         if (nonDirEntries.size == 1 && nonDirEntries[0].kind == 2) {
             val e0 = nonDirEntries[0]
-            val textBytes = sliceAt(e0.offset, e0.size)
             val textName = e0.path.ifEmpty { TEXT_RECEIVED_NAME }
-            val text =
-                if (com.airferry.app.scan.TextLike.fitsTextUi(textBytes.size))
-                    com.airferry.app.scan.TextLike.decodeUtf8Strict(textBytes)
-                else null
+            val textBytes = if (com.airferry.app.scan.TextLike.fitsTextUi(e0.size))
+                sliceAt(e0.offset, e0.size) else null
+            val text = textBytes?.let { com.airferry.app.scan.TextLike.decodeUtf8Strict(it) }
 
             if (text != null) {
                 updateRecoveryStage("正在保存文字…")
                 val put = store.putBytes(
-                    this, textName, textBytes,
+                    this, textName, textBytes!!,
                     crcUnknown = true, kind = "text",
                 )
                 clearRecoveryStage()
@@ -1026,14 +1134,11 @@ class ScanActivity : ComponentActivity() {
             }
             // Oversized or invalid UTF-8 → ordinary .txt file.
             updateRecoveryStage("正在保存文件…")
-            val put = store.putBytes(
-                this, textName, textBytes,
-                crcUnknown = true, kind = "file",
-            )
+            val put = putRange(e0.offset, e0.size, textName, "file")
             clearRecoveryStage()
             return Intent(this, ReceiveDetailActivity::class.java).apply {
                 putExtra("FILE_PATH", put.path.absolutePath)
-                putExtra("FILE_SIZE", textBytes.size.toLong())
+                putExtra("FILE_SIZE", e0.size)
                 putExtra("FILE_NAME", textName)
                 putExtra("ENTRY_ID", put.entry.id)
                 putExtra("CRC32_UNKNOWN", true)
@@ -1049,15 +1154,52 @@ class ScanActivity : ComponentActivity() {
             val bundleId = java.util.UUID.randomUUID().toString()
             val bundleTitle = "发送_$ts"
             updateRecoveryStage("正在保存 $totalFiles 个文件…")
-            val requests = nonDirEntries.map { e ->
-                val bytes = sliceAt(e.offset, e.size)
-                com.airferry.app.scan.ContentStore.PutBytesRequest(
-                    e.path, bytes,
-                    crcUnknown = true, kind = "file",
-                    bundleId = bundleId, bundleTitle = bundleTitle,
+            // Stage-then-commit: every member is materialized first and the
+            // whole bundle enters history with a single index write, so a
+            // mid-bundle disk failure cannot leave a truncated bundle behind.
+            val puts = if (spillUsable) {
+                val temps = ArrayList<java.io.File>(totalFiles)
+                try {
+                    for ((index, e) in nonDirEntries.withIndex()) {
+                        updateRecoveryStage("正在写出 ${index + 1}/$totalFiles 个文件…")
+                        require(e.offset >= 0 && e.size >= 0 &&
+                            e.offset <= snapshot.totalRawSize &&
+                            e.size <= snapshot.totalRawSize - e.offset) { "Manifest entry range out of bounds" }
+                        val temp = java.io.File(stageDir, "${java.util.UUID.randomUUID()}.partial")
+                        if (!spill!!.copyRangeToFile(e.offset, e.size, temp)) {
+                            throw java.io.IOException("无法从恢复缓存写出文件: ${e.path}")
+                        }
+                        temps.add(temp)
+                    }
+                    updateRecoveryStage("正在保存 $totalFiles 个文件…")
+                    store.putFileBatch(
+                        this,
+                        nonDirEntries.mapIndexed { i, e ->
+                            com.airferry.app.scan.ContentStore.PutFileRequest(
+                                e.savePath.ifEmpty { e.path }, temps[i],
+                                crcUnknown = true, kind = "file",
+                                bundleId = bundleId, bundleTitle = bundleTitle,
+                                expectedSize = e.size,
+                            )
+                        },
+                    )
+                } finally {
+                    // Moved files are already gone; dedup hits and failure
+                    // temps end here.
+                    for (t in temps) if (t.exists()) t.delete()
+                }
+            } else {
+                store.putBytesBatch(
+                    this,
+                    nonDirEntries.map { e ->
+                        com.airferry.app.scan.ContentStore.PutBytesRequest(
+                            e.savePath.ifEmpty { e.path }, sliceAt(e.offset, e.size),
+                            crcUnknown = true, kind = "file",
+                            bundleId = bundleId, bundleTitle = bundleTitle,
+                        )
+                    },
                 )
             }
-            val puts = store.putBytesBatch(this, requests)
 
             val paths = ArrayList<String>()
             val names = ArrayList<String>()
@@ -1086,23 +1228,15 @@ class ScanActivity : ComponentActivity() {
         val entry = nonDirEntries.firstOrNull()
         val fileName = entry?.path?.takeIf { it.isNotEmpty() }
             ?: displayName.ifEmpty { "received_file" }
-        val fileBytes = when {
-            entry != null && entry.offset >= 0 && entry.size >= 0 &&
-                entry.offset + entry.size <= snapshot.totalRawSize &&
-                entry.offset <= Int.MAX_VALUE && entry.size <= Int.MAX_VALUE ->
-                sliceAt(entry.offset, entry.size)
-            else -> sliceAt(0L, snapshot.totalRawSize)
-        }
+        val fileOffset = entry?.offset ?: 0L
+        val fileSize = entry?.size ?: snapshot.totalRawSize
 
         updateRecoveryStage("正在保存文件…")
-        val put = store.putBytes(
-            this, fileName, fileBytes,
-            crcUnknown = true, kind = "file",
-        )
+        val put = putRange(fileOffset, fileSize, fileName, "file")
         clearRecoveryStage()
         return Intent(this, ReceiveDetailActivity::class.java).apply {
             putExtra("FILE_PATH", put.path.absolutePath)
-            putExtra("FILE_SIZE", fileBytes.size.toLong())
+            putExtra("FILE_SIZE", fileSize)
             putExtra("FILE_NAME", fileName)
             putExtra("ENTRY_ID", put.entry.id)
             putExtra("CRC32_UNKNOWN", true)

@@ -86,7 +86,8 @@ impl Af2Sender {
 pub struct ReceiverSession { ... }
 impl ReceiverSession {
     pub fn new() -> Self;
-    // 摄入单帧字节，返回 packed u64 状态字（bit 0: complete, 1: accepted, 2: manifest_ready, 3: chunk_ready, 8..23: mismatch_streak, 32..63: received_symbols）
+    // 摄入单帧字节，返回 packed u64 状态字（bit 0: complete, 1: accepted, 2: manifest_ready,
+    // 3: chunk_ready, 4: relocked, 8..23: mismatch_streak, 32..63: received_symbols）
     pub fn ingest(&mut self, frame_bytes: &[u8]) -> u64;
     pub fn is_complete(&self) -> bool;
     pub fn snapshot_json(&self) -> String; // Schema 2 快照
@@ -95,6 +96,9 @@ impl ReceiverSession {
     pub fn forget_chunk(&mut self, index: u32) -> bool; // 驱逐已落盘 chunk，内存常数化
     pub fn verify_chunk(&self, index: u32, raw: &[u8]) -> bool; // §11/§12 对 Manifest 哈希表验块
     pub fn verify_final_stream(&self, stream: &[u8]) -> bool;   // §13 ⑧⑨ 终验（条目哈希、UTF-8、Content ID）
+    pub fn final_verify_begin(&mut self) -> bool;               // §13 增量终验开始（有界内存，spill 恢复路径）
+    pub fn final_verify_feed(&mut self, stream_bytes: &[u8]) -> bool; // 喂入下一段规范流（出错后校验器作废，须终止）
+    pub fn final_verify_finish(&mut self) -> bool;              // 结束并执行条目哈希/UTF-8/Content ID 校验
     pub fn resume(&mut self, root_frame_bytes: &[u8], completed: &[u32]) -> bool; // §12 续传
     pub fn invalidate_chunk(&mut self, index: u32) -> bool;     // §12 重核失败作废已恢复块
 }
@@ -157,7 +161,9 @@ class ReceiverSessionWasm {
 
   // 摄入一帧解码后的 QR 原始字节（26B header + payload + 4B CRC）。
   // 返回 packed bigint（64位状态字）：bit 0: complete, 1: accepted, 2: manifestReady,
-  // 3: chunkReady, 8..23: mismatchStreak, 32..63: receivedSymbols
+  // 3: chunkReady, 4: relocked, 8..23: mismatchStreak, 32..63: receivedSymbols
+  // relocked 仅在异传输接管会话的那一帧置位——宿主只可据此清理 spill/账本，
+  // 不得再用 accepted && received==0 启发式（§12 resume 后首个 META 同样命中该签名）
   ingest(frame_bytes: Uint8Array): bigint
 
   // 单 JSON 快照（ReceiverSnapshotV2）：schema_version / meta_confirmed /
@@ -171,6 +177,9 @@ class ReceiverSessionWasm {
   forget_chunk(index: number): boolean
   verify_chunk(index: number, raw: Uint8Array): boolean
   verify_final_stream(stream: Uint8Array): boolean
+  final_verify_begin(): boolean
+  final_verify_feed(streamBytes: Uint8Array): boolean
+  final_verify_finish(): boolean
   resume(root_frame_bytes: Uint8Array, completed_indices: Uint32Array): boolean
   invalidate_chunk(index: number): boolean
 }
@@ -196,7 +205,7 @@ class ReceiverSessionWasm {
 
 ```kotlin
 object NativeBridge {
-    const val NATIVE_ABI_VERSION = 2   // 2: 快照化 FFI（receiverSnapshotJson 取代逐字段 getter）
+    const val NATIVE_ABI_VERSION = 3   // 3: 增量式 §13 终验（receiverFinalVerify*）；2: 快照化 FFI
 
     /** 启动期握手：断言 nativeAbiVersion() >= NATIVE_ABI_VERSION，否则进入 ErrorScreen。 */
     external fun nativeAbiVersion(): Int
@@ -222,6 +231,9 @@ object NativeBridge {
     external fun receiverForgetChunk(handle: Long, index: Int): Boolean
     external fun receiverVerifyChunk(handle: Long, index: Int, rawBytes: ByteArray): Boolean
     external fun receiverVerifyFinalStream(handle: Long, streamBytes: ByteArray): Boolean
+    external fun receiverFinalVerifyBegin(handle: Long): Boolean
+    external fun receiverFinalVerifyFeed(handle: Long, streamBytes: ByteArray): Boolean
+    external fun receiverFinalVerifyFinish(handle: Long): Boolean
     external fun receiverResume(handle: Long, rootFrameBytes: ByteArray, completedIndices: IntArray): Boolean
     external fun receiverInvalidateChunk(handle: Long, index: Int): Boolean
 
@@ -271,10 +283,10 @@ Windows 侧同样以一把 ingest 锁串行化（与 Android JNI 模型一致）
 
 | 函数 | 签名要点 |
 |---|---|
-| `airferry_native_abi_version()` | `u32` ABI 版本（当前 2，快照化 FFI） |
+| `airferry_native_abi_version()` | `u32` ABI 版本（当前 3，增量式 §13 终验） |
 | `airferry_receiver_create(sid_lo, sid_hi)` | 建会话，返回不透明句柄 |
 | `airferry_receiver_destroy(handle)` | 销毁句柄（幂等） |
-| `airferry_receiver_ingest(handle, frame, len)` | 摄入单帧；返回 packed `u64` 状态字（bit 0/1/2/3 + mismatch + received，与 JNI/WASM 同布局） |
+| `airferry_receiver_ingest(handle, frame, len)` | 摄入单帧；返回 packed `u64` 状态字（bit 0/1/2/3 + bit 4 relock + mismatch + received，与 JNI/WASM 同布局） |
 | `airferry_receiver_is_complete(handle)` | 是否全部 Chunk 已验 |
 | `airferry_receiver_progress_json(handle, buf, cap)` | 进度 JSON 写入调用方缓冲（NUL 结尾，返回所需长度） |
 | `airferry_receiver_snapshot_json(handle)` | 单一快照 JSON（Schema 2），`airferry_free_string` 释放 |
@@ -284,6 +296,9 @@ Windows 侧同样以一把 ingest 锁串行化（与 Android JNI 模型一致）
 | `airferry_receiver_forget_chunk(handle, index)` | 驱逐已落盘 chunk（内存常数化） |
 | `airferry_receiver_verify_chunk(handle, index, raw, len)` | §11/§12 对 Manifest 哈希表验块 |
 | `airferry_receiver_verify_final_stream(handle, stream, len)` | §13 ⑧⑨ 终验（条目哈希、UTF-8、Content ID） |
+| `airferry_receiver_final_verify_begin(handle)` | §13 增量终验开始（spill 恢复路径） |
+| `airferry_receiver_final_verify_feed(handle, stream, len)` | 喂入下一段规范流；返回 0 后校验器作废须终止 |
+| `airferry_receiver_final_verify_finish(handle)` | 结束增量终验并校验条目哈希/UTF-8/Content ID |
 | `airferry_receiver_resume(handle, root, len, completed[], n)` | §12 续传（账本恢复） |
 | `airferry_receiver_invalidate_chunk(handle, index)` | 重核失败作废已恢复块 |
 | `airferry_decompress_bytes(data, len, codec, out, cap)` | 有界解压（单帧/单流 + §10.1 约束） |

@@ -86,10 +86,16 @@ pub fn encode_chunk_balanced(raw: &[u8], channel_bps: u64, force_full: bool) -> 
         }
     }
     // Rule 2: best of zstd-L1 vs xz-p2.
-    let z_vec = qr_protocol::compress::compress(raw, 1).unwrap_or_default();
+    // An encoder error must degrade to "zstd lost", NEVER to an empty
+    // compressed payload: a 0-byte Vec beats RAW on the strictly-smaller
+    // check and would sail through every downstream guard as
+    // {codec: ZSTD, data: []} — a chunk that can never be decoded (OTI F=0).
+    let z_vec = qr_protocol::compress::compress(raw, 1).ok();
     let mut best = (CODEC_RAW, raw.to_vec());
-    if z_vec.len() < best.1.len() {
-        best = (CODEC_ZSTD, z_vec.clone());
+    if let Some(z) = &z_vec {
+        if z.len() < best.1.len() {
+            best = (CODEC_ZSTD, z.clone());
+        }
     }
     if let Ok(x2) = qr_protocol::compress::compress_xz_preset(raw, 2) {
         if x2.len() < best.1.len() {
@@ -105,7 +111,10 @@ pub fn encode_chunk_balanced(raw: &[u8], channel_bps: u64, force_full: bool) -> 
     } else {
         // zstd lost or failed; clamp its measured ratio at 1.0 (the
         // escalation is measured against the worst case it replaces).
-        (z_vec.len() as f64 / raw.len() as f64).min(1.0)
+        z_vec
+            .as_deref()
+            .map_or(1.0, |z| z.len() as f64 / raw.len() as f64)
+            .min(1.0)
     };
     let escalate = force_full
         || (channel_bps > 0

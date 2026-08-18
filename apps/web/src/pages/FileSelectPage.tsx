@@ -21,6 +21,7 @@ import {
   XIcon,
 } from "@/components/icons"
 import { normalizeDraftFilename } from "@/storage/textDrafts"
+import { senderPathForFile, uniqueSenderPath } from "@/lib/sender-path"
 import { MAX_ORIGINAL_BYTES, MAX_ORIGINAL_MIB, type PendingItem } from "@/types"
 
 interface Props {
@@ -100,29 +101,31 @@ function newId(): string {
 }
 
 function itemName(item: PendingItem): string {
-  return item.kind === "file" ? item.file.name : item.name
+  return item.kind === "file" ? item.path ?? senderPathForFile(item.file) : item.name
 }
 
-/** Append files as file-items; suffix names that already appear in the list. */
+/** Append files as file-items; deduplicate by the full AF2 relative path. */
 function appendFiles(existing: PendingItem[], incoming: File[]): PendingItem[] {
   const used = new Set(existing.map(itemName))
   const out = [...existing]
   for (const f of incoming) {
-    let name = f.name
+    const originalPath = senderPathForFile(f)
+    const finalPath = uniqueSenderPath(used, originalPath)
     let file = f
-    if (used.has(name)) {
-      name = uniqueName(used, name)
-      file = new File([f], name, { type: f.type, lastModified: f.lastModified })
-      const rel = (f as File & { webkitRelativePath?: string }).webkitRelativePath
-      if (rel) {
-        Object.defineProperty(file, "webkitRelativePath", {
-          value: rel,
-          writable: false,
-        })
-      }
+    if (finalPath !== originalPath) {
+      const slash = finalPath.lastIndexOf("/")
+      const finalName = slash >= 0 ? finalPath.slice(slash + 1) : finalPath
+      file = new File([f], finalName, { type: f.type, lastModified: f.lastModified })
+      Object.defineProperty(file, "webkitRelativePath", {
+        value: finalPath,
+        writable: false,
+      })
     }
-    used.add(name)
-    out.push({ id: newId(), kind: "file", file })
+    used.add(finalPath)
+    // Persist the resolved AF2 path on the item: the webkitRelativePath
+    // override on the File is only readable on the main thread and is lost
+    // when the File is cloned into the compress worker.
+    out.push({ id: newId(), kind: "file", file, path: finalPath })
   }
   return out
 }
@@ -426,11 +429,16 @@ export function FileSelectPage({ items, onItemsChange, onPlay, busyLabel }: Prop
   /** Total original bytes of the selected items (pre-compression). */
   const selectedBytes = totalSize(items)
   /**
-   * AF2 streams everything in 8 MiB canonical chunks with OPFS/disk spill on
-   * receivers, so all content types (single file, text, bundles) share the 4 TiB
-   * protocol capacity with no 256 MiB ceiling.
+   * AF2 itself supports much larger transfers, but the current Web sender is
+   * still whole-buffered. Enforce the host cap before starting preparation so
+   * the worker/WASM path cannot OOM after the user has already pressed Send.
    */
   const handleSendClick = useCallback(() => {
+    // Wire the host-cap gate before file.arrayBuffer()/WASM copies begin.
+    if (totalSize(itemsRef.current) > MAX_ORIGINAL_BYTES) {
+      setOversizeConfirm(true)
+      return
+    }
     onPlay()
   }, [onPlay])
 
@@ -725,16 +733,16 @@ function OversizeConfirmModal({
         onClick={(e) => e.stopPropagation()}
       >
         <h3 id="oversize-title" className="modal-save-title">
-          内容超过接收上限
+          内容超过网页发送端上限
         </h3>
         <p className="hint" style={{ marginTop: 8 }}>
-          所选内容约 <strong>{totalMiB.toFixed(1)} MiB</strong>，超过接收端
-          <strong> {limitMiB} MiB</strong> 的原始内容接收上限。
+          所选内容约 <strong>{totalMiB.toFixed(1)} MiB</strong>，超过当前网页发送端
+          <strong> {limitMiB} MiB</strong> 的宿主内存上限。
         </p>
         <p className="hint" style={{ marginTop: 8 }}>
-          多文件包和文字会作为单个内存对象处理，接收端（Android / Windows / 网页）
-          为防内存耗尽设有此硬性上限，因此本次选择不能发送。大于该上限的内容请改为
-          单独选择一个文件，系统会自动使用分段传输。
+          AF2 协议本身支持更大内容，接收端也采用分块落盘；但当前浏览器发送端仍需把
+          所选文件读入 ArrayBuffer 并复制进 WASM，因此暂时不能安全发送超过该上限的内容。
+          后续发送端改为真正流式读取后可再放宽此限制。
         </p>
         <div className="modal-actions-row">
           <button type="button" className="btn primary" onClick={onCancel}>

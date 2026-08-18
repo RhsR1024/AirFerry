@@ -33,4 +33,16 @@ class FileNameUtilTest {
         assertFalse(Character.isLowSurrogate(sanitized.first()))
         assertTrue(sanitized.endsWith("Z"))
     }
+
+    @Test
+    fun relativePathSanitizationPreservesHierarchyWithoutTraversal() {
+        assertEquals(
+            "目录/子目录/报告 2026.txt",
+            FileNameUtil.sanitizeRelativePath("目录/子目录/报告 2026.txt"),
+        )
+        assertEquals(
+            "escape/a_b.txt",
+            FileNameUtil.sanitizeRelativePath("../escape/a:b.txt"),
+        )
+    }
 }

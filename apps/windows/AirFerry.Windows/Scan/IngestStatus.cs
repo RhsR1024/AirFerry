@@ -17,7 +17,14 @@ public readonly record struct IngestStatus(
     int MismatchStreak,
     int ReceivedSymbols,
     bool ManifestReady = false,
-    bool ChunkReady = false)
+    bool ChunkReady = false,
+    /// <summary>
+    /// Bit 4: a foreign transfer took over the session. The ONLY signal the
+    /// host may use to discard transfer artifacts — the historical
+    /// <c>Accepted &amp;&amp; ReceivedSymbols == 0</c> heuristic also matched the
+    /// first accepted META of a §12-resumed session (counter still zero).
+    /// </summary>
+    bool Relocked = false)
 {
     /// <summary>
     /// Decode a packed status word, or <see langword="null"/> on the error
@@ -36,8 +43,9 @@ public readonly record struct IngestStatus(
         bool accepted = ((word >> 1) & 1u) != 0u;
         bool manifestReady = ((word >> 2) & 1u) != 0u;
         bool chunkReady = ((word >> 3) & 1u) != 0u;
+        bool relocked = ((word >> 4) & 1u) != 0u;
         int streak = (int)((word >> 8) & 0xFFFFu);
         int received = (int)receivedField;
-        return new IngestStatus(complete, accepted, streak, received, manifestReady, chunkReady);
+        return new IngestStatus(complete, accepted, streak, received, manifestReady, chunkReady, relocked);
     }
 }

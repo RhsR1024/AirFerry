@@ -289,6 +289,21 @@ impl ReceiverSessionWasm {
         self.inner.verify_final_stream(stream)
     }
 
+    /// Begin bounded-memory §13 ⑧⑨ verification.
+    pub fn final_verify_begin(&mut self) -> bool {
+        self.inner.final_verify_begin()
+    }
+
+    /// Feed the next contiguous canonical-stream block.
+    pub fn final_verify_feed(&mut self, stream: &[u8]) -> bool {
+        self.inner.final_verify_feed(stream)
+    }
+
+    /// Finish bounded-memory §13 ⑧⑨ verification.
+    pub fn final_verify_finish(&mut self) -> bool {
+        self.inner.final_verify_finish()
+    }
+
     /// Restore session state from stored ROOT frame bytes + completed chunk indices.
     pub fn resume(&mut self, root_frame_bytes: &[u8], completed: &[u32]) -> bool {
         self.inner.resume(root_frame_bytes, completed)

@@ -838,6 +838,20 @@ export function ReceivePage(): React.ReactElement {
         }))
       } else if (d.type === "warn") {
         dbg(`[recv] warn: ${d.message}`)
+      } else if (d.type === "resupply") {
+        // Assembly found only local spill corruption/missing chunks. The
+        // worker kept the session + good OPFS chunks and invalidated the bad
+        // indices, so resume scanning instead of entering the fatal error path
+        // (whose Reset button intentionally destroys resume state).
+        dbg(`[recv] resupply: ${d.message}`)
+        assemblingRef.current = false
+        stageRef.current = "scanning"
+        setStage("scanning")
+        setError(null)
+        setProgress((p) => ({ ...p, statusText: d.message || "等待损坏分块重供…" }))
+        // The existing capture loop may have returned while stage=recovering;
+        // explicitly kick one new frame now that scanning is re-armed.
+        scheduleNextFrame()
       } else if (d.type === "relock") {
         // The Rust receiver re-locked onto a different transfer: drop the
         // previous transfer's name/progress display until the new manifest
@@ -1350,13 +1364,10 @@ function FileView({
   data,
 }: {
   name: string
-  data: Uint8Array
+  data: Blob
 }): React.ReactElement {
   const onDownload = () => {
-    const blob = new Blob([data.slice().buffer as ArrayBuffer], {
-      type: "application/octet-stream",
-    })
-    const url = URL.createObjectURL(blob)
+    const url = URL.createObjectURL(data)
     const a = document.createElement("a")
     a.href = url
     a.download = name
@@ -1364,7 +1375,7 @@ function FileView({
     // Firefox cancels the download if the URL is revoked synchronously.
     setTimeout(() => URL.revokeObjectURL(url), 0)
   }
-  const sizeKiB = (data.length / 1024).toFixed(1)
+  const sizeKiB = (data.size / 1024).toFixed(1)
   return (
     <div className="file-result">
       <p>
@@ -1385,10 +1396,23 @@ function BundleView({
   entries,
 }: {
   title?: string
-  entries: { name: string; data: Uint8Array }[]
+  entries: { name: string; data: Blob }[]
 }): React.ReactElement {
-  const onDownloadZip = () => {
-    const zipBlob = createZipBlob(entries)
+  const [zipError, setZipError] = useState("")
+  const onDownloadZip = async () => {
+    setZipError("")
+    let zipBlob: Blob
+    try {
+      zipBlob = await createZipBlob(entries)
+    } catch (e) {
+      // createZipBlob streams entry data (CRC pass) — an OPFS-backed entry
+      // whose backing file disappeared rejects here. Surface it instead of
+      // failing as an unhandled rejection with a silently dead button.
+      setZipError(
+        `打包失败：${e instanceof Error ? e.message : String(e)}。请尝试逐个下载，或重新接收后再下载。`
+      )
+      return
+    }
     const url = URL.createObjectURL(zipBlob)
     const a = document.createElement("a")
     a.href = url
@@ -1400,10 +1424,7 @@ function BundleView({
 
   const onDownloadAll = () => {
     for (const e of entries) {
-      const blob = new Blob([e.data.slice().buffer as ArrayBuffer], {
-        type: "application/octet-stream",
-      })
-      const url = URL.createObjectURL(blob)
+      const url = URL.createObjectURL(e.data)
       const a = document.createElement("a")
       a.href = url
       a.download = e.name
@@ -1421,10 +1442,7 @@ function BundleView({
       <ul className="bundle-list">
         {entries.map((e, i) => {
           const onDownload = () => {
-            const blob = new Blob([e.data.slice().buffer as ArrayBuffer], {
-              type: "application/octet-stream",
-            })
-            const url = URL.createObjectURL(blob)
+            const url = URL.createObjectURL(e.data)
             const a = document.createElement("a")
             a.href = url
             a.download = e.name
@@ -1434,7 +1452,7 @@ function BundleView({
           return (
             <li key={i}>
               <span>
-                {e.name}（{(e.data.length / 1024).toFixed(1)} KiB）
+                {e.name}（{(e.data.size / 1024).toFixed(1)} KiB）
               </span>
               <button onClick={onDownload} className="btn btn-sm">
                 下载
@@ -1451,6 +1469,11 @@ function BundleView({
           逐个下载
         </button>
       </div>
+      {zipError ? (
+        <p className="bundle-zip-error" style={{ color: "#d33", fontSize: "12px", marginTop: "6px" }}>
+          {zipError}
+        </p>
+      ) : null}
     </div>
   )
 }

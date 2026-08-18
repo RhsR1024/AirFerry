@@ -74,6 +74,11 @@ class ReceiverSessionManager {
         val accepted: Boolean,
         val manifestReady: Boolean,
         val chunkReady: Boolean,
+        /** Bit 4: a foreign transfer took over the session. The ONLY signal
+         * the host may use to discard transfer artifacts — the historical
+         * `accepted && receivedSymbols == 0` heuristic also matched the first
+         * accepted META of a §12-resumed session (counter still zero). */
+        val relocked: Boolean,
         val mismatchStreak: Int,
         val receivedSymbols: Int
     ) {
@@ -87,9 +92,10 @@ class ReceiverSessionManager {
                 val accepted = ((bits shr 1) and 1uL) != 0uL
                 val manifestReady = ((bits shr 2) and 1uL) != 0uL
                 val chunkReady = ((bits shr 3) and 1uL) != 0uL
+                val relocked = ((bits shr 4) and 1uL) != 0uL
                 val streak = ((bits shr 8) and 0xFFFFuL).toInt()
                 val received = ((bits shr 32) and 0xFFFFFFFFuL).toInt()
-                return IngestStatus(complete, accepted, manifestReady, chunkReady, streak, received)
+                return IngestStatus(complete, accepted, manifestReady, chunkReady, relocked, streak, received)
             }
         }
     }
@@ -120,7 +126,7 @@ class ReceiverSessionManager {
         }
         if (!initialized) return null
         val status = IngestStatus.unpack(NativeBridge.receiverIngest(handle, frameBytes))
-        if (status != null && status.accepted && status.receivedSymbols == 0) {
+        if (status != null && status.relocked) {
             // Relocked in native AF2: invalidate stale snapshot cache
             cachedSnapshot = null
         }
@@ -137,6 +143,18 @@ class ReceiverSessionManager {
     /** Run §13 ⑧⑨ integrity chain over the reassembled canonical stream. */
     fun verifyFinalStream(streamBytes: ByteArray): Boolean =
         initialized && NativeBridge.receiverVerifyFinalStream(handle, streamBytes)
+
+    /** Begin bounded-memory §13 ⑧⑨ final verification. */
+    fun finalVerifyBegin(): Boolean =
+        initialized && NativeBridge.receiverFinalVerifyBegin(handle)
+
+    /** Feed the next contiguous canonical-stream block. */
+    fun finalVerifyFeed(streamBytes: ByteArray): Boolean =
+        initialized && NativeBridge.receiverFinalVerifyFeed(handle, streamBytes)
+
+    /** Finish bounded-memory §13 ⑧⑨ final verification. */
+    fun finalVerifyFinish(): Boolean =
+        initialized && NativeBridge.receiverFinalVerifyFinish(handle)
 
     /** Restore session from stored ROOT frame bytes + completed chunk indices (§12 resume). */
     fun resume(rootFrameBytes: ByteArray, completedIndices: IntArray): Boolean {
