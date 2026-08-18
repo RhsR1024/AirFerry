@@ -107,21 +107,26 @@ class FileListActivity : ComponentActivity() {
             // queue only advances after the copy finishes, preserving the
             // one-SAF-dialog-at-a-time sequential semantics.
             Toast.makeText(this, "保存中…", Toast.LENGTH_SHORT).show()
-            bgExecutor.execute {
-                val error: String? = try {
-                    contentResolver.openOutputStream(uri)?.use { out ->
-                        job.first.inputStream().use { it.copyTo(out) }
+            try {
+                bgExecutor.execute {
+                    val error: String? = try {
+                        contentResolver.openOutputStream(uri)?.use { out ->
+                            job.first.inputStream().use { it.copyTo(out) }
+                        }
+                        null
+                    } catch (e: Exception) {
+                        e.message
                     }
-                    null
-                } catch (e: Exception) {
-                    e.message
-                }
-                runOnUiThread {
-                    if (error != null) {
-                        Toast.makeText(this, "保存失败: $error", Toast.LENGTH_LONG).show()
+                    runOnUiThread {
+                        if (error != null) {
+                            Toast.makeText(this, "保存失败: $error", Toast.LENGTH_LONG).show()
+                        }
+                        advanceSaveQueue()
                     }
-                    advanceSaveQueue()
                 }
+            } catch (_: RejectedExecutionException) {
+                // Activity is already being destroyed.
+                runOnUiThread { advanceSaveQueue() }
             }
         } else {
             advanceSaveQueue()
@@ -319,6 +324,18 @@ class FileListActivity : ComponentActivity() {
                             )
                             TextButton(
                                 onClick = {
+                                    // A §12 recovery in ScanActivity may be streaming
+                                    // from these exact spill/ledger files right now —
+                                    // deleting them under it aborts a fully received
+                                    // transfer. Refuse while one is running.
+                                    if (ScanActivity.recoveryActive.get()) {
+                                        Toast.makeText(
+                                            this@FileListActivity,
+                                            "有传输正在恢复中，请稍后再清理断点",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                        return@TextButton
+                                    }
                                     bgExecutor.execute {
                                         Af2LedgerStore.discardAllPending(cacheDir)
                                         runOnUiThread { refresh() }

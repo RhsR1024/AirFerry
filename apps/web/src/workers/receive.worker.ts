@@ -302,9 +302,6 @@ async function ingestBatch(frames: Uint8Array[], jobId: number): Promise<{
     decodedBlocks: chunkStore.completedCount,
     totalBlocks: meta.chunkCount,
     decodedFraction: meta.chunkCount > 0 ? chunkStore.completedCount / meta.chunkCount : 0,
-    framesSeen: 0,
-    framesDuplicate: 0,
-    framesCorrupt: 0,
     metaConfirmed: meta.metaConfirmed,
     symbolSize: meta.symbolSize,
     legacyPeerFrames: meta.legacyPeerFrames,
@@ -382,9 +379,19 @@ function maybePostMeta(jobId: number): void {
 // Worker Message Handler
 // ---------------------------------------------------------------------------
 
-self.addEventListener("message", async (e: MessageEvent) => {
+// Messages must be handled strictly in arrival order. ingest batches contain
+// real IO awaits (OPFS spill / journal writes); letting a later `reset` run
+// while a batch is suspended would null the session mid-flight and report the
+// resulting crash under the NEW job's id, killing the fresh session.
+let messageChain: Promise<void> = Promise.resolve()
+
+self.addEventListener("message", (e: MessageEvent) => {
   const data = e.data
   if (!data || typeof data !== "object") return
+  messageChain = messageChain.then(() => handleMessage(data))
+})
+
+async function handleMessage(data: Record<string, unknown>): Promise<void> {
 
   if (data.type === "init") {
     try {
@@ -431,13 +438,13 @@ self.addEventListener("message", async (e: MessageEvent) => {
         acceptedCount: res.acceptedCount,
         snapshot: res.snapshot,
         nowMs: Date.now(),
-        jobId: activeJobId,
+        jobId,
       })
     } catch (err) {
       post({
         type: "error",
         message: `帧处理失败: ${err instanceof Error ? err.message : String(err)}`,
-        jobId: activeJobId,
+        jobId,
       })
     }
     return
@@ -581,4 +588,4 @@ self.addEventListener("message", async (e: MessageEvent) => {
       })
     }
   }
-})
+}

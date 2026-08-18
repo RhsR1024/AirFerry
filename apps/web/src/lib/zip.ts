@@ -49,7 +49,10 @@ function dateToDosTimeDate(d: Date): { dosTime: number; dosDate: number } {
   const month = d.getMonth() + 1
   const day = d.getDate()
   const dosTime = (d.getHours() << 11) | (d.getMinutes() << 5) | Math.floor(d.getSeconds() / 2)
-  const dosDate = ((Math.max(1980, year) - 1980) << 9) | (month << 5) | day
+  // DOS date field is 7 bits for (year-1980) — clamp to the representable
+  // range instead of letting it overflow the u16 field.
+  const dosYear = Math.min(2107, Math.max(1980, year)) - 1980
+  const dosDate = (dosYear << 9) | (month << 5) | day
   return { dosTime, dosDate }
 }
 

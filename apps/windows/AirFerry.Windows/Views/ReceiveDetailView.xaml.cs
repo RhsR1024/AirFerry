@@ -127,7 +127,8 @@ public partial class ReceiveDetailView : Page
                 : "received_file";
             // Never expose the extensionless SHA-256 ContentStore blob. Explorer
             // receives a temporary copy carrying the logical filename instead.
-            string exported = ShareExport.ExportFile(src, displayName);
+            // The copy can be a full GB-scale file — keep it off the UI thread.
+            string exported = await Task.Run(() => ShareExport.ExportFile(src, displayName));
             var startInfo = new ProcessStartInfo("explorer.exe")
             {
                 UseShellExecute = true,

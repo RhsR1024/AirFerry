@@ -310,6 +310,18 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     [RelayCommand]
     public void StopScan()
     {
+        StopScanCore(expectedEpoch: null);
+    }
+
+    /// <param name="expectedEpoch">
+    /// Epoch guard for deferred stops (frame-source lost dispatched from the
+    /// producer thread): if a new pipeline started between dispatch and
+    /// execution the epoch moved on, and tearing down whatever is current
+    /// would silently kill the fresh pipeline. <see langword="null"/> = stop
+    /// unconditionally (user-initiated). Returns true when the stop ran.
+    /// </param>
+    private bool StopScanCore(long? expectedEpoch)
+    {
         Thread? producer;
         QrDecodePool? pool;
         IFrameSource? capture;
@@ -319,6 +331,10 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         Task cleanup;
         lock (_lifecycleGate)
         {
+            if (expectedEpoch is long expected && expected != _sessionEpoch)
+            {
+                return false;
+            }
             _producerRunning = false;
             IsScanning = false;
             Interlocked.Increment(ref _sessionEpoch);
@@ -329,7 +345,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
                 !_deferredCleanupTask.IsCompleted)
             {
                 StatusText = "摄像头响应缓慢，正在后台安全释放…";
-                return;
+                return true;
             }
             producer = _producerThread;
             _producerThread = null;
@@ -361,15 +377,18 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         if (ReferenceEquals(cleanup, Task.CompletedTask))
         {
             ResetStoppedUi();
-            return;
+            return true;
         }
 
         // Never free a capture, decode pool or Rust session while a producer,
         // native decode, ingest or recovery call may still be using it. Perform
-        // the complete ordered teardown as one task. A wedged DirectShow read is
-        // quarantined after a short wait so navigation remains responsive; the
-        // task retains every resource and disposes them only after the read exits.
-        Task completed = Task.WhenAny(cleanup, Task.Delay(TimeSpan.FromSeconds(2)))
+        // the complete ordered teardown as one task. Give the synchronous wait
+        // a SHORT budget (StopScan runs on the UI thread via Start/Reset/
+        // navigation): the normal teardown finishes well inside it, and a
+        // wedged DirectShow read is quarantined to the background instead of
+        // freezing the UI for seconds; the task retains every resource and
+        // disposes them only after the read exits.
+        Task completed = Task.WhenAny(cleanup, Task.Delay(TimeSpan.FromMilliseconds(150)))
             .GetAwaiter().GetResult();
         if (!ReferenceEquals(completed, cleanup))
         {
@@ -387,7 +406,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
                 TaskScheduler.Default);
             StatusText = "摄像头响应缓慢，正在后台安全释放…";
             IsRecovering = false;
-            return;
+            return true;
         }
 
         try
@@ -405,6 +424,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             }
         }
         ResetStoppedUi();
+        return true;
     }
 
     private static void CleanupDetachedPipeline(
@@ -500,6 +520,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     {
         long previewInterval = Math.Max(1, Stopwatch.Frequency / PreviewFps);
         long nextPreviewAt = 0;
+        int consecutiveFailures = 0;
         while (_producerRunning)
         {
             // Snapshot references once per iteration. StopScan may detach the
@@ -508,7 +529,26 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             IFrameSource? capture = _capture;
             QrDecodePool? pool = _pool;
             if (capture is null || pool is null) break;
-            Mat? gray = capture.ReadGray();
+            Mat? gray;
+            try
+            {
+                gray = capture.ReadGray();
+            }
+            catch (Exception ex)
+            {
+                // A driver hiccup (OpenCvException from a wedged DirectShow
+                // read, etc.) must not escape this thread — an unhandled
+                // exception on a raw Thread kills the process. Back off and
+                // treat persistent failure as a lost source.
+                System.Diagnostics.Debug.WriteLine($"[producer] ReadGray failed: {ex}");
+                if (++consecutiveFailures >= 10)
+                {
+                    HandleFrameSourceLost();
+                    break;
+                }
+                Thread.Sleep(50);
+                continue;
+            }
             if (gray is null)
             {
                 if (!capture.IsOpen)
@@ -523,13 +563,36 @@ public partial class ScanViewModel : ObservableObject, IDisposable
                 Thread.Sleep(10);
                 continue;
             }
-            // Submit clones the pixels; the Mat itself is reused by VideoCapture.
-            pool.Submit(gray);
+            try
+            {
+                // Submit clones the pixels; the Mat itself is reused by VideoCapture.
+                pool.Submit(gray);
+                consecutiveFailures = 0;
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"[producer] Submit failed: {ex}");
+                if (++consecutiveFailures >= 10)
+                {
+                    HandleFrameSourceLost();
+                    break;
+                }
+                Thread.Sleep(50);
+            }
 
             long now = Stopwatch.GetTimestamp();
             if (now >= nextPreviewAt)
             {
-                PreviewFrame? preview = capture.SnapshotBgr();
+                PreviewFrame? preview = null;
+                try
+                {
+                    preview = capture.SnapshotBgr();
+                }
+                catch (Exception ex)
+                {
+                    // Preview is cosmetic — never let it kill the producer.
+                    System.Diagnostics.Debug.WriteLine($"[producer] SnapshotBgr failed: {ex}");
+                }
                 if (preview is not null)
                 {
                     Action<PreviewFrame>? handler = PreviewFrameReady;
@@ -565,18 +628,25 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     /// </summary>
     private void HandleFrameSourceLost()
     {
+        long epochAtLoss = Volatile.Read(ref _sessionEpoch);
         _ = Task.Run(() =>
         {
+            bool ran = false;
             try
             {
-                StopScan();
+                ran = StopScanCore(epochAtLoss);
             }
             catch
             {
                 // The cleanup path reports its own failures; the message below
                 // is the actionable one either way.
             }
-            StatusText = "视频源已关闭，扫描已停止";
+            if (ran)
+            {
+                // Only claim the source died if the stop actually targeted the
+                // session that lost it — a newer session must keep its status.
+                StatusText = "视频源已关闭，扫描已停止";
+            }
         });
     }
 
@@ -707,8 +777,12 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             // completed receiver armed with _recoveryStarted == 1 so the same
             // completed transfer is not retried every frame. A genuine relock
             // is the point where a NEW transfer takes ownership, so re-arm the
-            // recovery gate here for that new transfer.
+            // recovery gate here for that new transfer. The pre-scan dedup
+            // marker must reset too: it keys on the session OBJECT, which the
+            // relocked transfer still shares — otherwise the new transfer
+            // would never get its descriptor-time duplicate check.
             Interlocked.Exchange(ref _recoveryStarted, 0);
+            _preScanCheckedSession = null;
             _awaitingChunkResupply = false;
         }
         if (s.ManifestReady)
@@ -884,6 +958,16 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         AirFerry.Windows.Bundle.ContinuousSaver? saver)
     {
         pool.IngestStopped = true;
+        // Quiesce barrier: acquiring the ingest lock once waits out any flush
+        // that passed the IngestStopped check before the flag was set; every
+        // later flush sees the flag under the lock and no-ops. After this
+        // point no ingest can race the native calls below, so the verify loop
+        // does NOT need to hold IngestLock across its whole disk walk — the UI
+        // thread takes that lock at ~7 Hz for progress refreshes and would
+        // otherwise freeze for the entire spill read+hash pass (seconds to
+        // tens of seconds on GB transfers). Per-call native safety is provided
+        // by ReceiverSession's own gate.
+        pool.RunExclusive(() => true);
 
         // Fast path for the normal bounded-memory receiver: completed chunks
         // already live in the sparse spill file, so verify and stage directly
@@ -958,72 +1042,83 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         ReceiverSession.Snapshot snapshot)
     {
         var badChunks = new List<uint>();
-        bool verified = pool.RunExclusive(() =>
+        // No RunExclusive around the loop: the quiesce barrier in
+        // RecoverAndStageCore guarantees no further ingest, and every native
+        // call below takes ReceiverSession's internal gate per call. Holding
+        // IngestLock across the chunk-by-chunk spill reads froze the UI
+        // progress refresh for the whole pass.
+        bool verified;
         {
-            if (!session.FinalVerifyBegin()) return false;
-            long chunkRawSize = Math.Max(1L, snapshot.ChunkRawSize);
-            bool finalVerifyUsable = true;
-            for (uint i = 0; i < snapshot.ChunkCount; i++)
+            if (!session.FinalVerifyBegin()) { verified = false; }
+            else
             {
-                long offset = checked((long)i * chunkRawSize);
-                long length = Math.Min(
-                    chunkRawSize,
-                    Math.Max(0L, checked((long)snapshot.TotalRawSize - offset)));
-                // Only trust ranges the spill is KNOWN to hold: the sparse file
-                // would happily hand back zeros for a hole. A chunk whose spill
-                // write once failed is still native-resident (eviction only
-                // happens after a successful write) — repair it into the spill
-                // so the staging pass below never slices holes.
-                byte[]? bytes = spill.HasChunk((int)i)
-                    ? spill.ReadRange(offset, length)
-                    : null;
-                if (bytes is null)
+                long chunkRawSize = Math.Max(1L, snapshot.ChunkRawSize);
+                bool finalVerifyUsable = true;
+                for (uint i = 0; i < snapshot.ChunkCount; i++)
                 {
-                    bytes = session.AssembleChunk(i);
+                    long offset = checked((long)i * chunkRawSize);
+                    long length = Math.Min(
+                        chunkRawSize,
+                        Math.Max(0L, checked((long)snapshot.TotalRawSize - offset)));
+                    // Only trust ranges the spill is KNOWN to hold: the sparse file
+                    // would happily hand back zeros for a hole. A chunk whose spill
+                    // write once failed is still native-resident (eviction only
+                    // happens after a successful write) — repair it into the spill
+                    // so the staging pass below never slices holes.
+                    byte[]? bytes = spill.HasChunk((int)i)
+                        ? spill.ReadRange(offset, length)
+                        : null;
                     if (bytes is null)
                     {
-                        // Unjournaled pre-crash spill data (written durably,
-                        // never committed to the ledger): last-resort read.
-                        // The §11 hash gate below still validates the bytes.
-                        bytes = spill.ReadRange(offset, length);
+                        bytes = session.AssembleChunk(i);
+                        if (bytes is null)
+                        {
+                            // Unjournaled pre-crash spill data (written durably,
+                            // never committed to the ledger): last-resort read.
+                            // The §11 hash gate below still validates the bytes.
+                            bytes = spill.ReadRange(offset, length);
+                        }
+                        else
+                        {
+                            spill.Write((int)i, (int)chunkRawSize, bytes);
+                        }
                     }
-                    else
+                    if (bytes is null)
                     {
-                        spill.Write((int)i, (int)chunkRawSize, bytes);
+                        verified = false; // missing everywhere despite repair
+                        goto done;
+                    }
+                    if (!session.VerifyChunk(i, bytes))
+                    {
+                        // Local corruption in ONE chunk must not cost the whole
+                        // transfer: invalidate just this chunk and keep every other
+                        // verified chunk plus the spill/ledger. The sender's next
+                        // epoch re-supplies exactly this chunk; failing here would
+                        // reset the receiver and force a complete re-receive.
+                        session.InvalidateChunk(i);
+                        // Keep the crash-resume journal in lockstep with native
+                        // completion state. Otherwise an app exit before re-supply
+                        // would resurrect this corrupt spill chunk as completed.
+                        _af2Ledger?.Invalidate((int)i);
+                        badChunks.Add(i);
+                        // FinalVerifyFeed consumes a contiguous canonical stream.
+                        // After skipping one corrupt chunk, feeding later chunks
+                        // would advance the verifier with the wrong logical bytes
+                        // and can transform a local spill fault into a false final
+                        // verification failure that resets the whole transfer.
+                        finalVerifyUsable = false;
+                        continue;
+                    }
+                    if (finalVerifyUsable && !session.FinalVerifyFeed(bytes))
+                    {
+                        verified = false;
+                        goto done;
                     }
                 }
-                if (bytes is null)
-                {
-                    return false; // missing everywhere despite repair
-                }
-                if (!session.VerifyChunk(i, bytes))
-                {
-                    // Local corruption in ONE chunk must not cost the whole
-                    // transfer: invalidate just this chunk and keep every other
-                    // verified chunk plus the spill/ledger. The sender's next
-                    // epoch re-supplies exactly this chunk; failing here would
-                    // reset the receiver and force a complete re-receive.
-                    session.InvalidateChunk(i);
-                    // Keep the crash-resume journal in lockstep with native
-                    // completion state. Otherwise an app exit before re-supply
-                    // would resurrect this corrupt spill chunk as completed.
-                    _af2Ledger?.Invalidate((int)i);
-                    badChunks.Add(i);
-                    // FinalVerifyFeed consumes a contiguous canonical stream.
-                    // After skipping one corrupt chunk, feeding later chunks
-                    // would advance the verifier with the wrong logical bytes
-                    // and can transform a local spill fault into a false final
-                    // verification failure that resets the whole transfer.
-                    finalVerifyUsable = false;
-                    continue;
-                }
-                if (finalVerifyUsable && !session.FinalVerifyFeed(bytes))
-                {
-                    return false;
-                }
+                verified = badChunks.Count == 0 && session.FinalVerifyFinish();
             }
-            return badChunks.Count == 0 && session.FinalVerifyFinish();
-        });
+        }
+    done:;
         if (badChunks.Count > 0)
         {
             // Re-arm the decode pipeline: the transfer re-completes once the
@@ -1453,6 +1548,11 @@ public partial class ScanViewModel : ObservableObject, IDisposable
                 return;
             }
             StatusText = "组装失败";
+            // Nothing was recoverable, but the pool was stopped and the
+            // receiver left "armed": without a reset the next decoded frame
+            // re-triggers the same dead-end recovery forever. Swap in a fresh
+            // receiver and re-arm ingest like the other failure paths.
+            ResetReceiverAfterRecoveryFailure(session, pool, epoch);
             return;
         }
         if (saver is not null && outcome.ContinuousReport is not null)

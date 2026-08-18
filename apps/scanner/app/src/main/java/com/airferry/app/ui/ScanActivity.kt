@@ -200,12 +200,13 @@ class ScanActivity : ComponentActivity() {
         if (jniOk) {
             // §12 resume attempt must precede the first ingest (the receiver
             // accepts resume only while unlocked). Runs on the ingest thread
-            // like every other session mutation.
-            val pool0 = decodePool
-            ioExecutor.execute {
-                val work = { tryResumeFromLedger() }
-                pool0?.runExclusive(work) ?: work()
-            }
+            // like every other session mutation. ensurePool() first so the
+            // resume runs under the SAME ingest lock the decode workers use —
+            // reading the field here would find null (the pool is otherwise
+            // created by the camera callback) and run resume lock-free while
+            // startCamera() races to create the pool and feed frames.
+            val pool0 = ensurePool()
+            ioExecutor.execute { pool0.runExclusive { tryResumeFromLedger() } }
         }
         if (!jniOk) {
             setContent {
@@ -565,7 +566,13 @@ class ScanActivity : ComponentActivity() {
         /** Total segment count (1 when not segmented). */
         val segmentCount: Int,
         /** v1-magic frames rejected; > 0 ⇒ peer runs protocol 1 (F2 hint). */
-        val legacyPeerFrames: Int = 0
+        val legacyPeerFrames: Int = 0,
+        /** Pre-meta total estimate, computed on the worker under the ingest
+         * lock — calling into JNI from the main thread would race worker
+         * ingests (`&` vs `&mut` on the same native session). */
+        val estimatedTotalSymbols: Int = 0,
+        /** Wire symbol size T as last seen on the worker (display only). */
+        val symbolSize: Int = 1024
     )
 
     /**
@@ -687,9 +694,18 @@ class ScanActivity : ComponentActivity() {
         }
 
         // UI refresh throttle: ~7 Hz is plenty for a progress bar, and keeps the
-        // main thread free. Always let the final "complete" frame through.
+        // main thread free. Only the completion-eligible frame (complete AND
+        // Manifest decoded) bypasses the throttle — in the "all chunks done but
+        // Manifest pending" window every frame re-announces complete=true, and
+        // letting those through would run the full progress+snapshot JNI/JSON
+        // chain at camera fps and starve symbol ingest.
         val now = System.currentTimeMillis()
-        if (now - lastUiUpdate < 150 && !status.complete) return
+        if (status.complete) {
+            val manifestDecoded = session.snapshot().entries.isNotEmpty()
+            if (!manifestDecoded && now - lastUiUpdate < 150) return
+        } else if (now - lastUiUpdate < 150) {
+            return
+        }
         lastUiUpdate = now
 
         // On the UI tick (or completion), pull the full progress snapshot. This
@@ -724,7 +740,11 @@ class ScanActivity : ComponentActivity() {
         val completionEligible = status.complete && manifestDecoded
         val displayProgress =
             if (status.complete && !manifestDecoded) progress.copy(complete = false) else progress
-        val snapshot = FrameSnapshot(displayProgress, fn, fs, cs, segIdx, segCount, legacy)
+        val snapshot = FrameSnapshot(
+            displayProgress, fn, fs, cs, segIdx, segCount, legacy,
+            estimatedTotalSymbols = session.getEstimatedTotalSymbols(),
+            symbolSize = session.symbolSizeBytes()
+        )
         if (completionEligible) {
             // Block any further ingest before the completion path (assemble +
             // file I/O + Activity start) runs on the main thread.
@@ -759,7 +779,7 @@ class ScanActivity : ComponentActivity() {
             // total_symbols (advisory only) and cap at 15% — the descriptor may
             // later reveal a larger total, so don't over-promise early.
             progress.receivedSymbols > 0 -> {
-                val estimated = session.getEstimatedTotalSymbols()
+                val estimated = s.estimatedTotalSymbols
                 if (estimated > 0) {
                     (progress.receivedSymbols * 100 / estimated).coerceIn(0, 15)
                 } else {
@@ -786,7 +806,10 @@ class ScanActivity : ComponentActivity() {
         val nowMs = System.currentTimeMillis()
         // Rate math uses ≥1 so early pre-descriptor ticks don't div0; samples
         // store symbol counts so a late real symbolSize never rewrites history.
-        val symbolSize = session.symbolSizeBytes().coerceAtLeast(1)
+        // Read from the snapshot (worker-produced), NOT `session` — the main
+        // thread must not call into the native session concurrently with
+        // worker ingests.
+        val symbolSize = s.symbolSize.coerceAtLeast(1)
         val receivedNow = progress.receivedSymbols.toLong().coerceAtLeast(0)
         val decodedNow = pool?.decodedCount() ?: 0L
         if (progress.complete) {
@@ -882,51 +905,60 @@ class ScanActivity : ComponentActivity() {
             // so after destroy the field's isInitialized==false and the guarded
             // getters no-op → recoverAndStage returns null harmlessly.
             val poolAtEnqueue = decodePool
-            ioExecutor.execute {
-                try {
-                    var intent: Intent? = null
-                    val work = fun() {
-                        intent = recoverAndStage(snapshotFileName)
-                    }
-                    // Always serialize via the captured pool. If the pool was
-                    // already null at enqueue (shouldn't happen mid-scan, but be
-                    // defensive), skip recovery entirely — calling recoverAndStage
-                    // without the lock would race destroy() on the native handle.
-                    poolAtEnqueue?.runExclusive(work)
-                    intent?.let { runOnUiThread { startActivity(it) } }
-                } catch (e: Exception) {
-                    clearRecoveryStage()
-                    resetReceiverAfterRecoveryFailure()
-                    runOnUiThread {
-                        Toast.makeText(
-                            this,
-                            e.message ?: "保存接收内容失败",
-                            Toast.LENGTH_LONG,
-                        ).show()
-                    }
-                } catch (e: OutOfMemoryError) {
-                    // A large recovered payload (e.g. multi-MB text decoded to a
-                    // ~2x String) can transiently exceed the default heap. Do not
-                    // crash the whole scanner — drop to a graceful message. The
-                    // bytes are typically already persisted by this point, so the
-                    // user can reopen the file from the list.
-                    android.util.Log.e("ScanActivity", "recoverAndStage OOM", e)
-                    clearRecoveryStage()
-                    resetReceiverAfterRecoveryFailure()
-                    runOnUiThread {
-                        Toast.makeText(this, "文件过大，接收内存不足", Toast.LENGTH_LONG).show()
+            try {
+                ioExecutor.execute {
+                    // Mark the recovery pass for FileListActivity's 断点清理
+                    // guard: it must not delete the spill/ledger under us.
+                    if (!recoveryActive.compareAndSet(false, true)) return@execute
+                    try {
+                        try {
+                            var intent: Intent? = null
+                            val work = fun() {
+                                intent = recoverAndStage(snapshotFileName)
+                            }
+                            // Always serialize via the captured pool. If the pool was
+                            // already null at enqueue (shouldn't happen mid-scan, but be
+                            // defensive), skip recovery entirely — calling recoverAndStage
+                            // without the lock would race destroy() on the native handle.
+                            poolAtEnqueue?.runExclusive(work)
+                            intent?.let { runOnUiThread { startActivity(it) } }
+                        } catch (e: Exception) {
+                            clearRecoveryStage()
+                            resetReceiverAfterRecoveryFailure()
+                            runOnUiThread {
+                                Toast.makeText(
+                                    this,
+                                    e.message ?: "保存接收内容失败",
+                                    Toast.LENGTH_LONG,
+                                ).show()
+                            }
+                        } catch (e: OutOfMemoryError) {
+                            // A large recovered payload (e.g. multi-MB text decoded to a
+                            // ~2x String) can transiently exceed the default heap. Do not
+                            // crash the whole scanner — drop to a graceful message. The
+                            // bytes are typically already persisted by this point, so the
+                            // user can reopen the file from the list.
+                            android.util.Log.e("ScanActivity", "recoverAndStage OOM", e)
+                            clearRecoveryStage()
+                            resetReceiverAfterRecoveryFailure()
+                            runOnUiThread {
+                                Toast.makeText(this, "文件过大，接收内存不足", Toast.LENGTH_LONG).show()
+                            }
+                        }
+                    } finally {
+                        recoveryActive.set(false)
                     }
                 }
+            } catch (_: java.util.concurrent.RejectedExecutionException) {
+                // onDestroy already shut the executor down (user backed out in
+                // the instant between completion and this dispatch) — execute()
+                // itself throws synchronously, outside the lambda's own catch,
+                // and must not crash the process at teardown.
             }
         }
     }
 
     /**
-     * Assemble the recovered bytes, verify CRC, and stage the file(s) to disk.
-     * Returns the [Intent] to launch the detail/bundle screen, or null if there
-     * was nothing to recover. Runs on a background thread under the decode pool's
-     * ingest lock (so it can't race an in-flight ingest or a destroy()).
-     */    /**
      * Assemble the recovered AF2 Canonical Content Stream and stage entries to
      * disk based on the Manifest entry table (kind = text / file / bundle).
      * Runs on a background thread under the decode pool's ingest lock.
@@ -1408,6 +1440,13 @@ class ScanActivity : ComponentActivity() {
 
     companion object {
         private const val TAG = "ScanActivity"
+        /**
+         * True while a §12 recovery/staging pass is reading the spill/ledger
+         * (process-wide). FileListActivity's "清理断点" refuses to run while
+         * this is set — deleting the spill under a live recovery used to abort
+         * it and discard a fully received transfer.
+         */
+        val recoveryActive = java.util.concurrent.atomic.AtomicBoolean(false)
         /**
          * Sliding window for decode rate + wire throughput shown in the info card.
          * ~3s is responsive enough to feel "live" without jittering every tick.

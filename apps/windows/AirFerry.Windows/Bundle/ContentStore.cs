@@ -400,11 +400,16 @@ public static class ContentStore
         }
         catch (Exception ex)
         {
-            string backup = Path.Combine(
-                RootDir,
-                $"index.corrupt.{File.GetLastWriteTimeUtc(IndexPath).Ticks}.json");
+            // The backup path itself touches the filesystem — if the index
+            // vanished between the read above and here, re-throwing a raw IO
+            // exception would escape as a non-InvalidDataException and crash
+            // callers that only guard the corruption case.
+            string backup = "";
             try
             {
+                backup = Path.Combine(
+                    RootDir,
+                    $"index.corrupt.{File.GetLastWriteTimeUtc(IndexPath).Ticks}.json");
                 if (!File.Exists(backup)) File.Copy(IndexPath, backup, overwrite: false);
             }
             catch

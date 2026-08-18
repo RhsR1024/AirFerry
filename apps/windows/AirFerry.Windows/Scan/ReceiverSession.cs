@@ -28,6 +28,7 @@ public sealed class ReceiverSession : IDisposable
     private readonly object _gate = new();
     private IntPtr _handle = IntPtr.Zero;
     private bool _initialized;
+    private bool _destroyed;
     private Snapshot? _cachedSnapshot;
 
     public bool IsInitialized { get { lock (_gate) return _initialized; } }
@@ -89,6 +90,14 @@ public sealed class ReceiverSession : IDisposable
         lock (_gate)
         {
             if (frameBytes is null || frameBytes.Length == 0)
+            {
+                return null;
+            }
+
+            // A destroyed session must not silently re-create a native receiver
+            // nobody owns (leak) — a straggler decode flush after teardown used
+            // to hit this.
+            if (_destroyed)
             {
                 return null;
             }
@@ -177,6 +186,10 @@ public sealed class ReceiverSession : IDisposable
     {
         lock (_gate)
         {
+            if (_destroyed)
+            {
+                return false;
+            }
             if (!_initialized)
             {
                 CreateReceiver();
@@ -498,6 +511,7 @@ public sealed class ReceiverSession : IDisposable
     {
         lock (_gate)
         {
+        _destroyed = true;
         if (_initialized && _handle != IntPtr.Zero)
         {
             NativeBridge.ReceiverDestroy(_handle);

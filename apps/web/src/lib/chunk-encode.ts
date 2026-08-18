@@ -94,17 +94,24 @@ export async function prepareChunkEncodings(
       BigInt(Math.max(0, Math.round(opts.channelBps))),
       opts.forceFull,
     )
-    if (enc.codec_id === CODEC_RAW) {
-      encodings.push({ index: i, codec: CODEC_RAW, data: new Uint8Array(0) })
-    } else {
-      if (enc.data.length >= raw.length) {
-        // Strictly-smaller is a wire invariant — refuse to provision a
-        // violation even if the core policy somehow produced one.
-        throw new Error(
-          `chunk ${i}: encoded ${enc.data.length} not < raw ${raw.length}`,
-        )
+    try {
+      if (enc.codec_id === CODEC_RAW) {
+        encodings.push({ index: i, codec: CODEC_RAW, data: new Uint8Array(0) })
+      } else {
+        if (enc.data.length >= raw.length) {
+          // Strictly-smaller is a wire invariant — refuse to provision a
+          // violation even if the core policy somehow produced one.
+          throw new Error(
+            `chunk ${i}: encoded ${enc.data.length} not < raw ${raw.length}`,
+          )
+        }
+        encodings.push({ index: i, codec: enc.codec_id, data: enc.data })
       }
-      encodings.push({ index: i, codec: enc.codec_id, data: enc.data })
+    } finally {
+      // The wasm-side EncodedChunk holds the full ≤8 MiB encoded block until
+      // GC; freeing here keeps the pre-encode pass from inflating the WASM
+      // heap by the whole transfer size.
+      enc.free()
     }
     opts.onProgress?.(i + 1, chunks.length)
     if (i < chunks.length - 1) await yieldToUi()

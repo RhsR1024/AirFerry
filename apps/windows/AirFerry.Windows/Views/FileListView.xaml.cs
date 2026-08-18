@@ -96,11 +96,10 @@ public partial class FileListView : Page
         try
         {
             long len = new FileInfo(entry.FullPath).Length;
-            byte[]? bytes = null;
             bool textCandidate = entry.Kind == "text" || FileNameUtil.IsTextLikeName(entry.Name);
             if (textCandidate && FileNameUtil.FitsTextUi(len))
             {
-                bytes = File.ReadAllBytes(entry.FullPath);
+                byte[] bytes = File.ReadAllBytes(entry.FullPath);
                 string? text = FileNameUtil.DecodeUtf8Strict(bytes);
                 if (text is not null)
                 {
@@ -109,19 +108,24 @@ public partial class FileListView : Page
                     NavigationService?.Navigate(new ReceiveTextView(textResult, entry.Name));
                     return;
                 }
+                // Whole-stream CRC for a blob that can be GB-scale must not run
+                // on the dispatcher thread — it froze the UI for the full read.
+                ulong receivedCrc = await Task.Run(() =>
+                {
+                    using FileStream stream = File.OpenRead(entry.FullPath);
+                    return Crc32.Compute(stream);
+                });
+                NavigationService?.Navigate(new ReceiveDetailView(
+                    BuildResult(entry, (ulong)len, receivedCrc, null)));
+                return;
             }
-            ulong receivedCrc;
-            if (bytes is not null)
-            {
-                receivedCrc = Crc32.Compute(bytes);
-            }
-            else
+            ulong streamCrc = await Task.Run(() =>
             {
                 using FileStream stream = File.OpenRead(entry.FullPath);
-                receivedCrc = Crc32.Compute(stream);
-            }
+                return Crc32.Compute(stream);
+            });
             NavigationService?.Navigate(new ReceiveDetailView(
-                BuildResult(entry, (ulong)len, receivedCrc, null)));
+                BuildResult(entry, (ulong)len, streamCrc, null)));
         }
         catch (Exception ex)
         {

@@ -69,10 +69,16 @@ export function HistoryModal({ isOpen, onClose }: Props) {
   }
 
   const handleCopyText = (id: string, text: string) => {
-    navigator.clipboard.writeText(text).then(() => {
-      setCopiedId(id)
-      setTimeout(() => setCopiedId(null), 1500)
-    })
+    navigator.clipboard
+      .writeText(text)
+      .then(() => {
+        setCopiedId(id)
+        setTimeout(() => setCopiedId(null), 1500)
+      })
+      .catch(() => {
+        setCopiedId(null)
+        alert("复制失败：浏览器未授权剪贴板，请手动选择文本复制。")
+      })
   }
 
   const pendingCount = items.filter((it) => it.status === "partial").length

@@ -33,6 +33,9 @@ public sealed class Af2LedgerStore
         _path = path;
     }
 
+    /// <summary>True once the header line is durably on disk (set by Create).</summary>
+    private bool _headerDurable;
+
     public int[] CompletedIndices => Completed.ToArray();
 
     /// <summary>Parse (or re-parse) the journal. True when a valid header exists.</summary>
@@ -92,14 +95,18 @@ public sealed class Af2LedgerStore
                 Completed.Remove(ii);
             }
         }
-        return headerSeen &&
+        // A journal that reloads with a valid header is durable by definition —
+        // resumed transfers keep appending to it.
+        _headerDurable = headerSeen &&
             !string.IsNullOrEmpty(TransferIdHex) &&
             RootFrameBytes.Length > 0;
+        return _headerDurable;
     }
 
     /// <summary>Append one commit event (after the chunk was spilled + flushed).</summary>
     public void Commit(int index)
     {
+        if (!_headerDurable) return; // headerless journal would never reload
         AppendLine($"{{\"c\":{index}}}");
         Completed.Add(index);
     }
@@ -107,6 +114,7 @@ public sealed class Af2LedgerStore
     /// <summary>Append one invalidate event (after a re-verification failure).</summary>
     public void Invalidate(int index)
     {
+        if (!_headerDurable) return;
         AppendLine($"{{\"i\":{index}}}");
         Completed.Remove(index);
     }
@@ -259,15 +267,22 @@ public sealed class Af2LedgerStore
             crs = chunkRawSize,
             root = BytesToHex(rootFrameBytes),
         });
+        bool headerDurable = false;
         try
         {
             Directory.CreateDirectory(dir);
             string tmp = path + ".tmp";
             File.WriteAllText(tmp, header + "\n");
             File.Move(tmp, path, overwrite: true);
+            headerDurable = true;
         }
         catch (Exception ex)
         {
+            // A journal whose header never became durable is permanently
+            // un-reloadable (Reload requires a header line) and the resume
+            // sweep would delete its spill as garbage. Keep the store for the
+            // in-memory completed-set, but refuse to append so we never write
+            // a headerless {"c":i} journal that silently breaks §12 resume.
             System.Diagnostics.Debug.WriteLine($"[Af2LedgerStore] header write failed: {ex.Message}");
         }
         return new Af2LedgerStore(path)
@@ -275,6 +290,7 @@ public sealed class Af2LedgerStore
             TransferIdHex = transferIdHex,
             ChunkRawSize = chunkRawSize,
             RootFrameBytes = rootFrameBytes,
+            _headerDurable = headerDurable,
         };
     }
 

@@ -28,16 +28,26 @@ export interface CachedManifest {
   chunkRawSize: number
 }
 
+// Reuse one connection: every call used to open (and leak) a fresh
+// IndexedDB connection for the same database.
+let dbPromise: Promise<IDBDatabase> | null = null
+
 function db(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, 1)
-    req.onupgradeneeded = () => {
-      const store = req.result.createObjectStore(STORE, { keyPath: "key" })
-      store.createIndex("cachedAt", "cachedAt")
-    }
-    req.onsuccess = () => resolve(req.result)
-    req.onerror = () => reject(req.error)
-  })
+  if (!dbPromise) {
+    dbPromise = new Promise((resolve, reject) => {
+      const req = indexedDB.open(DB_NAME, 1)
+      req.onupgradeneeded = () => {
+        const store = req.result.createObjectStore(STORE, { keyPath: "key" })
+        store.createIndex("cachedAt", "cachedAt")
+      }
+      req.onsuccess = () => resolve(req.result)
+      req.onerror = () => {
+        dbPromise = null
+        reject(req.error)
+      }
+    })
+  }
+  return dbPromise
 }
 
 function txDone(tx: IDBTransaction): Promise<void> {

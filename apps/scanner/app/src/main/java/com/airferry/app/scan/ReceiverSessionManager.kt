@@ -102,6 +102,10 @@ class ReceiverSessionManager {
 
     private var handle: Long = 0L
     private var initialized: Boolean = false
+    // Written under the ingest lock (worker) via progress(), read by the main
+    // thread for the rate display — volatile so the UI doesn't pin a stale
+    // pre-lock 1024 forever.
+    @Volatile
     private var symbolSize: Int = 1024
 
     /**

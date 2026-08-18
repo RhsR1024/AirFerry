@@ -127,6 +127,15 @@ function formatDuration(ms: number): string {
 }
 
 /**
+ * Revoke a download URL late rather than on a 0ms timeout. Result Blobs can be
+ * lazy references into the OPFS spill file; the browser streams them while the
+ * download runs, and revoking on the next tick can abort that stream.
+ */
+function revokeDownloadUrlLater(url: string): void {
+  setTimeout(() => URL.revokeObjectURL(url), 10_000)
+}
+
+/**
  * Extract a Y (luminance) plane from the live video for the fast backend.
  *
  * We draw to canvas and convert RGBA→Y explicitly. This guarantees a tightly
@@ -248,9 +257,6 @@ interface ProgressSnapshot {
   decodedBlocks: number
   totalBlocks: number
   decodedFraction: number
-  framesSeen: number
-  framesDuplicate: number
-  framesCorrupt: number
   metaConfirmed: boolean
   symbolSize: number
   legacyPeerFrames: number
@@ -333,6 +339,15 @@ export function ReceivePage(): React.ReactElement {
   const decodedCodesRef = useRef<number>(0)
   const stageRef = useRef<Stage>("camera")
   const assemblingRef = useRef<boolean>(false)
+  // Last wall-clock time recordPartialTransfer ran (throttled to 1/s).
+  const lastPartialRecordRef = useRef<number>(0)
+  // True while a capture callback (rVFC or rAF) is scheduled but has not yet
+  // fired — prevents stacking a second concurrent loop when resupply re-arms
+  // scanning while the previous chain's last callback is still pending.
+  const framePendingRef = useRef<boolean>(false)
+  // The pending requestVideoFrameCallback handle (rVFC has no global cancel;
+  // the element's own cancelVideoFrameCallback must be used).
+  const rvfcRef = useRef<number | null>(null)
 
   // keep stageRef in sync so the rAF loop can read the latest stage.
   useEffect(() => {
@@ -361,9 +376,17 @@ export function ReceivePage(): React.ReactElement {
   /** Stop camera + workers + rAF. */
   const teardown = useCallback(() => {
     scanningActiveRef.current = false
+    framePendingRef.current = false
     if (rafRef.current !== null) {
       cancelAnimationFrame(rafRef.current)
       rafRef.current = null
+    }
+    if (rvfcRef.current !== null) {
+      const video = videoRef.current as (HTMLVideoElement & {
+        cancelVideoFrameCallback?: (handle: number) => void
+      }) | null
+      video?.cancelVideoFrameCallback?.(rvfcRef.current)
+      rvfcRef.current = null
     }
     const stream = streamRef.current
     if (stream) {
@@ -516,7 +539,6 @@ export function ReceivePage(): React.ReactElement {
         p.metaConfirmed = snap.metaConfirmed
         p.symbolSize = snap.symbolSize
         p.legacyPeerFrames = snap.legacyPeerFrames || 0
-        p.framesSeen = snap.framesSeen
         if (snap.fileName) {
           p.fileName = snap.fileName
           activeNameRef.current = snap.fileName
@@ -632,6 +654,14 @@ export function ReceivePage(): React.ReactElement {
         }
       }
       recv.addEventListener("message", h)
+      // A module-level load failure (404 / CSP / parse error) fires the
+      // Worker "error" EVENT, not a message — without this the barrier below
+      // would hang forever on a stage that never reports anything.
+      const onFatal = (ev: ErrorEvent) => {
+        recv.removeEventListener("message", h)
+        reject(new Error(`receive worker 加载失败: ${ev.message || "未知错误"}`))
+      }
+      recv.addEventListener("error", onFatal)
     })
     // QR decode worker pool: N independent zxing workers → parallel frame decode.
     //
@@ -646,10 +676,16 @@ export function ReceivePage(): React.ReactElement {
     const qrWorkers: Worker[] = new Array(QR_WORKER_POOL)
     const qrReadyAll: Promise<void>[] = []
     const readyResolvers: (() => void)[] = new Array(QR_WORKER_POOL)
+    const readyRejecters: ((reason: Error) => void)[] = new Array(QR_WORKER_POOL)
+    // Consecutive fatal failures per slot without an intervening "ready".
+    // If the worker script/wasm can't load at all, every replacement dies
+    // instantly — without a cap that becomes an infinite respawn loop.
+    const qrSpawnFails: number[] = new Array(QR_WORKER_POOL).fill(0)
     for (let i = 0; i < QR_WORKER_POOL; i++) {
       qrReadyAll.push(
-        new Promise<void>((resolve) => {
+        new Promise<void>((resolve, reject) => {
           readyResolvers[i] = resolve
+          readyRejecters[i] = reject
         })
       )
     }
@@ -675,6 +711,7 @@ export function ReceivePage(): React.ReactElement {
         if (!d) return
         if (d.type === "ready") {
           qrBusyRef.current[i] = false
+          qrSpawnFails[i] = 0
           if (trackReady) readyResolvers[i]()
           dbg(`[qr#${i}] READY ✓`)
           return
@@ -707,13 +744,26 @@ export function ReceivePage(): React.ReactElement {
       // `trackReady` stays true: if the crash happens before the initial init
       // barrier completes, the replacement's "ready" must still resolve the
       // barrier; if it happens at runtime, the resolver is already resolved and
-      // re-resolving is a harmless no-op.
+      // re-resolving is a harmless no-op. More than 3 consecutive deaths
+      // without a ready means the worker assets themselves are broken — stop
+      // respawning (or the loop burns CPU forever) and fail the barrier.
+      const onSlotDeath = (reason: string): void => {
+        if (qrWorkersRef.current[i] !== qr) return
+        qrSpawnFails[i] += 1
+        qr.terminate()
+        if (qrSpawnFails[i] > 3) {
+          dbg(`[qr#${i}] giving up after ${qrSpawnFails[i]} consecutive failures (${reason})`)
+          readyRejecters[i]?.(
+            new Error(`二维码解码 worker 连续失败（${reason}），请刷新页面重试`)
+          )
+          return
+        }
+        dbg(`[qr#${i}] replacing dead worker (${reason})...`)
+        spawnQrWorker(i, trackReady)
+      }
       qr.addEventListener("error", (ev) => {
         dbg(`[qr#${i}] WORKER ERROR: ${ev.message || ""} @${ev.filename}:${ev.lineno}`)
-        if (qrWorkersRef.current[i] !== qr) return
-        qr.terminate()
-        dbg(`[qr#${i}] replacing dead worker...`)
-        spawnQrWorker(i, trackReady)
+        onSlotDeath(ev.message || "worker error")
       })
       // A reply whose structured-clone deserialization failed never arrives:
       // leaving the slot busy wedges it forever (effective pool -1 per
@@ -723,10 +773,7 @@ export function ReceivePage(): React.ReactElement {
       // reports ready, so captureLoop never dispatches to it prematurely).
       qr.addEventListener("messageerror", (ev) => {
         dbg(`[qr#${i}] MESSAGE ERROR: ${String(ev.data || "")}`)
-        if (qrWorkersRef.current[i] !== qr) return
-        qr.terminate()
-        dbg(`[qr#${i}] replacing worker after messageerror...`)
-        spawnQrWorker(i, trackReady)
+        onSlotDeath("message error")
       })
       // Kick off this worker's initialization. Sending here (rather than in the
       // caller) guarantees both the initial pool and error-path replacements
@@ -755,9 +802,17 @@ export function ReceivePage(): React.ReactElement {
     dbg(`[init] init sent to receive worker + ${qrWorkers.length} qr workers; waiting for ready...`)
 
     try {
-      await Promise.all([
-        recvReady.then(() => dbg("[init] receive worker READY ✓")),
-        qrReady.then(() => dbg("[init] qr worker pool READY ✓")),
+      // A worker that never reports (hangs during wasm init) must not wedge
+      // the stage at "scanning" with no capture loop and no error.
+      const timeout = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("worker 初始化超时（15 秒）")), 15_000)
+      )
+      await Promise.race([
+        Promise.all([
+          recvReady.then(() => dbg("[init] receive worker READY ✓")),
+          qrReady.then(() => dbg("[init] qr worker pool READY ✓")),
+        ]),
+        timeout,
       ])
     } catch (e) {
       dbg(`[init] FAILED: ${e instanceof Error ? e.message : String(e)}`)
@@ -786,15 +841,23 @@ export function ReceivePage(): React.ReactElement {
           recv.postMessage({ type: "assemble", jobId: jobIdRef.current })
         }
         if (activeTransferIdRef.current) {
-          recordPartialTransfer(
-            activeTransferIdRef.current,
-            activeNameRef.current,
-            activeTotalSizeRef.current,
-            activeEntryCountRef.current,
-            Number(d.decodedBlocks) || 0,
-            Number(d.totalBlocks) || activeChunkCountRef.current,
-            activeEntryCountRef.current > 1 ? "bundle" : "file"
-          )
+          // Throttle: status arrives per ingest batch (tens per second) and
+          // recordPartialTransfer does a full localStorage parse+stringify of
+          // the whole history array each call — at batch rate that stalls the
+          // frame loop once the history holds a large item.
+          const now = Date.now()
+          if (now - lastPartialRecordRef.current >= 1000) {
+            lastPartialRecordRef.current = now
+            recordPartialTransfer(
+              activeTransferIdRef.current,
+              activeNameRef.current,
+              activeTotalSizeRef.current,
+              activeEntryCountRef.current,
+              Number(d.decodedBlocks) || 0,
+              Number(d.totalBlocks) || activeChunkCountRef.current,
+              activeEntryCountRef.current > 1 ? "bundle" : "file"
+            )
+          }
         }
         applyStatus(d as Record<string, unknown>)
       } else if (d.type === "meta") {
@@ -907,6 +970,7 @@ export function ReceivePage(): React.ReactElement {
 
   /** The per-frame capture + decode loop (driven by requestVideoFrameCallback). */
   const captureLoop = useCallback(() => {
+    framePendingRef.current = false
     if (!scanningActiveRef.current) return // a previous session's loop must die
     // Capture fps: count captureLoop runs in a 1s sliding window.
     const fpsNow = performance.now()
@@ -986,6 +1050,11 @@ export function ReceivePage(): React.ReactElement {
 
   /** Schedule the next capture via rVFC if available, else rAF. */
   const scheduleNextFrame = useCallback(() => {
+    // One in-flight callback at a time: resupply re-arms scanning while the
+    // previous chain's last callback may still be pending — scheduling again
+    // would run two concurrent capture loops (double decode per frame).
+    if (framePendingRef.current) return
+    framePendingRef.current = true
     const video = videoRef.current
     if (!video) {
       rafRef.current = requestAnimationFrame(captureLoop)
@@ -999,7 +1068,7 @@ export function ReceivePage(): React.ReactElement {
       }
     ).requestVideoFrameCallback
     if (typeof rvfc === "function") {
-      rvfc.call(video, () => captureLoop())
+      rvfcRef.current = rvfc.call(video, () => captureLoop())
     } else {
       rafRef.current = requestAnimationFrame(captureLoop)
     }
@@ -1316,10 +1385,18 @@ function TextView({
   const [copied, setCopied] = useState(false)
   const displayName = name || "文字消息.txt"
   const onCopy = () => {
-    navigator.clipboard.writeText(text).then(() => {
-      setCopied(true)
-      setTimeout(() => setCopied(false), 1500)
-    })
+    navigator.clipboard
+      .writeText(text)
+      .then(() => {
+        setCopied(true)
+        setTimeout(() => setCopied(false), 1500)
+      })
+      .catch(() => {
+        // Clipboard permission denied / document not focused — surface it on
+        // the button instead of an unhandled rejection.
+        setCopied(false)
+        alert("复制失败：浏览器未授权剪贴板，请手动选择文本复制。")
+      })
   }
   const onSave = () => {
     const blob = new Blob([text], { type: "text/plain;charset=utf-8" })
@@ -1329,7 +1406,7 @@ function TextView({
     a.download = displayName
     a.click()
     // Firefox cancels the download if the URL is revoked synchronously.
-    setTimeout(() => URL.revokeObjectURL(url), 0)
+    revokeDownloadUrlLater(url)
   }
   return (
     <div className="text-result">
@@ -1373,7 +1450,7 @@ function FileView({
     a.download = name
     a.click()
     // Firefox cancels the download if the URL is revoked synchronously.
-    setTimeout(() => URL.revokeObjectURL(url), 0)
+    revokeDownloadUrlLater(url)
   }
   const sizeKiB = (data.size / 1024).toFixed(1)
   return (
@@ -1419,7 +1496,7 @@ function BundleView({
     const dateStr = new Date().toISOString().slice(0, 10)
     a.download = `AirFerry-文件包-${dateStr}.zip`
     a.click()
-    setTimeout(() => URL.revokeObjectURL(url), 0)
+    revokeDownloadUrlLater(url)
   }
 
   const onDownloadAll = () => {
@@ -1429,7 +1506,7 @@ function BundleView({
       a.href = url
       a.download = e.name
       a.click()
-      setTimeout(() => URL.revokeObjectURL(url), 0)
+      revokeDownloadUrlLater(url)
     }
   }
 
@@ -1447,7 +1524,7 @@ function BundleView({
             a.href = url
             a.download = e.name
             a.click()
-            setTimeout(() => URL.revokeObjectURL(url), 0)
+            revokeDownloadUrlLater(url)
           }
           return (
             <li key={i}>

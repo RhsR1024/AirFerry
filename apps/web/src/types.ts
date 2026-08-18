@@ -198,7 +198,10 @@ export function normalizeConfig(config: TransferConfig): TransferConfig {
     Number.isFinite(value) ? Math.min(max, Math.max(min, Math.round(value))) : fallback
   const redundancyPct = integer(config.redundancyPct, DEFAULT_CONFIG.redundancyPct, 5, 50)
   const fps = integer(config.fps, DEFAULT_CONFIG.fps, 0, 240)
-  const rawSymbol = integer(config.symbolSize, DEFAULT_CONFIG.symbolSize, 64, 2400)
+  // SPEC §5/§12: 256 ≤ T ≤ 2400. Values below 256 pass 8-alignment checks but
+  // fail Rust Sender::build — clamp here so bad stored configs fall back to
+  // the default instead of surfacing as "encoder init failed" later.
+  const rawSymbol = integer(config.symbolSize, DEFAULT_CONFIG.symbolSize, 256, 2400)
   const symbolSize = rawSymbol % 8 === 0 ? rawSymbol : DEFAULT_CONFIG.symbolSize
   const brightness = Number.isFinite(config.brightness)
     ? Math.min(1.5, Math.max(1, config.brightness))
