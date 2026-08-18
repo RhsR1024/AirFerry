@@ -1143,10 +1143,14 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             // must not leave a truncated bundle committed to history.
             var stored = ContentStore.PutFileBatch(
                 staged.Select(f => new ContentStore.PutFileRequest(
-                    f.Name, f.StoredPath!,
-                    crcHex: "unknown", crcUnknown: true, kind: "file",
-                    bundleId: bundleId, bundleTitle: bundleTitle,
-                    expectedSize: f.Size)).ToList())
+                    DisplayName: f.Name,
+                    FilePath: f.StoredPath!,
+                    CrcHex: "unknown",
+                    CrcUnknown: true,
+                    Kind: "file",
+                    BundleId: bundleId,
+                    BundleTitle: bundleTitle,
+                    ExpectedSize: f.Size)).ToList())
                 .Select(put => new BundleFile(
                     put.Entry.Name, put.Path, put.Entry.Size))
                 .ToList();
