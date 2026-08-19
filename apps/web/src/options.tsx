@@ -74,6 +74,8 @@ interface PreparedPayload {
   chunkCount: number
   totalBytes: number
   displayName: string
+  /** §9.3 cache hit: the worker skipped the whole read/hash/encode pass. */
+  cachedManifestHex?: string
 }
 
 export interface AppState {
@@ -126,6 +128,10 @@ export default function App() {
   const mountedRef = useRef(true)
   const ownedSessionRef = useRef<SenderSessionWasm | null>(null)
   const ownedStagerRef = useRef<ChunkStager | null>(null)
+  /** Latest probe-phase cache lookup, keyed by prepare jobId. */
+  const cachedManifestRef = useRef<{ jobId: number; hex: string } | null>(null)
+  /** One-shot cache bypass used when a cached manifest fails to build. */
+  const forceCacheMissJobRef = useRef<number | null>(null)
   // Latest session builder. The worker "done" handler lives in a mount-time
   // effect closure, so it must call through this ref to see fresh config.
   const startPlaybackRef = useRef<(p: PreparedPayload, startEpoch: number) => Promise<void>>(
@@ -185,6 +191,37 @@ export default function App() {
         return
       }
 
+      if (msg.phase === "probe") {
+        // Metadata-only probe finished (no disk reads yet): decide whether
+        // the §9.3 resend cache can skip the whole content pass.
+        const worker = workerRef.current
+        if (!worker) return
+        const jobId = msg.jobId as number
+        const probeEntries = msg.entries as PreparedEntry[]
+        if (forceCacheMissJobRef.current === jobId) {
+          forceCacheMissJobRef.current = null
+          cachedManifestRef.current = null
+          worker.postMessage({ type: "prepareContinue", jobId, useCache: false })
+          return
+        }
+        void (async () => {
+          let useCache = false
+          let hit: { jobId: number; hex: string } | null = null
+          try {
+            const cached = await getCachedManifest(probeEntries, 8 * 1024 * 1024)
+            if (cached && cached.chunkRawSize === 8 * 1024 * 1024) {
+              hit = { jobId, hex: cached.manifestHex }
+              useCache = true
+            }
+          } catch {
+            /* cache is advisory */
+          }
+          cachedManifestRef.current = hit
+          worker.postMessage({ type: "prepareContinue", jobId, useCache })
+        })()
+        return
+      }
+
       if (msg.phase === "progress") {
         // Streaming prepare pass: per-chunk progress (large transfers can take
         // a while at disk-read speed); reuse the "reading" phase for the UI.
@@ -193,12 +230,18 @@ export default function App() {
 
       if (msg.phase === "done") {
         issuedEpoch.current = -1
+        const cacheRef = cachedManifestRef.current
+        const cacheHit =
+          msg.cached === true && cacheRef != null && cacheRef.jobId === msg.jobId
+            ? cacheRef.hex
+            : undefined
         const payload: PreparedPayload = {
           entries: msg.entries as PreparedEntry[],
           chunkHashes: msg.chunkHashes as Uint8Array[],
           chunkCount: Number(msg.chunkCount) || 0,
           totalBytes: msg.totalBytes as number,
           displayName: msg.displayName as string,
+          cachedManifestHex: cacheHit,
         }
         setState((s) => ({
           ...s,
@@ -264,6 +307,8 @@ export default function App() {
   const onItemsChange = useCallback((items: PendingItem[]) => {
     releaseOwnedSession()
     epoch.current += 1
+    forceCacheMissJobRef.current = null
+    cachedManifestRef.current = null
     if (issuedEpoch.current >= 0) restartWorkerRef.current()
     issuedEpoch.current = -1
     setState((s) => ({
@@ -303,29 +348,71 @@ export default function App() {
         return builder
       }
       let session: SenderSessionWasm | null = null
-      try {
-        const cached = await getCachedManifest(p.entries, chunkRawSize)
-        if (!mountedRef.current || epoch.current !== startEpoch) {
-          if (mountedRef.current) {
-            setState((s) => ({ ...s, initializing: false }))
+      if (p.cachedManifestHex) {
+        // Probe-phase cache hit: the worker already skipped the content
+        // pass. If the cached manifest itself is unusable, retry the prepare
+        // once with cache bypass rather than attempting to build from the
+        // probe's intentionally-empty hash placeholders.
+        try {
+          session = new SenderBuilderWasm().build_streamed_cached(
+            p.cachedManifestHex,
+            cfg.symbolSize,
+            chunkRawSize,
+            cfg.redundancyPct
+          )
+        } catch (e) {
+          console.warn("cached manifest unusable, retrying full prepare:", e)
+          // A cache-hit worker intentionally skipped the content pass, so
+          // p.entries/p.chunkHashes contain probe placeholders and CANNOT be
+          // used for a metadata rebuild here. Start one fresh prepare job and
+          // bypass the cache exactly once; that job will read/hash/encode the
+          // sources and overwrite the bad cache entry with a valid manifest.
+          const worker = workerRef.current
+          const items = state.items
+          if (!worker || items.length === 0) throw e
+          epoch.current += 1
+          const retryEpoch = epoch.current
+          issuedEpoch.current = retryEpoch
+          forceCacheMissJobRef.current = retryEpoch
+          cachedManifestRef.current = null
+          releaseOwnedSession()
+          setState((s) => ({
+            ...s,
+            prepared: null,
+            session: null,
+            stager: null,
+            initializing: false,
+            compressPhase: "reading",
+            error: null,
+          }))
+          const channelBps = Math.round(
+            cfg.symbolSize * (cfg.fps || 60) * Math.max(1, cfg.multiQr || 1)
+          )
+          const forceFull = items.reduce(
+            (sum, it) =>
+              sum +
+              (it.kind === "file"
+                ? it.file.size
+                : new TextEncoder().encode(it.content).length),
+            0
+          ) <= 8 * 1024 * 1024
+          const encodeParams = { channelBps, forceFull }
+          if (items.length === 1 && items[0].kind === "text") {
+            worker.postMessage({
+              jobId: retryEpoch,
+              text: items[0].content,
+              name: items[0].name,
+              encodeParams,
+            })
+          } else {
+            worker.postMessage({
+              jobId: retryEpoch,
+              files: itemsToFiles(items),
+              encodeParams,
+            })
           }
           return
         }
-        if (cached && cached.chunkRawSize === chunkRawSize) {
-          try {
-            session = buildFromMeta().build_streamed_cached(
-              cached.manifestHex,
-              cfg.symbolSize,
-              chunkRawSize,
-              cfg.redundancyPct
-            )
-          } catch (e) {
-            console.warn("cached manifest unusable, rebuilding:", e)
-            session = null
-          }
-        }
-      } catch {
-        session = null
       }
       if (!session) {
         session = buildFromMeta().build_streamed(
@@ -403,7 +490,7 @@ export default function App() {
         error: `编码器初始化失败: ${e?.message || e}`,
       }))
     }
-  }, [state.config, releaseOwnedSession])
+  }, [state.config, state.items, releaseOwnedSession])
 
   startPlaybackRef.current = startPlaybackWithPayload
 

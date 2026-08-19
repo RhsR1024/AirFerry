@@ -504,11 +504,28 @@ impl Af2Sender {
         self.epoch
     }
 
+    /// True while `staged_chunks[index]` still holds prefetched bytes. Hosts
+    /// reconcile their armed-set against this instead of guessing consumption
+    /// timing: staged bytes are consumed lazily — for a multi-chunk advance
+    /// inside `advance_past_chunk` (before the state flips), but for an epoch
+    /// wrap on the single chunk at the NEW window's first META emission (the
+    /// wrap's `ensure(0)` early-returns while the encoder is still alive).
+    /// Keying armed-invalidation on the window change alone therefore either
+    /// re-requests redundantly (burning a worker round-trip per epoch) or
+    /// stalls; asking the core is exact.
+    pub fn is_staged(&self, index: u32) -> bool {
+        self.staged_chunks
+            .get(index as usize)
+            .is_some_and(|s| s.is_some())
+    }
+
     /// Provide one chunk's ENCODED bytes to a streamed sender
     /// ([`Self::from_manifest_streamed`]). Fail-closed against the manifest
     /// chunk table: RAW bytes must be exactly the canonical slice length and
     /// hash to the table entry; Zstd/Xz bytes must be strictly smaller AND
-    /// bounded-decompress to bytes hashing to the table entry. The staged
+    /// either carry a host-precomputed RAW digest (`stage_chunk_with_raw_hash`)
+    /// matching the table entry or bounded-decompress here to bytes hashing to
+    /// that entry. The staged
     /// bytes are consumed when the playlist reaches the chunk and dropped
     /// when the window moves on — later epochs must re-stage byte-identical
     /// bytes (deterministic re-encode) to keep the object_id stable.
@@ -517,6 +534,34 @@ impl Af2Sender {
         index: u32,
         codec_id: u8,
         bytes: Vec<u8>,
+    ) -> Result<(), SenderError> {
+        self.stage_chunk_inner(index, codec_id, bytes, None)
+    }
+
+    /// [`Self::stage_chunk`] with a host-precomputed BLAKE3-256 of the RAW
+    /// chunk bytes (32 bytes; empty slice = none). The digest path exists so
+    /// browser hosts hash on the worker thread instead of the render thread
+    /// (an 8 MiB in-core hash costs ~20 ms of main-thread jank per stage).
+    /// Trust boundary: the digest proves the worker assembled the exact
+    /// bytes it hashed — a buggy worker corrupting content is still caught
+    /// by the receiver's §11 manifest gate; this is an own-host sanity
+    /// check, not an adversarial boundary.
+    pub fn stage_chunk_with_raw_hash(
+        &mut self,
+        index: u32,
+        codec_id: u8,
+        bytes: Vec<u8>,
+        raw_hash: [u8; 32],
+    ) -> Result<(), SenderError> {
+        self.stage_chunk_inner(index, codec_id, bytes, Some(raw_hash))
+    }
+
+    fn stage_chunk_inner(
+        &mut self,
+        index: u32,
+        codec_id: u8,
+        bytes: Vec<u8>,
+        precomputed_raw_hash: Option<[u8; 32]>,
     ) -> Result<(), SenderError> {
         if !self.staged_mode {
             return Err(SenderError::Config(
@@ -550,24 +595,38 @@ impl Af2Sender {
                         bytes.len()
                     )));
                 }
-                hash(&bytes)
+                // Worker-precomputed digest when provided (main-thread
+                // friendliness); in-core hash otherwise (native/tests).
+                precomputed_raw_hash.unwrap_or_else(|| hash(&bytes))
             }
             CODEC_ZSTD | CODEC_XZ => {
-                // §10.1 dual-end invariant.
+                // §10.1 dual-end invariant. Browser hosts may supply the RAW
+                // digest computed on their worker thread and avoid a redundant
+                // 30-80 ms render-thread decompression here. Native/no-digest
+                // callers retain the strict bounded-decode + hash gate below.
                 if bytes.len() >= canonical_len {
                     return Err(SenderError::Config(format!(
                         "staged chunk {index} violates strictly-smaller ({} >= {canonical_len})",
                         bytes.len()
                     )));
                 }
-                let raw = crate::chunk::decode_chunk(
-                    codec_id,
-                    &bytes,
-                    canonical_len,
-                    self.config.chunk_raw_size,
-                )
-                .map_err(|e| SenderError::Config(format!("staged chunk {index} decode: {e}")))?;
-                hash(&raw)
+                match precomputed_raw_hash {
+                    Some(digest) => digest,
+                    None => {
+                        let raw = crate::chunk::decode_chunk(
+                            codec_id,
+                            &bytes,
+                            canonical_len,
+                            self.config.chunk_raw_size,
+                        )
+                        .map_err(|e| {
+                            SenderError::Config(format!(
+                                "staged chunk {index} decode: {e}"
+                            ))
+                        })?;
+                        hash(&raw)
+                    }
+                }
             }
             other => {
                 return Err(SenderError::Config(format!(
@@ -1330,6 +1389,30 @@ mod tests {
             streamed.stage_chunk(0, CODEC_RAW, bad),
             Err(SenderError::Config(_))
         ));
+
+        // Compressed staging stays fail-closed too. Native/no-digest callers
+        // must bounded-decode + hash the encoded bytes; corrupt compressed
+        // bytes therefore cannot be accepted just because they are smaller
+        // than the canonical chunk.
+        let raw = vec![0x5Au8; 4096];
+        let (compressed_codec, compressed) = crate::chunk::encode_chunk(&raw);
+        assert!(
+            matches!(compressed_codec, CODEC_ZSTD | CODEC_XZ),
+            "repetitive test payload must compress"
+        );
+        let mut corrupt_compressed = compressed.clone();
+        corrupt_compressed[0] ^= 0x5A;
+        assert!(matches!(
+            streamed.stage_chunk(0, compressed_codec, corrupt_compressed),
+            Err(SenderError::Config(_))
+        ));
+        // Browser fast path: the worker-provided RAW digest is still checked
+        // against the manifest table before the compressed bytes are armed.
+        assert!(matches!(
+            streamed.stage_chunk_with_raw_hash(0, compressed_codec, compressed, [0u8; 32]),
+            Err(SenderError::Config(_))
+        ));
+
         // Correct RAW bytes are accepted and playback proceeds — across an
         // epoch boundary (the tiny chunk's window is ~15 frames), which
         // retires the encoder and requires the documented stage-and-retry.

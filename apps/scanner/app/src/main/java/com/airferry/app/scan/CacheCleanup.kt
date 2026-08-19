@@ -36,30 +36,37 @@ object CacheCleanup {
         val shareDirty = prefs.getBoolean(KEY_SHARE_DIRTY, false)
 
         var removed = 0
-        try {
-            cache.listFiles()?.forEach { f ->
-                if (f.name.startsWith(RECOVERED_PREFIX)) {
-                    if (f.deleteRecursively()) removed++
+        // Serialize with recovery staging / manual 断点清理 (TransferMaintenance):
+        // this runs at app start while a resumed transfer's recovery may
+        // already be streaming from the very files being swept.
+        synchronized (TransferMaintenance.lock) {
+            try {
+                cache.listFiles()?.forEach { f ->
+                    if (f.name.startsWith(RECOVERED_PREFIX)) {
+                        if (f.deleteRecursively()) removed++
+                    }
                 }
+                // Always try to clear share/ if present (legacy staging).
+                val share = File(cache, SHARE_DIR)
+                if (share.exists() && (shareDirty || (share.list()?.isNotEmpty() == true))) {
+                    if (share.deleteRecursively()) removed++
+                }
+                if (shareDirty) {
+                    prefs.edit().putBoolean(KEY_SHARE_DIRTY, false).apply()
+                }
+                // Interrupted §13 entry staging leaves `<uuid>.partial` temps
+                // behind; recovery wipes the dir at its own start, this covers
+                // a process kill before that ever runs.
+                val entryStage = File(cache, ENTRY_STAGE_DIR)
+                if (entryStage.exists() && entryStage.listFiles()?.isNotEmpty() == true) {
+                    if (entryStage.deleteRecursively()) removed++
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "purgeOnAppStart failed", e)
             }
-            // Always try to clear share/ if present (legacy staging).
-            val share = File(cache, SHARE_DIR)
-            if (share.exists() && (shareDirty || (share.list()?.isNotEmpty() == true))) {
-                if (share.deleteRecursively()) removed++
-            }
-            if (shareDirty) {
-                prefs.edit().putBoolean(KEY_SHARE_DIRTY, false).apply()
-            }
-            // Interrupted §13 entry staging leaves `<uuid>.partial` temps
-            // behind; recovery wipes the dir at its own start, this covers
-            // a process kill before that ever runs.
-            val entryStage = File(cache, ENTRY_STAGE_DIR)
-            if (entryStage.exists() && entryStage.listFiles()?.isNotEmpty() == true) {
-                if (entryStage.deleteRecursively()) removed++
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "purgeOnAppStart failed", e)
-        }
+            Unit // synchronized's block is () -> R — pin R = Unit so the
+                 // trailing if-statements above stay statements, not expressions
+        } // synchronized (TransferMaintenance.lock)
         if (removed > 0) {
             Log.i(TAG, "purged $removed legacy cache entr(y/ies)")
         }

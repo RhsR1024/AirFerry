@@ -356,6 +356,10 @@ export function ReceivePage(): React.ReactElement {
   const yBusyRef = useRef<boolean>(false)
   const yFallbackRef = useRef<boolean>(false)
   const yFailStreakRef = useRef<number>(0)
+  /** The single yplane frame in flight: {jobId, qrSlot}. Ownership token —
+   *  only the current job's reply (or fatal-error handler) may clear it and
+   *  release its decode slot. */
+  const yInFlightRef = useRef<{ jobId: number; qrSlot: number } | null>(null)
 
   // keep stageRef in sync so the rAF loop can read the latest stage.
   useEffect(() => {
@@ -652,6 +656,7 @@ export function ReceivePage(): React.ReactElement {
     yWorkerRef.current?.terminate()
     yWorkerRef.current = null
     yBusyRef.current = false
+    yInFlightRef.current = null
     yFallbackRef.current = false
     yFailStreakRef.current = 0
 
@@ -671,12 +676,22 @@ export function ReceivePage(): React.ReactElement {
       yworker.addEventListener("message", (e: MessageEvent) => {
         const d = e.data
         if (!d || (d.type !== "yplane" && d.type !== "yerror")) return
+        // Worker + job + slot ownership FIRST: queued replies from a
+        // terminated worker, malformed replies, or duplicate replies must not
+        // touch a newer session's flags/QR pool.
+        if (
+          yWorkerRef.current !== yworker ||
+          typeof d.jobId !== "number" ||
+          d.jobId !== jobIdRef.current
+        ) return
+        const inflight = yInFlightRef.current
+        if (
+          !inflight ||
+          inflight.jobId !== d.jobId ||
+          inflight.qrSlot !== d.qrSlot
+        ) return
         yBusyRef.current = false
-        if (typeof d.jobId === "number" && d.jobId !== jobIdRef.current) {
-          // Stale session: its pool/busy arrays were replaced wholesale by
-          // initWorkers — nothing to release for the CURRENT session.
-          return
-        }
+        yInFlightRef.current = null
         if (d.type === "yerror") {
           qrBusyRef.current[d.qrSlot] = false
           framesDroppedRef.current += 1
@@ -709,12 +724,21 @@ export function ReceivePage(): React.ReactElement {
         )
       })
       // Fatal worker-level error: switch to the main-thread extractor rather
-      // than killing reception (the pool's respawn machinery is not needed —
-      // a fallback exists).
+      // than killing reception. The frame in flight will never get its reply,
+      // so release ITS reserved decode slot here — otherwise the pool
+      // permanently loses one worker (the slot's busy flag would never clear).
       yworker.addEventListener("error", (ev: ErrorEvent) => {
+        // An old worker can still have an error event queued after terminate;
+        // never let it switch a newly-created session into fallback mode.
+        if (yWorkerRef.current !== yworker) return
         dbg(`[yplane] WORKER ERROR: ${ev.message || ""} — falling back to main-thread extraction`)
         yFallbackRef.current = true
         yBusyRef.current = false
+        const inflight = yInFlightRef.current
+        yInFlightRef.current = null
+        if (inflight && inflight.jobId === jobIdRef.current) {
+          qrBusyRef.current[inflight.qrSlot] = false
+        }
       })
     } else {
       dbg("[yplane] OffscreenCanvas/ImageBitmap unavailable — main-thread extraction")
@@ -1127,6 +1151,7 @@ export function ReceivePage(): React.ReactElement {
         return
       }
       yBusyRef.current = true
+      yInFlightRef.current = { jobId, qrSlot: freeIdx }
       createImageBitmap(video)
         .then((bitmap) => {
           if (
@@ -1135,9 +1160,18 @@ export function ReceivePage(): React.ReactElement {
             jobIdRef.current !== jobId ||
             yWorkerRef.current !== yWorker
           ) {
-            // Session moved on while the snapshot was being taken.
+            // Session moved on while the snapshot was being taken. Clear the
+            // ownership token ONLY if it still belongs to this attempt (a
+            // newer session already reset it via initWorkers).
             bitmap.close()
-            yBusyRef.current = false
+            if (
+              yWorkerRef.current === yWorker &&
+              yInFlightRef.current?.jobId === jobId &&
+              yInFlightRef.current?.qrSlot === freeIdx
+            ) {
+              yInFlightRef.current = null
+              yBusyRef.current = false
+            }
             busyArr[freeIdx] = false
             return
           }
@@ -1147,13 +1181,21 @@ export function ReceivePage(): React.ReactElement {
           )
         })
         .catch(() => {
-          yBusyRef.current = false
-          busyArr[freeIdx] = false
-          framesDroppedRef.current += 1
-          if (++yFailStreakRef.current >= 10) {
-            yFallbackRef.current = true
-            dbg("[yplane] createImageBitmap keeps failing — main-thread path from now on")
+          const ownsCurrentAttempt =
+            yWorkerRef.current === yWorker &&
+            jobIdRef.current === jobId &&
+            yInFlightRef.current?.jobId === jobId &&
+            yInFlightRef.current?.qrSlot === freeIdx
+          if (ownsCurrentAttempt) {
+            yInFlightRef.current = null
+            yBusyRef.current = false
+            framesDroppedRef.current += 1
+            if (++yFailStreakRef.current >= 10) {
+              yFallbackRef.current = true
+              dbg("[yplane] createImageBitmap keeps failing — main-thread path from now on")
+            }
           }
+          busyArr[freeIdx] = false
         })
       refreshFrameCounters()
       scheduleNextFrame()

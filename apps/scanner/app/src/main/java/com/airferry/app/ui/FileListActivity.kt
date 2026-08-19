@@ -337,7 +337,25 @@ class FileListActivity : ComponentActivity() {
                                         return@TextButton
                                     }
                                     bgExecutor.execute {
-                                        Af2LedgerStore.discardAllPending(cacheDir)
+                                        // TransferMaintenance serializes this
+                                        // with recovery staging and the startup
+                                        // purge; re-check recoveryActive INSIDE
+                                        // the lock so a recovery that started
+                                        // right after the toast check is still
+                                        // honored.
+                                        synchronized (com.airferry.app.scan.TransferMaintenance.lock) {
+                                            if (ScanActivity.recoveryActive.get()) {
+                                                runOnUiThread {
+                                                    Toast.makeText(
+                                                        this@FileListActivity,
+                                                        "有传输正在恢复中，请稍后再清理断点",
+                                                        Toast.LENGTH_SHORT
+                                                    ).show()
+                                                }
+                                                return@execute
+                                            }
+                                            Af2LedgerStore.discardAllPending(cacheDir)
+                                        }
                                         runOnUiThread { refresh() }
                                     }
                                 },

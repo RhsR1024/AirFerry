@@ -342,11 +342,25 @@ impl SenderSessionWasm {
 
     /// Provide one chunk's encoded bytes for a streamed sender (see
     /// [`SenderBuilderWasm::build_streamed`]). Validated fail-closed against
-    /// the manifest chunk hash table.
-    pub fn stage_chunk(&mut self, index: u32, codec_id: u8, bytes: &[u8]) -> Result<(), JsValue> {
-        self.inner
-            .stage_chunk(index, codec_id, bytes.to_vec())
-            .map_err(|e| JsValue::from_str(&format!("AF2 stage_chunk failed: {e}")))
+    /// the manifest chunk hash table. `raw_hash` (32 bytes; empty = none) is
+    /// a worker-precomputed BLAKE3 of the RAW chunk — supplying it keeps the
+    /// ~20 ms in-core hash off the render thread.
+    pub fn stage_chunk(
+        &mut self,
+        index: u32,
+        codec_id: u8,
+        bytes: &[u8],
+        raw_hash: &[u8],
+    ) -> Result<(), JsValue> {
+        let inner = &mut self.inner;
+        let result = if raw_hash.len() == 32 {
+            let mut digest = [0u8; 32];
+            digest.copy_from_slice(raw_hash);
+            inner.stage_chunk_with_raw_hash(index, codec_id, bytes.to_vec(), digest)
+        } else {
+            inner.stage_chunk(index, codec_id, bytes.to_vec())
+        };
+        result.map_err(|e| JsValue::from_str(&format!("AF2 stage_chunk failed: {e}")))
     }
 
     /// Playlist position hint: `Some(chunk)` once playback is inside a
@@ -361,6 +375,12 @@ impl SenderSessionWasm {
     /// the same chunk index across every epoch wrap).
     pub fn epoch(&self) -> u32 {
         self.inner.epoch()
+    }
+
+    /// True while chunk `index` still holds prefetched staged bytes — the
+    /// host's armed-set reconciliation signal (see `Af2Sender::is_staged`).
+    pub fn is_staged(&self, index: u32) -> bool {
+        self.inner.is_staged(index)
     }
 }
 

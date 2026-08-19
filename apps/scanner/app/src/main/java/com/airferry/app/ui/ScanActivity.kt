@@ -907,6 +907,12 @@ class ScanActivity : ComponentActivity() {
             val poolAtEnqueue = decodePool
             try {
                 ioExecutor.execute {
+                    // Serialize against the startup purge and the file list's
+                    // manual 断点清理 (TransferMaintenance) — recoveryActive
+                    // alone was a check-then-act. Recovery may hold this lock
+                    // for seconds on large spills; both other takers run on
+                    // background threads, so no main thread ever blocks on it.
+                    synchronized (com.airferry.app.scan.TransferMaintenance.lock) {
                     // Mark the recovery pass for FileListActivity's 断点清理
                     // guard: it must not delete the spill/ledger under us.
                     if (!recoveryActive.compareAndSet(false, true)) return@execute
@@ -947,6 +953,7 @@ class ScanActivity : ComponentActivity() {
                         }
                     } finally {
                         recoveryActive.set(false)
+                    }
                     }
                 }
             } catch (_: java.util.concurrent.RejectedExecutionException) {

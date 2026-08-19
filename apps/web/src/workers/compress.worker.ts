@@ -40,6 +40,9 @@ const ENCODING_CACHE_CAP = 256 * 1024 * 1024
 /** AF2 wire format: the Manifest carries at most 4096 entries. */
 const MAX_ENTRIES = 4096
 
+/** Max wait for the main thread's prepareContinue after the probe phase. */
+const PROBE_TIMEOUT_MS = 5_000
+
 export interface PreparedEntry {
   kind: number
   path: string
@@ -94,12 +97,19 @@ let active: {
   chunks: PlannedChunk[]
   params: EncodeParams
   /** codec != RAW encodings, capped at ENCODING_CACHE_CAP (FIFO eviction). */
-  encodings: Map<number, { codec: number; data: Uint8Array }>
+  encodings: Map<number, { codec: number; data: Uint8Array; rawHash: Uint8Array }>
   encodingsBytes: number
 } | null = null
 
 /** Latest prepare jobId RECEIVED (set synchronously, in receipt order). */
 let latestPrepareJob: number | null = null
+
+/**
+ * Pending probe continuation: the cheap metadata-only probe phase handed
+ * control to the main thread (§9.3 resend-cache lookup) and is waiting for
+ * `prepareContinue` — `true` skips the whole read/hash/encode pass.
+ */
+let pendingContinue: { jobId: number; resolve: (useCache: boolean) => void } | null = null
 
 /** Serializes prepare passes: one disk-hashing walk at a time. */
 let prepareChain: Promise<void> = Promise.resolve()
@@ -117,8 +127,17 @@ async function readSourceRange(src: ItemSource, start: number, len: number): Pro
   return src.bytes.subarray(start, start + len)
 }
 
-/** Assemble one chunk's raw bytes from its planned item ranges. */
-async function assembleChunk(a: NonNullable<typeof active>, index: number): Promise<Uint8Array> {
+/**
+ * Assemble one chunk's raw bytes from its planned item ranges. `hashInto`
+ * (stage path) is fed the same bytes incrementally — the RAW staging digest
+ * comes out nearly free, keeping the BLAKE3 of an 8 MiB chunk on THIS thread
+ * instead of the render thread.
+ */
+async function assembleChunk(
+  a: NonNullable<typeof active>,
+  index: number,
+  hashInto?: Blake3Wasm
+): Promise<Uint8Array> {
   const planned = a.chunks[index]
   const total = planned.segments.reduce((s, g) => s + g.len, 0)
   const out = new Uint8Array(total)
@@ -126,6 +145,7 @@ async function assembleChunk(a: NonNullable<typeof active>, index: number): Prom
   for (const seg of planned.segments) {
     const part = await readSourceRange(a.sources[seg.item], seg.start, seg.len)
     out.set(part, pos)
+    hashInto?.update(part)
     pos += seg.len
   }
   return out
@@ -159,7 +179,8 @@ function cacheEncoding(
   a: NonNullable<typeof active>,
   index: number,
   codec: number,
-  data: Uint8Array
+  data: Uint8Array,
+  rawHash: Uint8Array
 ): void {
   if (codec === 0) return
   while (a.encodingsBytes + data.byteLength > ENCODING_CACHE_CAP && a.encodings.size > 0) {
@@ -168,7 +189,7 @@ function cacheEncoding(
     a.encodings.delete(oldest)
     if (evict) a.encodingsBytes -= evict.data.byteLength
   }
-  a.encodings.set(index, { codec, data })
+  a.encodings.set(index, { codec, data, rawHash })
   a.encodingsBytes += data.byteLength
 }
 
@@ -285,6 +306,73 @@ async function runPrepare(
 
     const chunkRawSize = 8 * 1024 * 1024
 
+    // §9.3 resend-cache fast path: hand the metadata-only result to the main
+    // thread BEFORE any disk read. On a cache hit the whole read/hash/encode
+    // pass is skipped (resending a 100 GB selection costs O(metadata), not
+    // O(content)); staging then re-reads chunks on demand exactly like a
+    // cache-miss playback. A missing reply falls through to the full pass
+    // after PROBE_TIMEOUT_MS.
+    const staged: NonNullable<typeof active> = {
+      jobId,
+      sources,
+      chunks,
+      params,
+      encodings: new Map(),
+      encodingsBytes: 0,
+    }
+    const probeEntries: PreparedEntry[] = metas.map((m) => ({
+      kind: m.kind,
+      path: m.path,
+      size: m.size,
+      // Hashes are unknown at probe time (empty placeholders); the cache-hit
+      // payload never uses them.
+      hash: new Uint8Array(0),
+      fingerprint: m.fingerprint,
+    }))
+    post({
+      phase: "probe",
+      jobId,
+      entries: probeEntries,
+      chunkCount: chunks.length,
+      totalBytes,
+      displayName,
+    })
+    const useCache = await new Promise<boolean>((resolve) => {
+      let settled = false
+      pendingContinue = {
+        jobId,
+        resolve: (v: boolean) => {
+          if (settled) return
+          settled = true
+          resolve(v)
+        },
+      }
+      setTimeout(() => {
+        if (pendingContinue?.jobId === jobId) {
+          pendingContinue = null
+          settled = true
+          resolve(false)
+        }
+      }, PROBE_TIMEOUT_MS)
+    })
+    if (latestPrepareJob !== jobId) return
+    if (useCache) {
+      active = staged
+      post({
+        phase: "done",
+        jobId,
+        streamed: true,
+        cached: true,
+        entries: probeEntries,
+        chunkHashes: [],
+        chunkCount: chunks.length,
+        chunkRawSize,
+        totalBytes,
+        displayName,
+      })
+      return
+    }
+
     // §9.3 single pass: per-chunk hashing + balanced encoding, one chunk's
     // bytes live at a time. Entry hashers are finalized (digest + free) as
     // soon as the canonical walk feeds their entry's last byte.
@@ -297,14 +385,6 @@ async function runPrepare(
     entryHashers = metas.map((m) => (m.kind === KIND_DIRECTORY ? null : new Blake3Wasm()))
     const hashedLen: number[] = metas.map(() => 0)
     const chunkHashes: Uint8Array[] = []
-    const staged: NonNullable<typeof active> = {
-      jobId,
-      sources,
-      chunks,
-      params,
-      encodings: new Map(),
-      encodingsBytes: 0,
-    }
     for (let i = 0; i < chunks.length; i++) {
       // A newer prepare was received while this pass was reading disk —
       // abort early instead of wasting IO and then racing the commit (the
@@ -344,7 +424,7 @@ async function runPrepare(
         }
       }
       const { codec, data: encoded } = encodeChunk(staged, raw)
-      if (codec !== 0) cacheEncoding(staged, i, codec, encoded)
+      if (codec !== 0) cacheEncoding(staged, i, codec, encoded, chunkHashes[i])
       if ((i + 1) % 8 === 0 || i === chunks.length - 1) {
         post({ phase: "progress", jobId, done: i + 1, total: chunks.length })
       }
@@ -409,6 +489,16 @@ self.addEventListener("message", (e: MessageEvent) => {
     return
   }
 
+  if (data.type === "prepareContinue") {
+    const { jobId, useCache } = data as { jobId: number; useCache: boolean }
+    if (pendingContinue?.jobId === jobId) {
+      const resolve = pendingContinue.resolve
+      pendingContinue = null
+      resolve(!!useCache)
+    }
+    return
+  }
+
   if (data.type === "stage") {
     const { jobId, index } = data as { jobId: number; index: number }
     const a = active
@@ -420,16 +510,26 @@ self.addEventListener("message", (e: MessageEvent) => {
       try {
         const cached = a.encodings.get(index)
         if (cached) {
-          post({ type: "staged", jobId, index, codec: cached.codec, data: cached.data })
+          post({
+            type: "staged",
+            jobId,
+            index,
+            codec: cached.codec,
+            data: cached.data,
+            rawHash: cached.rawHash,
+          })
           return
         }
-        const raw = await assembleChunk(a, index)
+        const hasher = new Blake3Wasm()
+        const raw = await assembleChunk(a, index, hasher)
+        const rawDigest = new Uint8Array(hasher.digest())
+        hasher.free()
         const { codec, data: encoded } = encodeChunk(a, raw)
-        if (codec !== 0) cacheEncoding(a, index, codec, encoded)
-        if (codec === 0) {
-          post({ type: "staged", jobId, index, codec: 0, data: raw })
+        if (codec !== 0) {
+          cacheEncoding(a, index, codec, encoded, rawDigest)
+          post({ type: "staged", jobId, index, codec, data: encoded, rawHash: rawDigest })
         } else {
-          post({ type: "staged", jobId, index, codec, data: encoded })
+          post({ type: "staged", jobId, index, codec: 0, data: raw, rawHash: rawDigest })
         }
       } catch (err: unknown) {
         post({
