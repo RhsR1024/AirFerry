@@ -140,6 +140,11 @@ code {
 .step:hover { color: var(--color-text-secondary); }
 .step.active { color: var(--color-primary); font-weight: 600; }
 .step.done { color: var(--color-success); }
+/* 不可导航的目标（当前页 / 会话不存在 / 准备进行中）：保留指示，去除可点暗示 */
+.step.disabled { cursor: default; }
+.step.disabled:hover { color: inherit; }
+.step.disabled.active:hover { color: var(--color-primary); }
+.step.disabled.done:hover { color: var(--color-success); }
 
 .step-dot {
   width: 26px;

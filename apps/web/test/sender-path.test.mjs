@@ -2,12 +2,14 @@ import assert from "node:assert/strict"
 import test from "node:test"
 
 import { normalizeSenderPath, senderPathForFile, uniqueSenderPath } from "../src/lib/sender-path.ts"
-import { AF2_MAX_ORIGINAL_BYTES, MAX_ORIGINAL_BYTES, MAX_ORIGINAL_MIB } from "../src/types.ts"
+import { AF2_MAX_ORIGINAL_BYTES, MAX_ORIGINAL_BYTES, MAX_ORIGINAL_MIB, LARGE_TRANSFER_BYTES } from "../src/types.ts"
 
-test("Web sender host limit stays below the AF2 wire capacity while whole-buffered", () => {
-  assert.equal(MAX_ORIGINAL_MIB, 256)
-  assert.equal(MAX_ORIGINAL_BYTES, 256 * 1024 * 1024)
+test("Web sender host limit matches the streamed wire capacity (8 MiB × 131072 chunks)", () => {
+  assert.equal(MAX_ORIGINAL_BYTES, 1024 * 1024 * 1024 * 1024)
+  assert.equal(MAX_ORIGINAL_MIB, 1024 * 1024)
   assert.ok(MAX_ORIGINAL_BYTES < AF2_MAX_ORIGINAL_BYTES)
+  // The large-transfer confirmation sits strictly between normal and cap.
+  assert.ok(LARGE_TRANSFER_BYTES < MAX_ORIGINAL_BYTES)
 })
 
 test("senderPathForFile preserves directory picker hierarchy", () => {

@@ -16,7 +16,7 @@
  * Cache hygiene: ≤ MAX_ENTRIES, entries older than MAX_AGE_MS pruned on put.
  */
 
-import type { PreparedItem } from "../workers/compress.worker"
+import type { PreparedEntry } from "../workers/compress.worker"
 
 const DB_NAME = "airferry-sender-cache"
 const STORE = "manifest-cache"
@@ -78,7 +78,7 @@ function getOne(database: IDBDatabase, key: string): Promise<CachedManifest | nu
 
 /** Look up a cached manifest for the given transfer fingerprint. */
 export async function getCachedManifest(
-  items: readonly PreparedItem[],
+  items: readonly PreparedEntry[],
   chunkRawSize: number
 ): Promise<CachedManifest | null> {
   const key = await cacheKey(items, chunkRawSize)
@@ -93,7 +93,7 @@ export async function getCachedManifest(
 
 /** Store the encoded manifest (from `SenderSessionWasm.manifest_json`). */
 export async function putCachedManifest(
-  items: readonly PreparedItem[],
+  items: readonly PreparedEntry[],
   manifestHex: string,
   chunkRawSize: number
 ): Promise<void> {
@@ -149,7 +149,7 @@ async function prune(database: IDBDatabase): Promise<void> {
  * anyway. Returns null when crypto.subtle is unavailable (then: no caching).
  */
 export async function cacheKey(
-  items: readonly PreparedItem[],
+  items: readonly PreparedEntry[],
   chunkRawSize: number
 ): Promise<string | null> {
   const subtle = globalThis.crypto?.subtle

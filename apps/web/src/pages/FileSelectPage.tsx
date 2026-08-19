@@ -22,7 +22,7 @@ import {
 } from "@/components/icons"
 import { normalizeDraftFilename } from "@/storage/textDrafts"
 import { senderPathForFile, uniqueSenderPath } from "@/lib/sender-path"
-import { MAX_ORIGINAL_BYTES, MAX_ORIGINAL_MIB, type PendingItem } from "@/types"
+import { MAX_ORIGINAL_BYTES, MAX_ORIGINAL_MIB, LARGE_TRANSFER_BYTES, type PendingItem } from "@/types"
 
 interface Props {
   items: PendingItem[]
@@ -184,8 +184,8 @@ export function FileSelectPage({ items, onItemsChange, onPlay, busyLabel }: Prop
   const [dropError, setDropError] = useState<string | null>(null)
   const [textOpen, setTextOpen] = useState(false)
   const [listCollapsed, setListCollapsed] = useState(true)
-  /** When true, an oversized-transfer confirmation dialog is shown. */
-  const [oversizeConfirm, setOversizeConfirm] = useState(false)
+  /** Large/hard-cap transfer dialog mode (null = hidden). */
+  const [oversizeConfirm, setOversizeConfirm] = useState<"soft" | "hard" | null>(null)
 
   useEffect(() => {
     mountedRef.current = true
@@ -429,14 +429,19 @@ export function FileSelectPage({ items, onItemsChange, onPlay, busyLabel }: Prop
   /** Total original bytes of the selected items (pre-compression). */
   const selectedBytes = totalSize(items)
   /**
-   * AF2 itself supports much larger transfers, but the current Web sender is
-   * still whole-buffered. Enforce the host cap before starting preparation so
-   * the worker/WASM path cannot OOM after the user has already pressed Send.
+   * Preparation is fully streamed (one chunk in memory at a time), so the
+   * only hard limit is the AF2 wire format (1 TiB at 8 MiB chunks). Larger-
+   * than-LARGE_TRANSFER_BYTES sends still work — they just take a long time,
+   * so confirm before committing the user to the duration.
    */
   const handleSendClick = useCallback(() => {
-    // Wire the host-cap gate before file.arrayBuffer()/WASM copies begin.
-    if (totalSize(itemsRef.current) > MAX_ORIGINAL_BYTES) {
-      setOversizeConfirm(true)
+    const total = totalSize(itemsRef.current)
+    if (total > MAX_ORIGINAL_BYTES) {
+      setOversizeConfirm("hard")
+      return
+    }
+    if (total > LARGE_TRANSFER_BYTES) {
+      setOversizeConfirm("soft")
       return
     }
     onPlay()
@@ -597,9 +602,14 @@ export function FileSelectPage({ items, onItemsChange, onPlay, busyLabel }: Prop
 
       {oversizeConfirm && (
         <OversizeConfirmModal
+          mode={oversizeConfirm}
           totalMiB={selectedBytes / (1024 * 1024)}
           limitMiB={MAX_ORIGINAL_MIB}
-          onCancel={() => setOversizeConfirm(false)}
+          onCancel={() => setOversizeConfirm(null)}
+          onConfirm={() => {
+            setOversizeConfirm(null)
+            onPlay()
+          }}
         />
       )}
     </div>
@@ -708,13 +718,17 @@ function AddTextModal({
 }
 
 function OversizeConfirmModal({
+  mode,
   totalMiB,
   limitMiB,
   onCancel,
+  onConfirm,
 }: {
+  mode: "soft" | "hard"
   totalMiB: number
   limitMiB: number
   onCancel: () => void
+  onConfirm: () => void
 }) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -733,21 +747,31 @@ function OversizeConfirmModal({
         onClick={(e) => e.stopPropagation()}
       >
         <h3 id="oversize-title" className="modal-save-title">
-          内容超过网页发送端上限
+          {mode === "hard" ? "内容超过协议上限" : "大文件传输确认"}
         </h3>
         <p className="hint" style={{ marginTop: 8 }}>
-          所选内容约 <strong>{totalMiB.toFixed(1)} MiB</strong>，超过当前网页发送端
-          <strong> {limitMiB} MiB</strong> 的宿主内存上限。
-        </p>
-        <p className="hint" style={{ marginTop: 8 }}>
-          AF2 协议本身支持更大内容，接收端也采用分块落盘；但当前浏览器发送端仍需把
-          所选文件读入 ArrayBuffer 并复制进 WASM，因此暂时不能安全发送超过该上限的内容。
-          后续发送端改为真正流式读取后可再放宽此限制。
+          {mode === "hard" ? (
+            <>
+              所选内容约 <strong>{totalMiB.toFixed(1)} MiB</strong>，超过 AF2 线格式在
+              8 MiB 分块下的 <strong>{limitMiB} MiB</strong> 寻址上限，无法发送。
+            </>
+          ) : (
+            <>
+              所选内容约 <strong>{totalMiB.toFixed(1)} MiB</strong>。发送流程已完全流式化
+              （内存占用与文件大小无关），但在典型光学吞吐（~0.5–2 MB/s）下预计需要
+              <strong> 较长时间</strong>（可能数十分钟到数小时）。
+            </>
+          )}
         </p>
         <div className="modal-actions-row">
           <button type="button" className="btn primary" onClick={onCancel}>
-            知道了
+            {mode === "hard" ? "知道了" : "取消"}
           </button>
+          {mode === "soft" && (
+            <button type="button" className="btn" onClick={onConfirm}>
+              继续传输
+            </button>
+          )}
         </div>
       </div>
     </div>

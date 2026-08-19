@@ -1,14 +1,14 @@
 {
   "version": 2,
-  "state_revision": 12,
-  "archive_revision": "sha256:fd5e8a484f201f8ea17b30d935848b30f4cb384794dae0d8b91f10aad8d38cbd",
-  "generated_at": "unix:1787037838",
+  "state_revision": 15,
+  "archive_revision": "sha256:ee7fe0f78c2edee0b1d0db21bcfc3a867e8f3dd57b83b191e5baa446917917ab",
+  "generated_at": "unix:1787081342",
   "current_session": {
-    "number": 4,
-    "path": "docs/history-session/4.md",
+    "number": 6,
+    "path": "docs/history-session/6.md",
     "reason": "当前 ChatGPT 会话档案"
   },
-  "current_focus": "再审计一遍呢",
+  "current_focus": "@AirFerry 审计一下最近的改动会不会引入其他问题",
   "recent_changes": [
     "apps/web/src/types.ts",
     "apps/web/src/workers/compress.worker.ts",
@@ -24,20 +24,30 @@
     "apps/windows/AirFerry.Windows/ViewModels/ScanViewModel.cs"
   ],
   "open_items": [
+    "Unify Android startup/manual cleanup and live recovery under a real mutex/ownership mechanism rather than AtomicBoolean check-then-act.",
+    "Fix single-chunk streamed sender/stager ownership semantics at epoch wrap and add an integration regression that models the real ChunkStager armed/inflight behavior for multiple epochs.",
+    "Make Y-plane busy/slot ownership generation-scoped and release an in-flight QR slot on worker fatal error/reset.",
+    "Move resend-cache lookup ahead of the expensive hash/encode pass or redefine cache semantics; validate cached manifest identity against current computed hashes if the full pass is retained.",
+    "Consider moving stage_chunk trust validation off the UI thread or returning already-validated encoded payloads with a safe core contract.",
+    "Prioritize Android recovery/cleanup race and single-chunk epoch staging stall first, then Y-plane generation/slot bookkeeping, then sender-cache flow and main-thread staging performance.",
     "No new deterministic P1/P2 found in the final static pass. Full Rust/Web/Android/Windows compile/test execution remains unverified in this connector environment because toolchains are unavailable on PATH / disallowed outside the workspace.",
     "Run the repository interop/test matrix on a host/CI with Cargo, Node/npm, a real JDK, and .NET SDK available.",
     "Real Chromium OPFS File/Blob lifetime integration testing remains valuable even though reset cleanup now has a grace period and fake-OPFS regressions cover the intended ownership semantics.",
     "Fix the deterministic Web compile error before any further build/release.",
     "Add a multi-chunk regression for pre-Manifest poisoned chunk reverify to catch completed_count double decrement.",
-    "Serialize all receive-worker state mutations through one promise queue/mutex, including assemble/reset/init.",
-    "Make save-path sanitization reserve generated candidates and cover all Windows-invalid filename characters.",
-    "Harden ledger creation/appends and malformed candidate fallback; add rollback to PutBytesBatch.",
-    "Use release-time ownership/tombstone for Web OPFS cleanup rather than backing-file mtime.",
-    "Prioritize P0 Web compile fix, then receiver completed_count and Web worker serialization before addressing P2 durability/path hygiene.",
-    "真实 Chromium OPFS Blob backing-file 生命周期集成测试仍未补；不属于本轮两处状态机修复。",
-    "当前工作树仍包含用户此前的大批未提交修改，本轮没有重置或覆盖其他改动。"
+    "Serialize all receive-worker state mutations through one promise queue/mutex, including assemble/reset/init."
   ],
   "references": [
+    {
+      "number": 5,
+      "path": "docs/history-session/5.md",
+      "reason": "最近历史档案；可按需读取原文"
+    },
+    {
+      "number": 4,
+      "path": "docs/history-session/4.md",
+      "reason": "最近历史档案；可按需读取原文"
+    },
     {
       "number": 3,
       "path": "docs/history-session/3.md",

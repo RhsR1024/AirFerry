@@ -184,9 +184,17 @@ object_id = Trunc128(H(
 ### 7.2 标准 Playlist 调度
 ```text
 Bootstrap: ROOT × 4 → MANIFEST META × 4 → up to 32 Manifest Symbols
-Each Chunk i: ROOT × 1 → CHUNK i META × 2 → i's source symbols → fresh repair symbols (0.25 K)
+Each Chunk i (Epoch 1):  ROOT × 1 → CHUNK i META × 2 → i's source symbols → fresh repair (redundancy 预算)
+Each Chunk i (Epoch ≥ 2): ROOT × 1 → CHUNK i META × 2 → K + redundancy 个全新 Repair ESI
 Interleave: META 每 ~17 帧广播；ROOT 每 ~31 帧广播；每 ~8 个 Chunk Symbol 插入 1 个 Manifest Symbol
 ```
+
+> **Epoch ≥ 2 的每窗口预算必须是完整的 K + 冗余量**（而非仅冗余量）：接收端同时只保留
+> 一个活跃 Chunk Decoder，且在新 Chunk META 到达时零缓存丢弃未完成 Decoder 的全部已收
+> 符号（§11 资源策略）。任何在 Epoch 1 窗口内丢损超过冗余预算的 Chunk，后续每个窗口都
+> 从零开始收集——若窗口只携带冗余量的新 Repair ESI，该 Chunk 将永远无法凑齐 K 个符号
+> （表现为 received/total 持续攀升超过 100% 而永不完成）。携带 K + 冗余量全新 ESI 后，
+> 一个被完整观看的窗口即可独立完成解码。
 
 ---
 

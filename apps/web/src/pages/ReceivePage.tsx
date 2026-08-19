@@ -348,6 +348,14 @@ export function ReceivePage(): React.ReactElement {
   // The pending requestVideoFrameCallback handle (rVFC has no global cancel;
   // the element's own cancelVideoFrameCallback must be used).
   const rvfcRef = useRef<number | null>(null)
+  // OffscreenCanvas Y-plane extraction worker state. `yBusyRef` caps the
+  // extract pipeline at ONE in-flight frame (drop otherwise, like the qr
+  // pool); `yFallbackRef` switches back to the legacy main-thread extractor
+  // when the worker path is unsupported or failing.
+  const yWorkerRef = useRef<Worker | null>(null)
+  const yBusyRef = useRef<boolean>(false)
+  const yFallbackRef = useRef<boolean>(false)
+  const yFailStreakRef = useRef<number>(0)
 
   // keep stageRef in sync so the rAF loop can read the latest stage.
   useEffect(() => {
@@ -402,6 +410,8 @@ export function ReceivePage(): React.ReactElement {
       teardown()
       for (const w of qrWorkersRef.current) w.terminate()
       recvWorkerRef.current?.terminate()
+      yWorkerRef.current?.terminate()
+      yWorkerRef.current = null
     }
   }, [teardown])
 
@@ -639,6 +649,77 @@ export function ReceivePage(): React.ReactElement {
     qrWorkersRef.current = []
     qrBusyRef.current = []
     recvWorkerRef.current?.terminate()
+    yWorkerRef.current?.terminate()
+    yWorkerRef.current = null
+    yBusyRef.current = false
+    yFallbackRef.current = false
+    yFailStreakRef.current = 0
+
+    // Y-plane extraction worker (OffscreenCanvas): keeps the ~8 MB readback +
+    // 2M-pixel RGBA→Y loop off the main thread. Replies are forwarded straight
+    // into the reserved qr-pool slot; unsupported engines (or repeated
+    // failures) fall back to the legacy main-thread extractor in captureLoop.
+    const ySupported =
+      typeof createImageBitmap === "function" &&
+      typeof OffscreenCanvas !== "undefined"
+    if (ySupported) {
+      const yworker = new Worker(
+        new URL("../workers/yplane.worker.ts", import.meta.url),
+        { type: "module" }
+      )
+      yWorkerRef.current = yworker
+      yworker.addEventListener("message", (e: MessageEvent) => {
+        const d = e.data
+        if (!d || (d.type !== "yplane" && d.type !== "yerror")) return
+        yBusyRef.current = false
+        if (typeof d.jobId === "number" && d.jobId !== jobIdRef.current) {
+          // Stale session: its pool/busy arrays were replaced wholesale by
+          // initWorkers — nothing to release for the CURRENT session.
+          return
+        }
+        if (d.type === "yerror") {
+          qrBusyRef.current[d.qrSlot] = false
+          framesDroppedRef.current += 1
+          if (++yFailStreakRef.current >= 10) {
+            yFallbackRef.current = true
+            dbg("[yplane] extraction keeps failing — falling back to main-thread path")
+          }
+          return
+        }
+        if (!scanningActiveRef.current || stageRef.current !== "scanning") {
+          qrBusyRef.current[d.qrSlot] = false
+          return
+        }
+        const qr = qrWorkersRef.current[d.qrSlot]
+        if (!qr) {
+          qrBusyRef.current[d.qrSlot] = false
+          return
+        }
+        yFailStreakRef.current = 0
+        qr.postMessage(
+          {
+            type: "decode",
+            width: d.width,
+            height: d.height,
+            format: "Y",
+            yPlane: d.yPlane,
+            jobId: jobIdRef.current,
+          },
+          [d.yPlane.buffer]
+        )
+      })
+      // Fatal worker-level error: switch to the main-thread extractor rather
+      // than killing reception (the pool's respawn machinery is not needed —
+      // a fallback exists).
+      yworker.addEventListener("error", (ev: ErrorEvent) => {
+        dbg(`[yplane] WORKER ERROR: ${ev.message || ""} — falling back to main-thread extraction`)
+        yFallbackRef.current = true
+        yBusyRef.current = false
+      })
+    } else {
+      dbg("[yplane] OffscreenCanvas/ImageBitmap unavailable — main-thread extraction")
+    }
+
     // Receive worker (single; ingest stays serialized).
     const recv = createReceiveWorker()
     recvWorkerRef.current = recv
@@ -1017,7 +1098,70 @@ export function ReceivePage(): React.ReactElement {
       )
     }
     qrBusyRef.current[freeIdx] = true
-    // FAST-only: feed the Y (luminance) plane directly (no RGBA conversion).
+    const jobId = jobIdRef.current
+    // The busy array this slot belongs to — a mid-flight reset swaps
+    // qrBusyRef to a fresh array; releasing via the captured reference can
+    // then only touch the (garbage) old one, never the new session's slots.
+    const busyArr = qrBusyRef.current
+    const refreshFrameCounters = () => {
+      setProgress((p) => ({
+        ...p,
+        framesSeen: framesDecodedRef.current,
+        framesDropped: framesDroppedRef.current,
+      }))
+    }
+
+    // FAST-only Y plane. Preferred path: snapshot the frame as an ImageBitmap
+    // (the pixel copy happens off-thread) and hand it to the yplane worker —
+    // the RGBA→Y conversion and its ~10 MB/frame allocations stay OFF the
+    // main thread (they used to cause periodic GC hitches that stalled the
+    // capture loop). Legacy main-thread path remains the fallback.
+    const yWorker = yWorkerRef.current
+    if (yWorker && !yFallbackRef.current) {
+      if (yBusyRef.current) {
+        // Previous frame still extracting — drop this one (back-pressure,
+        // same semantics as a full decode pool).
+        busyArr[freeIdx] = false
+        framesDroppedRef.current += 1
+        scheduleNextFrame()
+        return
+      }
+      yBusyRef.current = true
+      createImageBitmap(video)
+        .then((bitmap) => {
+          if (
+            !scanningActiveRef.current ||
+            stageRef.current !== "scanning" ||
+            jobIdRef.current !== jobId ||
+            yWorkerRef.current !== yWorker
+          ) {
+            // Session moved on while the snapshot was being taken.
+            bitmap.close()
+            yBusyRef.current = false
+            busyArr[freeIdx] = false
+            return
+          }
+          yWorker.postMessage(
+            { type: "convert", bitmap, jobId, qrSlot: freeIdx },
+            [bitmap]
+          )
+        })
+        .catch(() => {
+          yBusyRef.current = false
+          busyArr[freeIdx] = false
+          framesDroppedRef.current += 1
+          if (++yFailStreakRef.current >= 10) {
+            yFallbackRef.current = true
+            dbg("[yplane] createImageBitmap keeps failing — main-thread path from now on")
+          }
+        })
+      refreshFrameCounters()
+      scheduleNextFrame()
+      return
+    }
+
+    // Legacy synchronous main-thread extraction (unsupported engines or
+    // worker failure fallback).
     const yPlane = extractYPlane(video, canvas, w, h)
     if (!yPlane) {
       // Extraction failed — drop this frame rather than misroute a decode.
@@ -1040,11 +1184,7 @@ export function ReceivePage(): React.ReactElement {
     // Each worker's decoded handler (wired in initWorkers) marks it free again
     // and forwards payloads to the receive worker; just refresh frame counters.
     // busy cleared by that handler.
-    setProgress((p) => ({
-      ...p,
-      framesSeen: framesDecodedRef.current,
-      framesDropped: framesDroppedRef.current,
-    }))
+    refreshFrameCounters()
     scheduleNextFrame()
   }, [])
 

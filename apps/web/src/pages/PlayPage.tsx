@@ -2,10 +2,12 @@
 import { useState } from "react"
 import { QrStream, type QrStreamStats } from "@/components/QrStream"
 import type { SenderSessionWasm } from "@/wasm/loader"
+import type { ChunkStager } from "@/lib/chunk-stager"
 import type { TransferConfig } from "@/types"
 
 interface Props {
   session: SenderSessionWasm
+  stager: ChunkStager | null
   config: TransferConfig
   totalBytes: number
   onStop: () => void
@@ -23,6 +25,7 @@ function formatDuration(seconds: number): string {
 
 export function PlayPage({
   session,
+  stager,
   config,
   totalBytes,
   onStop,
@@ -53,6 +56,7 @@ export function PlayPage({
 
       <QrStream
         session={session}
+        stager={stager}
         fps={config.fps}
         brightness={config.brightness}
         autoOptimize={config.autoOptimize}

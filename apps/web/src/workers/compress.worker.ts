@@ -1,32 +1,74 @@
 /**
- * AF2 File-preparation worker.
+ * AF2 streaming preparation worker.
  *
- * Reads user-selected files or text off the main thread, normalizes paths and
- * emits entries `{ kind, path, content }` ready for `SenderBuilderWasm`.
+ * Single bounded-memory pass over the user's selection (§9.3): every chunk is
+ * assembled once from `File.slice()` reads, hashed incrementally (per-entry +
+ * per-chunk BLAKE3) and balanced-encoded in the same pass. Only metadata and
+ * 32-byte digests leave this worker — the content bytes NEVER materialize on
+ * the main thread. The retained item sources + chunk plan then serve
+ * play-time `stage` requests: a chunk's raw bytes are re-assembled and
+ * deterministically re-encoded on demand, keeping the WASM sender's content
+ * memory at one chunk at a time.
+ *
+ * Memory profile (bounded-memory by design constants, NOT by transfer size):
+ *   - one chunk's raw bytes + one encode in flight during the pass/stage;
+ *   - ≤ ENCODING_CACHE_CAP of cached compressed chunks (RAW is never cached);
+ *   - BLAKE3 hashers only for entries STRADDLING the current chunk boundary
+ *     (each is digested + freed the moment its entry's last byte is fed);
+ *   - per-transfer metadata (paths/sizes/32-byte digests, ≤ 4096 entries).
+ *
+ * Prepare jobs are serialized through `prepareChain`, and only the LATEST
+ * received jobId may commit its staging state or post `done`/`error`: a
+ * stale job finishing late (slow reads) must never overwrite the newer
+ * job's `active` — that race used to brick staging with
+ * "staging state unavailable" after rapid re-sends.
  */
 
 /// <reference lib="webworker" />
 
 import { senderPathForFile, uniqueSenderPath, type SenderFileItem } from "@/lib/sender-path"
+import { ensureWasm, Blake3Wasm, encode_chunk_balanced, plan_chunks } from "@/wasm/loader"
 import { MAX_ORIGINAL_BYTES, MAX_ORIGINAL_MIB } from "@/types"
 
 export const KIND_FILE = 1
 export const KIND_UTF8_TEXT = 2
 export const KIND_DIRECTORY = 3
 
-export interface PreparedItem {
+/** Hard cap on cached compressed chunk encodings (RAW is never cached). */
+const ENCODING_CACHE_CAP = 256 * 1024 * 1024
+
+/** AF2 wire format: the Manifest carries at most 4096 entries. */
+const MAX_ENTRIES = 4096
+
+export interface PreparedEntry {
   kind: number
   path: string
-  content: ArrayBuffer
+  size: number
+  /** BLAKE3-256 of the entry content (32 bytes). */
+  hash: Uint8Array
   /**
    * §9.3 resend-cache stamp for this item — the sender's local cache
    * invalidation key (SPEC §10.2: `(path, size, mtime)`; mtime is a LOCAL
    * cache key, never protocol identity). Files: `size:lastModified`.
-   * Text items have no mtime, so their stamp is `t:size:fnv1a(content)`
-   * (same-length edits change the hash).
+   * Text items have no mtime, so their stamp is `t:size:fnv1a(content)`.
    */
   fingerprint: string
 }
+
+export interface EncodeParams {
+  /** Playout payload rate in bytes/sec — feeds the balanced codec policy. */
+  channelBps: number
+  /** Single-chunk transfers always escalate to the high-ratio preset. */
+  forceFull: boolean
+}
+
+/** One planned chunk: which item ranges assemble its raw bytes. */
+interface PlannedChunk {
+  segments: { item: number; start: number; len: number }[]
+}
+
+/** Byte source for one item: a lazily-sliced File or an in-memory text. */
+type ItemSource = { file: File } | { bytes: Uint8Array }
 
 /**
  * FNV-1a 32-bit — cheap content stamp for text items (the only input that can
@@ -41,38 +83,129 @@ function fnv1a32(bytes: Uint8Array): number {
   return h >>> 0
 }
 
-export interface CompressResult {
-  jobId: number
-  items: PreparedItem[]
-  totalBytes: number
-  displayName: string
-}
-
 function post(msg: unknown, transfer: Transferable[] = []): void {
   ;(postMessage as (m: unknown, transfer?: Transferable[]) => void)(msg, transfer)
 }
 
-self.addEventListener("message", async (e: MessageEvent) => {
-  const data = e.data
-  if (!data || typeof data !== "object") return
+/** Retained state of the last COMMITTED prepare — serves stage requests. */
+let active: {
+  jobId: number
+  sources: ItemSource[]
+  chunks: PlannedChunk[]
+  params: EncodeParams
+  /** codec != RAW encodings, capped at ENCODING_CACHE_CAP (FIFO eviction). */
+  encodings: Map<number, { codec: number; data: Uint8Array }>
+  encodingsBytes: number
+} | null = null
 
-  if (data.type === "wasm-init") {
-    post({ phase: "ready" })
-    return
+/** Latest prepare jobId RECEIVED (set synchronously, in receipt order). */
+let latestPrepareJob: number | null = null
+
+/** Serializes prepare passes: one disk-hashing walk at a time. */
+let prepareChain: Promise<void> = Promise.resolve()
+
+async function readSourceRange(src: ItemSource, start: number, len: number): Promise<Uint8Array> {
+  if ("file" in src) {
+    const buf = await src.file.slice(start, start + len).arrayBuffer()
+    if (buf.byteLength !== len) {
+      throw new Error(
+        `文件读取截断: 期望 ${len} 字节，实际读取 ${buf.byteLength} 字节（文件可能已被修改）`
+      )
+    }
+    return new Uint8Array(buf)
   }
+  return src.bytes.subarray(start, start + len)
+}
 
-  const { jobId, files, text, name } = data as {
-    jobId: number
-    files?: SenderFileItem[]
-    text?: string
-    name?: string
+/** Assemble one chunk's raw bytes from its planned item ranges. */
+async function assembleChunk(a: NonNullable<typeof active>, index: number): Promise<Uint8Array> {
+  const planned = a.chunks[index]
+  const total = planned.segments.reduce((s, g) => s + g.len, 0)
+  const out = new Uint8Array(total)
+  let pos = 0
+  for (const seg of planned.segments) {
+    const part = await readSourceRange(a.sources[seg.item], seg.start, seg.len)
+    out.set(part, pos)
+    pos += seg.len
   }
+  return out
+}
 
+/** Deterministic balanced encode (same inputs ⇒ same bytes, both at prepare
+ * and at every later re-stage — the chunk's encoded_hash depends on it). */
+function encodeChunk(
+  a: NonNullable<typeof active>,
+  raw: Uint8Array
+): { codec: number; data: Uint8Array } {
+  const enc = encode_chunk_balanced(
+    raw,
+    BigInt(Math.max(0, Math.round(a.params.channelBps))),
+    a.params.forceFull
+  )
   try {
-    post({ phase: "reading", jobId })
+    const codec = enc.codec_id
+    const data = enc.data
+    if (codec !== 0 && data.length > 0 && data.length < raw.length) {
+      return { codec, data }
+    }
+    // RAW marker (compression cannot win): stage as RAW with the raw bytes.
+    return { codec: 0, data: new Uint8Array(0) }
+  } finally {
+    enc.free()
+  }
+}
 
-    const items: PreparedItem[] = []
-    let totalBytes = 0
+function cacheEncoding(
+  a: NonNullable<typeof active>,
+  index: number,
+  codec: number,
+  data: Uint8Array
+): void {
+  if (codec === 0) return
+  while (a.encodingsBytes + data.byteLength > ENCODING_CACHE_CAP && a.encodings.size > 0) {
+    const oldest = a.encodings.keys().next().value as number
+    const evict = a.encodings.get(oldest)
+    a.encodings.delete(oldest)
+    if (evict) a.encodingsBytes -= evict.data.byteLength
+  }
+  a.encodings.set(index, { codec, data })
+  a.encodingsBytes += data.byteLength
+}
+
+async function runPrepare(
+  jobId: number,
+  files: SenderFileItem[] | undefined,
+  text: string | undefined,
+  name: string | undefined,
+  params: EncodeParams
+): Promise<void> {
+  // Everything allocated here dies with this function unless the job is
+  // still the latest one at commit time. `entryHashers` holds ONLY the
+  // entries whose byte range the canonical walk has entered but not yet
+  // completed — a hasher is digested and freed the moment its entry's last
+  // byte is fed (see the early-finalize pass in the chunk loop), so peak
+  // hasher count tracks entries straddling chunk boundaries, not the total
+  // entry count. Directories never appear in segments; the protocol defines
+  // their content hash as H(empty), computed once.
+  let entryHashers: (Blake3Wasm | null)[] = []
+  const freeLiveHashers = (): void => {
+    for (let k = 0; k < entryHashers.length; k++) {
+      const h = entryHashers[k]
+      if (h) {
+        try {
+          h.free()
+        } catch {
+          /* already freed */
+        }
+        entryHashers[k] = null
+      }
+    }
+  }
+  try {
+    await ensureWasm()
+
+    const sources: ItemSource[] = []
+    const metas: { kind: number; path: string; size: number; fingerprint: string }[] = []
     let displayName = "传输内容"
 
     if (typeof text === "string") {
@@ -84,11 +217,11 @@ self.addEventListener("message", async (e: MessageEvent) => {
       if (encoded.byteLength > MAX_ORIGINAL_BYTES) {
         throw new Error(`文字内容超过当前网页发送端 ${MAX_ORIGINAL_MIB} MiB 宿主上限`)
       }
-      totalBytes = encoded.byteLength
-      items.push({
+      sources.push({ bytes: encoded })
+      metas.push({
         kind: KIND_UTF8_TEXT,
         path: cleanName,
-        content: encoded.buffer,
+        size: encoded.byteLength,
         fingerprint: `t:${encoded.byteLength}:${fnv1a32(encoded)}`,
       })
     } else if (Array.isArray(files) && files.length > 0) {
@@ -100,14 +233,10 @@ self.addEventListener("message", async (e: MessageEvent) => {
       const usedPaths = new Set<string>()
       for (const item of files) {
         const file = item.file
-        if (file.size > MAX_ORIGINAL_BYTES || totalBytes + file.size > MAX_ORIGINAL_BYTES) {
+        if (file.size > MAX_ORIGINAL_BYTES) {
           throw new Error(
             `所选内容超过当前网页发送端 ${MAX_ORIGINAL_MIB} MiB 宿主上限: ${file.name}`
           )
-        }
-        const buffer = await file.arrayBuffer()
-        if (buffer.byteLength !== file.size) {
-          throw new Error(`文件读取截断: ${file.name} 期望 ${file.size} 字节，实际读取 ${buffer.byteLength} 字节`)
         }
         // Directory hierarchy arrives in item.path: a webkitRelativePath
         // own-property override on the File does not survive the structured
@@ -115,32 +244,219 @@ self.addEventListener("message", async (e: MessageEvent) => {
         // field, which is empty for picked/walked files).
         const filePath = uniqueSenderPath(usedPaths, senderPathForFile(file, item.path))
         usedPaths.add(filePath)
-        totalBytes += buffer.byteLength
-        items.push({
+        sources.push({ file })
+        metas.push({
           kind: KIND_FILE,
           path: filePath,
-          content: buffer,
+          size: file.size,
           fingerprint: `${file.size}:${file.lastModified}`,
         })
       }
     }
 
-    const transfers = items.map((it) => it.content)
+    // Structural gates BEFORE building any plan: a >1 TiB or >4096-entry
+    // selection must fail here, not after materializing a huge chunk layout
+    // (or worse, mid-pass).
+    if (metas.length > MAX_ENTRIES) {
+      throw new Error(`条目数 ${metas.length} 超过 AF2 协议上限 ${MAX_ENTRIES}（文件/文件夹数过多）`)
+    }
+    const totalBytes = metas.reduce((s, m) => s + m.size, 0)
+    if (totalBytes > MAX_ORIGINAL_BYTES) {
+      throw new Error(`所选内容超过当前网页发送端 ${MAX_ORIGINAL_MIB} MiB 宿主上限`)
+    }
+
+    // Canonical chunk layout (NFC-path sorted inside plan_chunks — the same
+    // order the manifest assembles the stream with).
+    const plan = JSON.parse(
+      plan_chunks(
+        new Uint8Array(metas.map((m) => m.kind)),
+        metas.map((m) => m.path),
+        new Float64Array(metas.map((m) => m.size)),
+        8 * 1024 * 1024
+      )
+    ) as { chunks: number[][] }
+    const chunks: PlannedChunk[] = plan.chunks.map((flat) => {
+      const segments: { item: number; start: number; len: number }[] = []
+      for (let i = 0; i < flat.length; i += 3) {
+        segments.push({ item: flat[i], start: flat[i + 1], len: flat[i + 2] })
+      }
+      return { segments }
+    })
+
+    const chunkRawSize = 8 * 1024 * 1024
+
+    // §9.3 single pass: per-chunk hashing + balanced encoding, one chunk's
+    // bytes live at a time. Entry hashers are finalized (digest + free) as
+    // soon as the canonical walk feeds their entry's last byte.
+    const emptyHasher = new Blake3Wasm()
+    const EMPTY_HASH = new Uint8Array(emptyHasher.digest())
+    emptyHasher.free()
+    const entryDigests: (Uint8Array | null)[] = metas.map((m) =>
+      m.kind === KIND_DIRECTORY ? EMPTY_HASH : null
+    )
+    entryHashers = metas.map((m) => (m.kind === KIND_DIRECTORY ? null : new Blake3Wasm()))
+    const hashedLen: number[] = metas.map(() => 0)
+    const chunkHashes: Uint8Array[] = []
+    const staged: NonNullable<typeof active> = {
+      jobId,
+      sources,
+      chunks,
+      params,
+      encodings: new Map(),
+      encodingsBytes: 0,
+    }
+    for (let i = 0; i < chunks.length; i++) {
+      // A newer prepare was received while this pass was reading disk —
+      // abort early instead of wasting IO and then racing the commit (the
+      // finally clause releases any still-live hashers).
+      if (latestPrepareJob !== jobId) {
+        return
+      }
+      const raw = await assembleChunk(staged, i)
+      // Feed the entry hashers the same bytes in stream order. A chunk's
+      // segments are already stream-ordered (plan_chunks emits them in
+      // canonical order), so hashing each segment into its item's hasher
+      // reproduces exactly one full pass per entry.
+      const chunkHasher = new Blake3Wasm()
+      try {
+        let pos = 0
+        for (const seg of chunks[i].segments) {
+          const slice = raw.subarray(pos, pos + seg.len)
+          chunkHasher.update(slice)
+          entryHashers[seg.item]?.update(slice)
+          hashedLen[seg.item] += seg.len
+          pos += seg.len
+        }
+        chunkHashes.push(new Uint8Array(chunkHasher.digest()))
+      } finally {
+        chunkHasher.free()
+      }
+      // Early finalize: an entry fully covered by the walk so far is done —
+      // digest and free NOW instead of holding one hasher per entry until
+      // the end of the pass (matters at the 4096-entry ceiling).
+      for (const seg of chunks[i].segments) {
+        const it = seg.item
+        const h = entryHashers[it]
+        if (h && hashedLen[it] === metas[it].size) {
+          entryDigests[it] = new Uint8Array(h.digest())
+          h.free()
+          entryHashers[it] = null
+        }
+      }
+      const { codec, data: encoded } = encodeChunk(staged, raw)
+      if (codec !== 0) cacheEncoding(staged, i, codec, encoded)
+      if ((i + 1) % 8 === 0 || i === chunks.length - 1) {
+        post({ phase: "progress", jobId, done: i + 1, total: chunks.length })
+      }
+    }
+
+    // The last chunk completes every remaining entry by construction.
+    const entries: PreparedEntry[] = metas.map((m, i) => {
+      const dg = entryDigests[i]
+      if (!dg) throw new Error(`internal: entry hash missing for ${m.path}`)
+      return {
+        kind: m.kind,
+        path: m.path,
+        size: m.size,
+        hash: dg,
+        fingerprint: m.fingerprint,
+      }
+    })
+    freeLiveHashers()
+    entryHashers = []
+
+    // Latest-wins commit: a job superseded while reading must not overwrite
+    // the newer job's staging state (rapid re-send race).
+    if (latestPrepareJob !== jobId) return
+    active = staged
+    const hashTransfers = [...chunkHashes, ...entries.map((en) => en.hash)].map(
+      (h) => h.buffer as ArrayBuffer
+    )
     post(
       {
         phase: "done",
         jobId,
-        items,
+        streamed: true,
+        entries,
+        chunkHashes,
+        chunkCount: chunks.length,
+        chunkRawSize,
         totalBytes,
         displayName,
       },
-      transfers
+      hashTransfers
     )
   } catch (err: unknown) {
-    post({
-      phase: "error",
-      message: err instanceof Error ? err.message : String(err),
-      jobId,
-    })
+    if (latestPrepareJob === jobId) {
+      active = null
+      post({
+        phase: "error",
+        message: err instanceof Error ? err.message : String(err),
+        jobId,
+      })
+    }
+  } finally {
+    freeLiveHashers()
   }
+}
+
+self.addEventListener("message", (e: MessageEvent) => {
+  const data = e.data
+  if (!data || typeof data !== "object") return
+
+  if (data.type === "wasm-init") {
+    post({ phase: "ready" })
+    return
+  }
+
+  if (data.type === "stage") {
+    const { jobId, index } = data as { jobId: number; index: number }
+    const a = active
+    if (!a || a.jobId !== jobId || index < 0 || index >= a.chunks.length) {
+      post({ type: "stageError", jobId, index, message: "staging state unavailable" })
+      return
+    }
+    void (async () => {
+      try {
+        const cached = a.encodings.get(index)
+        if (cached) {
+          post({ type: "staged", jobId, index, codec: cached.codec, data: cached.data })
+          return
+        }
+        const raw = await assembleChunk(a, index)
+        const { codec, data: encoded } = encodeChunk(a, raw)
+        if (codec !== 0) cacheEncoding(a, index, codec, encoded)
+        if (codec === 0) {
+          post({ type: "staged", jobId, index, codec: 0, data: raw })
+        } else {
+          post({ type: "staged", jobId, index, codec, data: encoded })
+        }
+      } catch (err: unknown) {
+        post({
+          type: "stageError",
+          jobId,
+          index,
+          message: err instanceof Error ? err.message : String(err),
+        })
+      }
+    })()
+    return
+  }
+
+  const { jobId, files, text, name, encodeParams } = data as {
+    jobId: number
+    files?: SenderFileItem[]
+    text?: string
+    name?: string
+    encodeParams?: EncodeParams
+  }
+  const params: EncodeParams = encodeParams ?? { channelBps: 0, forceFull: false }
+
+  // Respond immediately so the UI flips to "reading" without waiting behind
+  // a still-running older pass; the pass itself is serialized.
+  post({ phase: "reading", jobId })
+  latestPrepareJob = jobId
+  prepareChain = prepareChain.then(() =>
+    runPrepare(jobId, files, text, name, params)
+  )
 })

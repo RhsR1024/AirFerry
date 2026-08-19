@@ -11,6 +11,7 @@
  */
 import { useEffect, useRef, useCallback, useState } from "react"
 import { SenderSessionWasm, ensureWasm } from "@/wasm/loader"
+import type { ChunkStager } from "@/lib/chunk-stager"
 
 export interface QrStreamStats {
   frames: number
@@ -23,9 +24,11 @@ export interface QrStreamStats {
 interface Props {
   /** Initialized sender session. */
   session: SenderSessionWasm
+  /** Streamed-sender chunk stager (null for fully-buffered sessions). */
+  stager?: ChunkStager | null
   /** Target frames per second (0 = every display refresh). */
   fps: number
-  /** Brightness multiplier for screen (1.0 = normal, >1 = brighter). */
+  /** Brightness multiplier for screen (1.0 = normal, >1 brighter). */
   brightness: number
   /** Auto-optimize brightness/contrast for scanning. */
   autoOptimize: boolean
@@ -41,6 +44,7 @@ interface Props {
 
 export function QrStream({
   session,
+  stager,
   fps,
   brightness,
   autoOptimize,
@@ -62,6 +66,8 @@ export function QrStream({
   const onErrorRef = useRef(onError)
   onStatsRef.current = onStats
   onErrorRef.current = onError
+  const stagerRef = useRef(stager)
+  stagerRef.current = stager
 
   // A rAF callback is scheduled inside the effect's `loop` closure which binds
   // the `session` captured at render time. When the parent swaps the session
@@ -90,6 +96,11 @@ export function QrStream({
     // point at the NEW loop's frame id.
     if (activeSessionRef.current !== session) return
 
+    // Streamed-sender chunk staging: prefetch the next window's chunk and
+    // skip this tick while the CURRENT chunk's stage is still in flight.
+    const stager = stagerRef.current
+    if (stager && !stager.tick(session)) return
+
     const wantMulti = multiQr >= 2
 
     type Matrix = { side: number; modules: Uint8Array }
@@ -102,6 +113,10 @@ export function QrStream({
       matrices = parseMultiQrBuf(scratch, written)
       if (matrices.length === 0) return
     } catch (e) {
+      // The playlist reached an unstaged chunk (streamed sender). The failed
+      // call was transactional (no side effects) — request the stage and let
+      // the next tick continue the exact frame sequence.
+      if (stager && stager.handleNotStaged(e)) return
       onErrorRef.current?.(e as Error)
       return
     }

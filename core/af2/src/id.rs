@@ -57,6 +57,17 @@ pub fn hash(bytes: &[u8]) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
+/// Re-export so downstream crates (WASM bindings) can name the incremental
+/// hasher type without a direct blake3 dependency.
+pub use blake3::Hasher as Blake3Hasher;
+
+/// Fresh incremental BLAKE3-256 hasher — the bounded-memory companion of
+/// [`hash`] for hosts that stream content instead of materializing it
+/// (§9.3: one pass, hash while reading).
+pub fn new_hasher() -> Blake3Hasher {
+    Blake3Hasher::new()
+}
+
 /// Hash of the empty input (directories' entry_hash).
 pub fn empty_hash() -> [u8; 32] {
     hash(&[])

@@ -22,12 +22,9 @@ import {
   type SenderSessionWasm,
 } from "@/wasm/loader"
 import { getCachedManifest, putCachedManifest } from "@/lib/sender-cache"
-import {
-  type ChunkEncoding,
-  prepareChunkEncodings,
-} from "@/lib/chunk-encode"
+import { createChunkStager, type ChunkStager } from "@/lib/chunk-stager"
 import { SettingsIcon } from "@/components/icons"
-import type { PreparedItem } from "@/workers/compress.worker"
+import type { PreparedEntry } from "@/workers/compress.worker"
 import { senderPathForFile, type SenderFileItem } from "@/lib/sender-path"
 import "@/assets/app.css"
 
@@ -65,8 +62,16 @@ function itemsToFiles(items: PendingItem[]): SenderFileItem[] {
   })
 }
 
+/**
+ * Streamed preparation payload: hash-only entry metadata + the chunk hash
+ * table. Content bytes never cross this boundary — they stream into the WASM
+ * sender chunk-by-chunk at play time via `stage_chunk` (bounded memory for
+ * arbitrarily large transfers).
+ */
 interface PreparedPayload {
-  items: PreparedItem[]
+  entries: PreparedEntry[]
+  chunkHashes: Uint8Array[]
+  chunkCount: number
   totalBytes: number
   displayName: string
 }
@@ -78,6 +83,7 @@ export interface AppState {
   items: PendingItem[]
   prepared: PreparedPayload | null
   session: SenderSessionWasm | null
+  stager: ChunkStager | null
   config: TransferConfig
   initializing: boolean
   compressPhase: CompressPhase | null
@@ -106,6 +112,7 @@ export default function App() {
     items: [],
     prepared: null,
     session: null,
+    stager: null,
     config: loadConfig(),
     initializing: false,
     compressPhase: null,
@@ -118,6 +125,7 @@ export default function App() {
   const restartWorkerRef = useRef<() => void>(() => undefined)
   const mountedRef = useRef(true)
   const ownedSessionRef = useRef<SenderSessionWasm | null>(null)
+  const ownedStagerRef = useRef<ChunkStager | null>(null)
   // Latest session builder. The worker "done" handler lives in a mount-time
   // effect closure, so it must call through this ref to see fresh config.
   const startPlaybackRef = useRef<(p: PreparedPayload, startEpoch: number) => Promise<void>>(
@@ -129,6 +137,11 @@ export default function App() {
     if (s) {
       ownedSessionRef.current = null
       freeSenderSession(s)
+    }
+    const st = ownedStagerRef.current
+    if (st) {
+      ownedStagerRef.current = null
+      st.dispose()
     }
   }, [])
 
@@ -172,10 +185,18 @@ export default function App() {
         return
       }
 
+      if (msg.phase === "progress") {
+        // Streaming prepare pass: per-chunk progress (large transfers can take
+        // a while at disk-read speed); reuse the "reading" phase for the UI.
+        return
+      }
+
       if (msg.phase === "done") {
         issuedEpoch.current = -1
         const payload: PreparedPayload = {
-          items: msg.items as PreparedItem[],
+          entries: msg.entries as PreparedEntry[],
+          chunkHashes: msg.chunkHashes as Uint8Array[],
+          chunkCount: Number(msg.chunkCount) || 0,
           totalBytes: msg.totalBytes as number,
           displayName: msg.displayName as string,
         }
@@ -250,6 +271,7 @@ export default function App() {
       items,
       prepared: null,
       session: null,
+      stager: null,
       compressPhase: null,
       error: null,
     }))
@@ -267,40 +289,22 @@ export default function App() {
         return
       }
       const chunkRawSize = 8 * 1024 * 1024
-      const channelBps = Math.round(
-        cfg.symbolSize * (cfg.fps || 60) * Math.max(1, cfg.multiQr || 1)
-      )
-      const forceFull = p.totalBytes <= chunkRawSize
-      let encodings: ChunkEncoding[] = []
-      try {
-        encodings = await prepareChunkEncodings(p.items, {
-          chunkRawSize,
-          channelBps,
-          forceFull,
-        })
-      } catch (e) {
-        console.warn("chunk pre-encode failed, falling back to lazy encoding:", e)
-        encodings = []
-      }
-      if (!mountedRef.current || epoch.current !== startEpoch) {
-        if (mountedRef.current) {
-          setState((s) => ({ ...s, initializing: false }))
-        }
-        return
-      }
-      const fillBuilder = (): SenderBuilderWasm => {
+      // Streamed build: only kind/path/size + BLAKE3 digests cross into the
+      // core — the canonical stream never materializes (bounded memory).
+      // Content reaches the sender per chunk at play time via stage_chunk.
+      const buildFromMeta = () => {
         const builder = new SenderBuilderWasm()
-        for (const it of p.items) {
-          builder.add_entry(it.kind, it.path, new Uint8Array(it.content))
+        for (const en of p.entries) {
+          builder.add_meta(en.kind, en.path, en.size, en.hash)
         }
-        for (const c of encodings) {
-          builder.add_preencoded_chunk(c.index, c.codec, c.data)
+        for (const h of p.chunkHashes) {
+          builder.add_chunk_hash(h)
         }
         return builder
       }
       let session: SenderSessionWasm | null = null
       try {
-        const cached = await getCachedManifest(p.items, chunkRawSize)
+        const cached = await getCachedManifest(p.entries, chunkRawSize)
         if (!mountedRef.current || epoch.current !== startEpoch) {
           if (mountedRef.current) {
             setState((s) => ({ ...s, initializing: false }))
@@ -309,7 +313,7 @@ export default function App() {
         }
         if (cached && cached.chunkRawSize === chunkRawSize) {
           try {
-            session = fillBuilder().build_cached(
+            session = buildFromMeta().build_streamed_cached(
               cached.manifestHex,
               cfg.symbolSize,
               chunkRawSize,
@@ -324,9 +328,13 @@ export default function App() {
         session = null
       }
       if (!session) {
-        session = fillBuilder().build(cfg.symbolSize, chunkRawSize, cfg.redundancyPct)
+        session = buildFromMeta().build_streamed(
+          cfg.symbolSize,
+          chunkRawSize,
+          cfg.redundancyPct
+        )
         try {
-          await putCachedManifest(p.items, session.manifest_json(), chunkRawSize)
+          await putCachedManifest(p.entries, session.manifest_json(), chunkRawSize)
         } catch {
           // advisory
         }
@@ -341,7 +349,52 @@ export default function App() {
       }
       releaseOwnedSession()
       ownedSessionRef.current = session
-      setState((s) => ({ ...s, session, page: "play", initializing: false }))
+      // Play-time chunk staging: the prepare worker still holds the item
+      // sources + chunk plan; startEpoch doubles as the stage request's
+      // currency guard (it equals the prepare jobId).
+      const worker = workerRef.current
+      const stager =
+        worker && p.chunkCount > 0
+          ? createChunkStager({
+              worker,
+              session,
+              jobId: startEpoch,
+              chunkCount: p.chunkCount,
+              isLive: () =>
+                mountedRef.current &&
+                epoch.current === startEpoch &&
+                ownedSessionRef.current === session &&
+                workerRef.current === worker,
+              onFatal: (message) => {
+                if (epoch.current !== startEpoch) return
+                // A stage can only fail terminally when the source bytes
+                // disagree with the prepare-time manifest hashes (file
+                // modified/moved between prepare and playback) or its slice
+                // read failed — either way continuing is pointless: every
+                // later stage of this session would fail the same gate.
+                // Tear the session down with an actionable message instead
+                // of an endless stage-retry loop.
+                const changed =
+                  /hash mismatch|disagree with the manifest/i.test(message)
+                const userMessage = changed
+                  ? "源文件内容与准备传输时不一致（可能已被修改），请重新选择并发送"
+                  : `分块读取失败（源文件可能已被移动或修改），请重新发送。${message}`
+                releaseOwnedSession()
+                setState((s) => ({
+                  ...s,
+                  session: null,
+                  stager: null,
+                  page: "select",
+                  error: userMessage,
+                  initializing: false,
+                }))
+              },
+            })
+          : null
+      if (stager) {
+        ownedStagerRef.current = stager
+      }
+      setState((s) => ({ ...s, session, stager, page: "play", initializing: false }))
     } catch (e: any) {
       console.error("WASM session creation failed:", e)
       setState((s) => ({
@@ -370,19 +423,32 @@ export default function App() {
     setState((s) => ({
       ...s,
       session: null,
+      stager: null,
       compressPhase: "reading",
       error: null,
     }))
+    // Balanced-encode params captured NOW (from the live config): the worker
+    // reuses them verbatim for every play-time re-stage — determinism keeps
+    // the staged encoded_hash (and thus the chunk object_id) stable.
+    const channelBps = Math.round(
+      state.config.symbolSize * (state.config.fps || 60) * Math.max(1, state.config.multiQr || 1)
+    )
+    const forceFull = items.reduce(
+      (s, it) => s + (it.kind === "file" ? it.file.size : new TextEncoder().encode(it.content).length),
+      0
+    ) <= 8 * 1024 * 1024
+    const encodeParams = { channelBps, forceFull }
     if (items.length === 1 && items[0].kind === "text") {
       worker.postMessage({
         jobId: e,
         text: items[0].content,
         name: items[0].name,
+        encodeParams,
       })
     } else {
-      worker.postMessage({ jobId: e, files: itemsToFiles(items) })
+      worker.postMessage({ jobId: e, files: itemsToFiles(items), encodeParams })
     }
-  }, [state.items, state.compressPhase, state.initializing, releaseOwnedSession])
+  }, [state.items, state.compressPhase, state.initializing, state.config, releaseOwnedSession])
 
   const updateConfig = useCallback(
     (patch: Partial<TransferConfig>) =>
@@ -416,6 +482,7 @@ export default function App() {
     setState((s) => ({
       ...s,
       session: null,
+      stager: null,
       page: "select",
       prepared: null,
       initializing: false,
@@ -429,6 +496,25 @@ export default function App() {
       : state.initializing
       ? "正在准备编码…"
       : null
+
+  // Step-bar navigation: every finished step is clickable to go back /
+  // forward between the pages of the CURRENT transfer session. Guarded while
+  // a preparation pass runs (reading / encoder init) so the clicks cannot
+  // race startPlaybackWithPayload's epoch checks.
+  const stepsBusy = state.compressPhase != null || state.initializing
+  const canPlay = state.session != null && state.prepared != null
+  const gotoSelect = () => {
+    if (stepsBusy || state.page === "select") return
+    setState((s) => ({ ...s, page: "select" }))
+  }
+  const gotoPlay = () => {
+    if (stepsBusy || !canPlay || state.page === "play") return
+    setState((s) => ({ ...s, page: "play" }))
+  }
+  const gotoStats = () => {
+    if (stepsBusy || state.session == null || state.page === "stats") return
+    setState((s) => ({ ...s, page: "stats" }))
+  }
 
   return (
     <div className="app">
@@ -454,22 +540,39 @@ export default function App() {
       {state.page !== "settings" && (
         <div className="steps">
           <div
-            className={`step ${state.page === "select" ? "active" : state.session ? "done" : ""}`}
-            onClick={() => state.page !== "play" && setState((s) => ({ ...s, page: "select" }))}
+            className={`step ${state.page === "select" ? "active" : state.session ? "done" : ""} ${
+              stepsBusy || state.page === "select" ? "disabled" : ""
+            }`}
+            onClick={gotoSelect}
+            role="button"
+            aria-disabled={stepsBusy || state.page === "select"}
+            title="返回选择文件"
           >
             <span className="step-dot">1</span>
             <span className="step-label">选择文件</span>
           </div>
           <div className="step-line" />
           <div
-            className={`step ${state.page === "play" ? "active" : state.page === "stats" ? "done" : ""}`}
+            className={`step ${state.page === "play" ? "active" : state.page === "stats" ? "done" : ""} ${
+              stepsBusy || !canPlay || state.page === "play" ? "disabled" : ""
+            }`}
+            onClick={gotoPlay}
+            role="button"
+            aria-disabled={stepsBusy || !canPlay || state.page === "play"}
+            title={canPlay ? "返回播放传输" : "尚未准备传输"}
           >
             <span className="step-dot">2</span>
             <span className="step-label">播放传输</span>
           </div>
           <div className="step-line" />
           <div
-            className={`step ${state.page === "stats" ? "active" : ""}`}
+            className={`step ${state.page === "stats" ? "active" : ""} ${
+              stepsBusy || state.session == null || state.page === "stats" ? "disabled" : ""
+            }`}
+            onClick={gotoStats}
+            role="button"
+            aria-disabled={stepsBusy || state.session == null || state.page === "stats"}
+            title={state.session ? "查看传输统计" : "尚未开始传输"}
           >
             <span className="step-dot">3</span>
             <span className="step-label">传输统计</span>
@@ -500,6 +603,7 @@ export default function App() {
         {state.page === "play" && state.session && state.prepared && (
           <PlayPage
             session={state.session}
+            stager={state.stager}
             config={state.config}
             totalBytes={state.prepared.totalBytes}
             onStop={stopPlayback}

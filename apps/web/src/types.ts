@@ -68,18 +68,20 @@ export const AF2_MAX_ORIGINAL_BYTES = 4 * 1024 * 1024 * 1024 * 1024
 /**
  * Current Web sender host cap.
  *
- * The protocol/receivers can address 4 TiB, but the browser sender still
- * materializes each selected File as ArrayBuffer and copies entries into WASM.
- * Until that path becomes genuinely streaming, advertise/enforce the host's
- * real bounded capability instead of the wire-format maximum.
+ * The preparation path is fully streamed (§9.3 single pass, one chunk in
+ * memory at a time, play-time `stage_chunk`), so the binding limit is the AF2
+ * wire format itself: at the default 8 MiB chunk_raw_size the chunk table
+ * addresses at most 131,072 chunks = 1 TiB.
  */
-// The current sender transiently holds the selection in JS ArrayBuffers,
-// copies entries into wasm-bindgen Vecs, then builds one canonical stream in
-// WASM. A 1 GiB host cap can therefore require several GiB of live memory and
-// still OOM on mainstream browsers. Keep the advertised host limit
-// conservative until SenderBuilderWasm becomes genuinely streaming.
-export const MAX_ORIGINAL_BYTES = 256 * 1024 * 1024
+export const MAX_ORIGINAL_BYTES = 1024 * 1024 * 1024 * 1024
 export const MAX_ORIGINAL_MIB = MAX_ORIGINAL_BYTES / (1024 * 1024)
+
+/**
+ * Large-transfer confirmation threshold: content beyond this still sends
+ * fine, but at typical optical throughputs (~0.5–2 MB/s) it takes a long
+ * time — confirm before committing the user to it.
+ */
+export const LARGE_TRANSFER_BYTES = 256 * 1024 * 1024
 
 export interface SpeedPresetDef {
   id: SpeedPreset

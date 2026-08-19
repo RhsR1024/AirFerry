@@ -38,6 +38,8 @@ pub enum SenderError {
     Oti(String),
     #[error("config error: {0}")]
     Config(String),
+    #[error("chunk {0} not staged — streamed senders require stage_chunk before playback reaches a chunk")]
+    ChunkNotStaged(u32),
     #[error("empty content: AF2 wire v2 cannot encode a zero-byte canonical stream (receiver OTI gate rejects F=0)")]
     EmptyContent,
 }
@@ -108,7 +110,8 @@ pub struct Af2Sender {
     /// bytes, so a cached manifest rebuilds a sender without re-hashing).
     manifest_bytes: Vec<u8>,
     manifest_encoder: ObjectEncoder,
-    /// Canonical content stream (single copy, entries concatenated).
+    /// Canonical content stream (single copy, entries concatenated). Empty in
+    /// streamed mode — chunks arrive at play time via [`Self::stage_chunk`].
     stream: Vec<u8>,
     /// Lazily initialized chunk encoders (only built when the chunk is first
     /// reached, freed again when the playlist moves on — peak memory stays
@@ -122,6 +125,16 @@ pub struct Af2Sender {
     /// back to lazy `encode_chunk` at play time, so partially-provisioned
     /// hosts (and all native/tests paths) keep working unchanged.
     preencoded_chunks: Vec<Option<PreencodedChunk>>,
+    /// ROOT-bound chunk hash table from the manifest. In streamed mode this
+    /// is the only per-chunk trust anchor: staged bytes are validated
+    /// against it, and the chunk META's raw_hash is taken from it (no
+    /// play-time decompression needed to recover the raw hash).
+    chunk_hashes: Vec<[u8; 32]>,
+    /// Streamed mode: the canonical stream never materializes here; each
+    /// chunk must be staged via [`Self::stage_chunk`] before the playlist
+    /// reaches it, and is dropped again when the window moves on.
+    staged_mode: bool,
+    staged_chunks: Vec<Option<(u8, Vec<u8>)>>,
     /// 1-based broadcast epoch. Epoch 1 sends each chunk's source symbols
     /// once; epoch ≥ 2 sends only fresh repair symbols.
     epoch: u32,
@@ -205,6 +218,34 @@ impl Af2Sender {
     pub fn from_manifest_with_preencoded(
         manifest: Manifest,
         items: Vec<(u8, String, Vec<u8>)>,
+        config: SenderConfig,
+        preencoded: Vec<(u32, PreencodedChunk)>,
+    ) -> Result<Self, SenderError> {
+        Self::build_from_manifest(manifest, Some(items), config, preencoded)
+    }
+
+    /// Bounded-memory streamed construction: the manifest already carries the
+    /// complete entry table and chunk hash table, so the sender never holds
+    /// the canonical stream. Each chunk must be provided at play time via
+    /// [`Self::stage_chunk`] (validated against the manifest's chunk hashes);
+    /// [`Self::next_frame`] fails closed with [`SenderError::ChunkNotStaged`]
+    /// when the playlist reaches an unstaged chunk. Re-staging a chunk in a
+    /// later epoch MUST supply byte-identical encoded bytes — the chunk META's
+    /// encoded_hash (and thus its object_id) is derived from them, and a
+    /// differing object_id would make the receiver drop every symbol.
+    ///
+    /// Use [`crate::manifest::build_manifest_from_hashes`] (or the §9.3
+    /// resend cache) to build `manifest` without ever holding content bytes.
+    pub fn from_manifest_streamed(
+        manifest: Manifest,
+        config: SenderConfig,
+    ) -> Result<Self, SenderError> {
+        Self::build_from_manifest(manifest, None, config, Vec::new())
+    }
+
+    fn build_from_manifest(
+        manifest: Manifest,
+        items: Option<Vec<(u8, String, Vec<u8>)>>,
         config: SenderConfig,
         preencoded: Vec<(u32, PreencodedChunk)>,
     ) -> Result<Self, SenderError> {
@@ -329,32 +370,39 @@ impl Af2Sender {
         // caller's items may still carry NFD names (macOS) — match through an
         // NFC-normalized index, never a raw path comparison (a silent miss here
         // would desync every chunk hash from the manifest table).
-        use std::collections::HashMap;
-        use unicode_normalization::UnicodeNormalization;
-        let mut item_index: HashMap<String, usize> = HashMap::with_capacity(items.len());
-        for (i, (_, path, _)) in items.iter().enumerate() {
-            // Duplicate normalized keys correspond to transfers build_manifest
-            // already rejected above, so overwrite is unreachable.
-            item_index.insert(path.nfc().collect::<String>(), i);
-        }
-        let mut stream = Vec::with_capacity(manifest.total_raw_size as usize);
-        for e in &manifest.entries {
-            if e.kind != crate::id::KIND_DIRECTORY {
-                if let Some(&i) = item_index.get(&e.path) {
-                    stream.extend_from_slice(&items[i].2);
+        //
+        // Streamed mode (items == None) skips the stream entirely: chunks are
+        // staged at play time and validated against the manifest chunk table.
+        let staged_mode = items.is_none();
+        let mut stream = Vec::new();
+        if let Some(items) = items {
+            use std::collections::HashMap;
+            use unicode_normalization::UnicodeNormalization;
+            let mut item_index: HashMap<String, usize> = HashMap::with_capacity(items.len());
+            for (i, (_, path, _)) in items.iter().enumerate() {
+                // Duplicate normalized keys correspond to transfers build_manifest
+                // already rejected above, so overwrite is unreachable.
+                item_index.insert(path.nfc().collect::<String>(), i);
+            }
+            stream.reserve(manifest.total_raw_size as usize);
+            for e in &manifest.entries {
+                if e.kind != crate::id::KIND_DIRECTORY {
+                    if let Some(&i) = item_index.get(&e.path) {
+                        stream.extend_from_slice(&items[i].2);
+                    }
                 }
             }
-        }
-        // The manifest is authoritative for total_raw_size; a silently-skipped
-        // item (e.g. a stale §9.3 cached manifest replayed against a mutated
-        // selection) must fail the build loudly instead of producing tail
-        // chunks sliced from `&[]` that only die at play time.
-        if stream.len() as u64 != manifest.total_raw_size {
-            return Err(SenderError::Config(format!(
-                "assembled stream length {} != manifest total_raw_size {} — item set inconsistent with manifest",
-                stream.len(),
-                manifest.total_raw_size
-            )));
+            // The manifest is authoritative for total_raw_size; a silently-skipped
+            // item (e.g. a stale §9.3 cached manifest replayed against a mutated
+            // selection) must fail the build loudly instead of producing tail
+            // chunks sliced from `&[]` that only die at play time.
+            if stream.len() as u64 != manifest.total_raw_size {
+                return Err(SenderError::Config(format!(
+                    "assembled stream length {} != manifest total_raw_size {} — item set inconsistent with manifest",
+                    stream.len(),
+                    manifest.total_raw_size
+                )));
+            }
         }
 
         let chunk_count = manifest.chunk_count as usize;
@@ -409,6 +457,9 @@ impl Af2Sender {
             chunk_encoders,
             chunk_repair_esi,
             preencoded_chunks,
+            chunk_hashes: manifest.chunk_hashes,
+            staged_mode,
+            staged_chunks: vec![None; chunk_count],
             epoch: 1,
             state: PlaylistState::BootstrapRoot(4),
             global_frame_count: 0,
@@ -435,13 +486,156 @@ impl Af2Sender {
         &self.manifest_bytes
     }
 
+    /// Playlist position: `Some(chunk)` once playback is inside a chunk's
+    /// window, `None` during bootstrap. Streamed hosts use this to prefetch
+    /// the upcoming chunk (stage current + next).
+    pub fn current_chunk_index(&self) -> Option<u32> {
+        match self.state {
+            PlaylistState::ChunkLoop { chunk_index, .. } => Some(chunk_index as u32),
+            _ => None,
+        }
+    }
+
+    /// 1-based broadcast epoch. Together with [`Self::current_chunk_index`]
+    /// this uniquely identifies the active window — a single-chunk transfer
+    /// keeps the same chunk index across every epoch wrap, so hosts keying
+    /// per-window prefetch state on the index alone go stale.
+    pub fn epoch(&self) -> u32 {
+        self.epoch
+    }
+
+    /// Provide one chunk's ENCODED bytes to a streamed sender
+    /// ([`Self::from_manifest_streamed`]). Fail-closed against the manifest
+    /// chunk table: RAW bytes must be exactly the canonical slice length and
+    /// hash to the table entry; Zstd/Xz bytes must be strictly smaller AND
+    /// bounded-decompress to bytes hashing to the table entry. The staged
+    /// bytes are consumed when the playlist reaches the chunk and dropped
+    /// when the window moves on — later epochs must re-stage byte-identical
+    /// bytes (deterministic re-encode) to keep the object_id stable.
+    pub fn stage_chunk(
+        &mut self,
+        index: u32,
+        codec_id: u8,
+        bytes: Vec<u8>,
+    ) -> Result<(), SenderError> {
+        if !self.staged_mode {
+            return Err(SenderError::Config(
+                "stage_chunk is only valid for streamed senders (from_manifest_streamed)".into(),
+            ));
+        }
+        let idx = index as usize;
+        if idx >= self.chunk_encoders.len() {
+            return Err(SenderError::Config(format!(
+                "stage_chunk index {index} out of range (chunk_count {})",
+                self.chunk_encoders.len()
+            )));
+        }
+        if self.staged_chunks[idx].is_some() {
+            // Already armed for this chunk's next need (the host prefetches
+            // the next epoch's copy while the current window is still live —
+            // see retire_chunk, which keeps the slot).
+            return Ok(());
+        }
+        let start = u64::from(idx as u32) * u64::from(self.config.chunk_raw_size);
+        let canonical_len = self
+            .root_record
+            .total_raw_size
+            .saturating_sub(start)
+            .min(u64::from(self.config.chunk_raw_size)) as usize;
+        let raw_hash = match codec_id {
+            CODEC_RAW => {
+                if bytes.len() != canonical_len {
+                    return Err(SenderError::Config(format!(
+                        "staged RAW chunk {index} length {} != canonical {canonical_len}",
+                        bytes.len()
+                    )));
+                }
+                hash(&bytes)
+            }
+            CODEC_ZSTD | CODEC_XZ => {
+                // §10.1 dual-end invariant.
+                if bytes.len() >= canonical_len {
+                    return Err(SenderError::Config(format!(
+                        "staged chunk {index} violates strictly-smaller ({} >= {canonical_len})",
+                        bytes.len()
+                    )));
+                }
+                let raw = crate::chunk::decode_chunk(
+                    codec_id,
+                    &bytes,
+                    canonical_len,
+                    self.config.chunk_raw_size,
+                )
+                .map_err(|e| SenderError::Config(format!("staged chunk {index} decode: {e}")))?;
+                hash(&raw)
+            }
+            other => {
+                return Err(SenderError::Config(format!(
+                    "staged chunk {index} codec {other} must be RAW/Zstd/Xz"
+                )));
+            }
+        };
+        if raw_hash != self.chunk_hashes[idx] {
+            return Err(SenderError::Config(format!(
+                "staged chunk {index} hash mismatch — bytes disagree with the manifest chunk table"
+            )));
+        }
+        self.staged_chunks[idx] = Some((codec_id, bytes));
+        Ok(())
+    }
+
     /// Produce the next wire frame according to the standard automatic playlist.
+    ///
+    /// Transactional: a failed call (e.g. [`SenderError::ChunkNotStaged`] in
+    /// streamed mode) leaves EVERY piece of emission state untouched — the
+    /// interleave counters, the per-chunk repair ESI cursor and the playlist
+    /// position. Hosts may therefore "stage-and-retry" on error and get the
+    /// exact frame sequence an always-staged sender would have produced;
+    /// without the rollback every failed attempt would silently consume one
+    /// interleave beat and desync the schedule.
     pub fn next_frame(&mut self) -> Result<Vec<u8>, SenderError> {
+        let counters = (
+            self.global_frame_count,
+            self.since_meta_counter,
+            self.since_root_counter,
+            self.since_manifest_counter,
+            self.manifest_interleave_count,
+        );
+        let cursor_chunk = match self.state {
+            PlaylistState::ChunkLoop { chunk_index, .. } => Some(chunk_index),
+            _ => None,
+        };
+        let cursor_checkpoint = cursor_chunk.map(|i| self.chunk_repair_esi[i]);
         self.global_frame_count += 1;
         self.since_meta_counter += 1;
         self.since_root_counter += 1;
         self.since_manifest_counter += 1;
+        let result = self.step();
+        if result.is_err() {
+            (
+                self.global_frame_count,
+                self.since_meta_counter,
+                self.since_root_counter,
+                self.since_manifest_counter,
+                self.manifest_interleave_count,
+            ) = counters;
+            if let (Some(i), Some(cursor)) = (cursor_chunk, cursor_checkpoint) {
+                self.chunk_repair_esi[i] = cursor;
+                // The LIVE encoder's internal cursor is the authoritative
+                // value while its window is active (the persisted array only
+                // feeds encoder rebuilds). Without restoring it too, a failed
+                // advance AFTER a symbol fetch permanently burned repair
+                // ordinals — the retry resumed past ESIs that were never
+                // displayed, silently shrinking the receiver's fountain pool.
+                if let Some(enc) = &mut self.chunk_encoders[i] {
+                    enc.next_repair_esi = cursor;
+                }
+            }
+        }
+        result
+    }
 
+    fn step(&mut self) -> Result<Vec<u8>, SenderError> {
         match self.state {
             PlaylistState::BootstrapRoot(rem) => {
                 if rem <= 1 {
@@ -586,21 +780,27 @@ impl Af2Sender {
     }
 
     /// Chunk `chunk_index` is finished (symbol target reached, or its repair
-    /// ESI space exhausted per §9.1): free its encoder and move the playlist
-    /// to the next chunk — or, on the last chunk, restart the epoch from
-    /// Chunk 0. Later epochs skip the source-symbol pass and send only fresh
-    /// repair ESIs (§9.2), resuming from the persisted per-chunk ESI.
+    /// ESI space exhausted per §9.1): move the playlist to the next chunk —
+    /// or, on the last chunk, restart the epoch from Chunk 0. Later epochs
+    /// skip the source-symbol pass and send only fresh repair ESIs (§9.2),
+    /// resuming from the persisted per-chunk ESI.
+    ///
+    /// The next chunk's encoder is built BEFORE the current one is freed and
+    /// the state moves: in streamed mode an unstaged next chunk fails here
+    /// with [`SenderError::ChunkNotStaged`] while the playlist state stays
+    /// intact, so the host can stage the chunk and resume exactly where it
+    /// stopped.
     fn advance_past_chunk(&mut self, chunk_index: usize) -> Result<(), SenderError> {
-        // Free the finished chunk's encoder + cached packets — rebuilt
-        // deterministically (same inputs ⇒ same OTI / object_id) when the
-        // playlist returns to it, keeping peak memory at O(one chunk).
-        self.chunk_encoders[chunk_index] = None;
         let next_chunk = chunk_index + 1;
         if next_chunk < self.chunk_encoders.len() {
             self.ensure_chunk_encoder(next_chunk)?;
-            let k = self.chunk_encoders[next_chunk].as_ref().unwrap().source_symbol_count;
+            let k = self.chunk_encoders[next_chunk]
+                .as_ref()
+                .unwrap()
+                .source_symbol_count;
             let start = if self.epoch == 1 { 0 } else { k };
             let next_target = self.chunk_target_symbols(next_chunk);
+            self.retire_chunk(chunk_index);
             self.state = PlaylistState::ChunkLoop {
                 chunk_index: next_chunk,
                 root_sent: false,
@@ -609,14 +809,19 @@ impl Af2Sender {
                 symbols_target: next_target,
             };
         } else {
-            // Epoch finished: restart from Chunk 0 with fresh repair symbols
-            self.epoch += 1;
+            // Epoch finished: restart from Chunk 0 with fresh repair symbols.
+            // chunk_target_symbols depends on the epoch, so pass next_epoch
+            // explicitly instead of mutating self.epoch before the (fallible)
+            // staging is known to succeed.
+            let next_epoch = self.epoch + 1;
             self.ensure_chunk_encoder(0)?;
             let k = self.chunk_encoders[0].as_ref().unwrap().source_symbol_count;
             // Epoch 1 already sent every source symbol once; epoch ≥ 2 sends
             // only repair symbols the receiver has never seen (§9.2).
-            let start = if self.epoch == 1 { 0 } else { k };
-            let next_target = self.chunk_target_symbols(0);
+            let start = if next_epoch == 1 { 0 } else { k };
+            let next_target = self.chunk_target_symbols_at(0, next_epoch);
+            self.retire_chunk(chunk_index);
+            self.epoch = next_epoch;
             self.state = PlaylistState::ChunkLoop {
                 chunk_index: 0,
                 root_sent: false,
@@ -628,29 +833,57 @@ impl Af2Sender {
         Ok(())
     }
 
+    /// Free the finished chunk's encoder + cached packets — rebuilt
+    /// deterministically (same inputs ⇒ same OTI / object_id) when the
+    /// playlist returns to it, keeping peak memory at O(one chunk).
+    ///
+    /// The STAGED slot is deliberately kept: hosts prefetch the next epoch's
+    /// copy of a chunk while its current window is still live (essential for
+    /// single-chunk transfers, whose EVERY window boundary is an epoch wrap —
+    /// without the kept slot each wrap would stall on ChunkNotStaged). Memory
+    /// stays bounded: the slot is empty whenever the chunk's window is active
+    /// (the encoder build consumes it), so at most one prefetched chunk is
+    /// held beyond the live one.
+    fn retire_chunk(&mut self, chunk_index: usize) {
+        self.chunk_encoders[chunk_index] = None;
+    }
+
     /// Lazily construct the RaptorQ encoder for chunk `index` if not built yet.
     fn ensure_chunk_encoder(&mut self, index: usize) -> Result<(), SenderError> {
         if self.chunk_encoders[index].is_some() {
             return Ok(());
         }
         let t = self.config.symbol_size;
-        let start64 = u64::from(index as u32) * u64::from(self.config.chunk_raw_size);
-        let end64 = (start64 + u64::from(self.config.chunk_raw_size)).min(self.stream.len() as u64);
-        let raw = if start64 < self.stream.len() as u64 {
-            &self.stream[start64 as usize..end64 as usize]
+        // Streamed mode: the staged bytes ARE the encoded chunk (already
+        // validated against the manifest chunk table at stage time). The
+        // canonical raw never materializes here; the META's raw_hash comes
+        // straight from the table (no play-time decompression).
+        let (codec, encoded, raw_hash): (u8, Cow<'_, [u8]>, [u8; 32]) = if self.staged_mode {
+            let (codec, bytes) = self
+                .staged_chunks[index]
+                .take()
+                .ok_or(SenderError::ChunkNotStaged(index as u32))?;
+            (codec, Cow::Owned(bytes), self.chunk_hashes[index])
         } else {
-            &[]
-        };
-        let (codec, encoded): (u8, Cow<'_, [u8]>) = match &self.preencoded_chunks[index] {
-            // Balanced policy provisioned this chunk at prep time — no codec
-            // runs on the play path (the rAF/QR loop must never block on
-            // compression).
-            Some(PreencodedChunk::RawMarker) => (CODEC_RAW, Cow::Borrowed(raw)),
-            Some(PreencodedChunk::Encoded(c, bytes)) => (*c, Cow::Borrowed(bytes)),
-            None => {
-                let (c, e) = encode_chunk(raw);
-                (c, Cow::Owned(e))
-            }
+            let start64 = u64::from(index as u32) * u64::from(self.config.chunk_raw_size);
+            let end64 = (start64 + u64::from(self.config.chunk_raw_size)).min(self.stream.len() as u64);
+            let raw = if start64 < self.stream.len() as u64 {
+                &self.stream[start64 as usize..end64 as usize]
+            } else {
+                &[]
+            };
+            let (codec, encoded): (u8, Cow<'_, [u8]>) = match &self.preencoded_chunks[index] {
+                // Balanced policy provisioned this chunk at prep time — no codec
+                // runs on the play path (the rAF/QR loop must never block on
+                // compression).
+                Some(PreencodedChunk::RawMarker) => (CODEC_RAW, Cow::Borrowed(raw)),
+                Some(PreencodedChunk::Encoded(c, bytes)) => (*c, Cow::Borrowed(bytes)),
+                None => {
+                    let (c, e) = encode_chunk(raw);
+                    (c, Cow::Owned(e))
+                }
+            };
+            (codec, encoded, hash(raw))
         };
         let chunk_enc = Encoder::with_defaults(encoded.as_ref(), t as u16);
         let chunk_oti = chunk_enc.get_config().serialize();
@@ -673,7 +906,7 @@ impl Af2Sender {
             codec_id: codec,
             fec_id: FEC_ID_RAPTORQ,
             oti: chunk_meta_obj.oti_bytes,
-            raw_hash: hash(raw),
+            raw_hash,
             encoded_hash,
             extensions: vec![],
         };
@@ -712,12 +945,32 @@ impl Af2Sender {
     }
 
     fn chunk_target_symbols(&self, chunk_index: usize) -> u32 {
+        self.chunk_target_symbols_at(chunk_index, self.epoch)
+    }
+
+    fn chunk_target_symbols_at(&self, chunk_index: usize, epoch: u32) -> u32 {
         let k = self.chunk_encoders[chunk_index]
             .as_ref()
             .map(|e| e.source_symbol_count)
             .unwrap_or(1);
-        let redundancy = (k as u64 * self.config.redundancy_pct as u64 / 100) as u32;
-        k + redundancy.max(1)
+        let redundancy = (k as u64 * self.config.redundancy_pct as u64 / 100).max(1) as u32;
+        if epoch == 1 {
+            // Epoch 1: the source-symbol pass plus the configured redundancy.
+            k + redundancy
+        } else {
+            // Epoch ≥ 2 sends repair-only (start = k). The receiver holds
+            // exactly ONE chunk decoder and drops it (with every collected
+            // symbol — zero cache, §11 resource policy) the moment the next
+            // chunk's META arrives, so a chunk that missed more than the
+            // redundancy budget inside its epoch-1 window starts every later
+            // window FROM SCRATCH. A window carrying only `redundancy` fresh
+            // symbols could therefore never reach K again — a permanently
+            // starved chunk and an unfinishable transfer (observed as
+            // received/total climbing past 100% forever). Every later epoch
+            // must carry a full K-symbol budget of fresh repair ESI plus the
+            // same slack as epoch 1, so one watched window suffices to decode.
+            k.saturating_mul(2) + redundancy
+        }
     }
 
     fn get_manifest_symbol_frame(&self, symbol_index: u32) -> Result<Vec<u8>, SenderError> {
@@ -882,6 +1135,507 @@ mod tests {
     use super::*;
     use crate::id::{KIND_FILE, KIND_UTF8_TEXT};
     use crate::receiver::{Af2Receiver, IngestEvent};
+
+    #[test]
+    fn multi_chunk_transfer_completes_after_epoch1_window_loss() {
+        // Regression: the reported "63573/46016, never completes" multi-item
+        // bundle stall. Root cause: the receiver keeps ONE chunk decoder and
+        // drops it (zero symbol cache) when the next chunk's META arrives;
+        // pre-fix, epoch ≥ 2 windows carried only `redundancy` fresh repair
+        // symbols, so any chunk that missed more than the redundancy budget in
+        // its epoch-1 window could never gather K symbols again in any single
+        // later window — received_symbols kept climbing past total_symbols
+        // forever while the transfer never completed.
+        // Content must be INCOMPRESSIBLE (pseudorandom): compressible filler
+        // collapses each chunk's encoded size to a handful of symbols, which
+        // any epoch can trivially re-collect — real media files do not.
+        let mut seed = 0x9E3779B97F4A7C15u64;
+        let mut next_bytes = |n: usize| {
+            let mut v = Vec::with_capacity(n);
+            while v.len() < n {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                v.extend_from_slice(&seed.to_le_bytes());
+            }
+            v.truncate(n);
+            v
+        };
+        let items = vec![
+            (KIND_FILE, "a.bin".to_string(), next_bytes(1_200_000)),
+            (KIND_FILE, "b.bin".to_string(), next_bytes(1_200_000)),
+            (KIND_FILE, "c.bin".to_string(), next_bytes(1_200_000)),
+        ];
+        let config = SenderConfig {
+            symbol_size: 2400,
+            chunk_raw_size: 1 << 20,
+            redundancy_pct: 5,
+        };
+        let mut sender = Af2Sender::new(items, config).unwrap();
+        let mut receiver = Af2Receiver::new();
+        let mut chunk_count = 0usize;
+        let mut ready_chunks = std::collections::HashSet::new();
+        // Burst-loss window: drop EVERY symbol frame from the moment chunk 2's
+        // META binds until a chunk OUTSIDE {2, 3} is announced — a single
+        // camera-miss event spans two adjacent chunk windows. TWO starved
+        // chunks is the real deadlock shape: with one missing chunk the
+        // receiver's decoder survives into the next epoch (done chunks' METAs
+        // early-return and never replace it) and slowly re-collects, but two
+        // incomplete chunks destroy each other's decoder at every window
+        // boundary — each restarts from zero symbols forever.
+        let mut drop_window = false;
+        let mut burst_armed = false;
+        for _ in 0..12_000 {
+            let frame = sender.next_frame().unwrap();
+            if drop_window {
+                let parsed = Af2Frame::from_bytes(&frame).unwrap();
+                if parsed.frame_type == FrameType::ObjectMeta {
+                    if let Ok(rec) = ObjectMetaRecord::parse(&parsed.body) {
+                        if rec.role == ROLE_CHUNK
+                            && rec.object_index != 2
+                            && rec.object_index != 3
+                        {
+                            drop_window = false;
+                        }
+                    }
+                } else if parsed.frame_type == FrameType::Symbol {
+                    continue;
+                }
+            }
+            match receiver.ingest(&frame).unwrap() {
+                IngestEvent::ManifestReady => {
+                    chunk_count = receiver.manifest().unwrap().chunk_count as usize;
+                }
+                IngestEvent::MetaBound { role, object_index } if role == ROLE_CHUNK => {
+                    if object_index == 2 && !burst_armed {
+                        burst_armed = true;
+                        drop_window = true;
+                    }
+                }
+                IngestEvent::ChunkReady { index, .. } => {
+                    ready_chunks.insert(index as usize);
+                }
+                _ => {}
+            }
+            if chunk_count > 0 && ready_chunks.len() == chunk_count {
+                break;
+            }
+        }
+        assert!(chunk_count > 3, "scenario must span at least 4 chunks");
+        assert!(
+            ready_chunks.contains(&2) && ready_chunks.contains(&3),
+            "the burst-loss chunks must eventually complete (ready: {:?}/{chunk_count})",
+            {
+                let mut v: Vec<_> = ready_chunks.into_iter().collect();
+                v.sort_unstable();
+                v
+            }
+        );
+    }
+
+    #[test]
+    fn streamed_sender_matches_buffered_frames() {
+        // The streamed (bounded-memory) construction must be wire-identical
+        // to the buffered one: same manifest, same chunk metas, same symbol
+        // frames — including across an epoch boundary where every chunk is
+        // retired and re-staged from scratch.
+        let mut seed = 0x0DDB_EA07_5C0F_1A33u64;
+        let mut next_bytes = |n: usize| {
+            let mut v = Vec::with_capacity(n);
+            while v.len() < n {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                v.extend_from_slice(&seed.to_le_bytes());
+            }
+            v.truncate(n);
+            v
+        };
+        let items = vec![
+            (KIND_FILE, "a.bin".to_string(), next_bytes(300_000)),
+            (KIND_UTF8_TEXT, "b.txt".to_string(), b"streamed text entry".to_vec()),
+        ];
+        let config = SenderConfig {
+            symbol_size: 512,
+            chunk_raw_size: 1 << 20,
+            redundancy_pct: 5,
+        };
+        let mut buffered = Af2Sender::new(items.clone(), config.clone()).unwrap();
+        let (manifest, _) = crate::manifest::Manifest::parse(buffered.manifest_bytes()).unwrap();
+        let mut streamed = Af2Sender::from_manifest_streamed(manifest, config).unwrap();
+
+        // Canonical stream for RAW staging, assembled exactly like the
+        // manifest orders it (NFC path bytes, non-directory entries only).
+        let mut sorted = items;
+        sorted.sort_by(|a, b| a.1.as_bytes().cmp(b.1.as_bytes()));
+        let mut stream = Vec::new();
+        for (kind, _, content) in &sorted {
+            if *kind != crate::id::KIND_DIRECTORY {
+                stream.extend_from_slice(content);
+            }
+        }
+        let crs = 1usize << 20;
+        let stage = |s: &mut Af2Sender, index: u32| {
+            let start = index as usize * crs;
+            let end = ((index as usize + 1) * crs).min(stream.len());
+            s.stage_chunk(index, CODEC_RAW, stream[start..end].to_vec())
+                .unwrap();
+        };
+        let next = |s: &mut Af2Sender| -> Vec<u8> {
+            loop {
+                match s.next_frame() {
+                    Ok(f) => return f,
+                    Err(SenderError::ChunkNotStaged(i)) => stage(s, i),
+                    Err(e) => panic!("unexpected sender error: {e}"),
+                }
+            }
+        };
+        for frame_no in 0..4_000 {
+            assert_eq!(
+                buffered.next_frame().unwrap(),
+                next(&mut streamed),
+                "streamed frame {frame_no} differs from buffered"
+            );
+        }
+    }
+
+    #[test]
+    fn streamed_sender_fails_closed_on_unstaged_and_bad_hashes() {
+        let items = vec![(KIND_FILE, "a.bin".to_string(), vec![0x5Au8; 4096])];
+        let config = SenderConfig {
+            symbol_size: 512,
+            ..SenderConfig::default()
+        };
+        let buffered = Af2Sender::new(items, config.clone()).unwrap();
+        let (manifest, _) = crate::manifest::Manifest::parse(buffered.manifest_bytes()).unwrap();
+        let mut streamed = Af2Sender::from_manifest_streamed(manifest, config).unwrap();
+
+        // Bootstrap (ROOT/MANIFEST frames) flows without any chunk staged…
+        let mut saw_chunk_zero = false;
+        for _ in 0..80 {
+            match streamed.next_frame() {
+                Err(SenderError::ChunkNotStaged(0)) => {
+                    saw_chunk_zero = true;
+                    break;
+                }
+                Ok(_) => {}
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+        assert!(saw_chunk_zero, "must fail closed with ChunkNotStaged(0)");
+
+        // …and staging WRONG bytes is rejected against the manifest table.
+        let bad = vec![0u8; 4096];
+        assert!(matches!(
+            streamed.stage_chunk(0, CODEC_RAW, bad),
+            Err(SenderError::Config(_))
+        ));
+        // Correct RAW bytes are accepted and playback proceeds — across an
+        // epoch boundary (the tiny chunk's window is ~15 frames), which
+        // retires the encoder and requires the documented stage-and-retry.
+        streamed
+            .stage_chunk(0, CODEC_RAW, vec![0x5Au8; 4096])
+            .unwrap();
+        for frame_no in 0..40 {
+            loop {
+                match streamed.next_frame() {
+                    Ok(_) => break,
+                    Err(SenderError::ChunkNotStaged(0)) => {
+                        streamed
+                            .stage_chunk(0, CODEC_RAW, vec![0x5Au8; 4096])
+                            .unwrap()
+                    }
+                    Err(e) => panic!("frame {frame_no}: unexpected error {e}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn streamed_sender_proactive_staging_never_stalls() {
+        // Mirrors the web ChunkStager exactly: stage the next chunk with
+        // wraparound every tick, seed chunk 0 before bootstrap ends. A missed
+        // prefetch surfaces as ChunkNotStaged — on the wire that is a
+        // periodic playback stall (frozen QR frame, receiver rate drops to
+        // zero until the stage completes). Zero stalls must hold for the
+        // single-chunk case, whose EVERY window boundary is an epoch wrap,
+        // and for multi-chunk transfers.
+        let cases: &[usize] = &[1, 3]; // chunk counts (via content sizing)
+        for &case in cases {
+            // 3 × 900 KB at 1 MiB chunks ⇒ 3 chunks; 1 × 900 KB ⇒ 1 chunk.
+            // Deliberately repetitive bytes (zstd collapses them) keep each
+            // window to a handful of symbols, so the 6000-frame budget walks
+            // through MANY window/epoch boundaries — exactly the transitions
+            // a missed prefetch would stall on.
+            let per = 900_000;
+            let mut items = Vec::new();
+            for i in 0..case {
+                items.push((
+                    KIND_FILE,
+                    format!("f{i}.bin"),
+                    (0..per).map(|j| ((i * 37 + j * 31) & 0xff) as u8).collect::<Vec<u8>>(),
+                ));
+            }
+            let config = SenderConfig {
+                symbol_size: 2400,
+                chunk_raw_size: 1 << 20,
+                redundancy_pct: 5,
+            };
+            let mut buffered = Af2Sender::new(items.clone(), config.clone()).unwrap();
+            let (manifest, _) =
+                crate::manifest::Manifest::parse(buffered.manifest_bytes()).unwrap();
+            let chunk_count = manifest.chunk_count as usize;
+            assert_eq!(chunk_count, case, "case setup must produce the wanted chunk count");
+            let mut streamed = Af2Sender::from_manifest_streamed(manifest, config).unwrap();
+
+            let mut sorted = items;
+            sorted.sort_by(|a, b| a.1.as_bytes().cmp(b.1.as_bytes()));
+            let mut stream = Vec::new();
+            for (kind, _, content) in &sorted {
+                if *kind != crate::id::KIND_DIRECTORY {
+                    stream.extend_from_slice(content);
+                }
+            }
+            let crs = 1usize << 20;
+            let stage = |s: &mut Af2Sender, index: u32| {
+                if index as usize >= chunk_count {
+                    return; // mirrors the JS stager's out-of-range guard
+                }
+                let start = index as usize * crs;
+                let end = ((index as usize + 1) * crs).min(stream.len());
+                let _ = s.stage_chunk(index, CODEC_RAW, stream[start..end].to_vec());
+            };
+
+            let mut stalls = 0usize;
+            let mut frames = 0usize;
+            for _ in 0..6_000 {
+                // ChunkStager.tick(): bootstrap seeds 0/1; each window tick
+                // arms the WRAPPED next chunk (== current for single-chunk).
+                match streamed.current_chunk_index() {
+                    Some(cur) => stage(&mut streamed, (cur + 1) % chunk_count as u32),
+                    None => {
+                        stage(&mut streamed, 0);
+                        stage(&mut streamed, 1);
+                    }
+                }
+                match streamed.next_frame() {
+                    Ok(_) => frames += 1,
+                    Err(SenderError::ChunkNotStaged(_)) => stalls += 1,
+                    Err(e) => panic!("case {case}: unexpected error {e}"),
+                }
+                let _ = buffered.next_frame().unwrap();
+            }
+            assert!(frames > 5_000, "case {case}: playback must progress");
+            assert_eq!(
+                stalls, 0,
+                "case {case}: proactive staging must cover every window/epoch boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn streamed_sender_multi_frame_batches_match_buffered_across_epochs() {
+        // Reproduces, at the core level, the exact host playback shape:
+        // `next_qr_scratch(4)` pulls up to 4 frames per screen tick, keeps a
+        // mid-batch ChunkNotStaged as a PARTIAL batch (frames already pulled
+        // stay rendered; the marker defers to the next tick's first frame),
+        // and the ChunkStager arms the WRAPPED next chunk every tick. Two
+        // audit bugs are locked out by the sequence-equality + zero-stall
+        // assertions:
+        //   1. swallowing a partially-generated batch would consume fountain
+        //      state (symbol_index / repair ESI) without displaying it — the
+        //      streamed sequence would then skip frames vs the buffered one;
+        //   2. a prefetch that misses the epoch wrap (or the single-chunk
+        //      case, where every boundary IS a wrap) surfaces as a
+        //      first-frame ChunkNotStaged — a visible playback stall.
+        // Two host scenarios per shape:
+        //  - proactive: the real ChunkStager arms the WRAPPED next chunk every
+        //    tick — zero not-staged events are tolerated (each would be a
+        //    visible playback freeze);
+        //  - reactive: prefetch never lands in time (slow disk) and staging
+        //    happens strictly on the not-staged marker — every window
+        //    boundary walks the PARTIAL-BATCH path, and the sequence must
+        //    still stay byte-identical (this is the scenario where the old
+        //    "swallow the partial batch" bug dropped fountain frames).
+        for chunk_count in [1usize, 2] {
+            for proactive in [true, false] {
+                let per = 900_000;
+                let mut items = Vec::new();
+                for i in 0..chunk_count {
+                    items.push((
+                        KIND_FILE,
+                        format!("f{i}.bin"),
+                        (0..per).map(|j| ((i * 37 + j * 31) & 0xff) as u8).collect::<Vec<u8>>(),
+                    ));
+                }
+                let config = SenderConfig {
+                    symbol_size: 2400,
+                    chunk_raw_size: 1 << 20,
+                    redundancy_pct: 5,
+                };
+                let mut buffered = Af2Sender::new(items.clone(), config.clone()).unwrap();
+                let (manifest, _) =
+                    crate::manifest::Manifest::parse(buffered.manifest_bytes()).unwrap();
+                assert_eq!(manifest.chunk_count as usize, chunk_count, "case setup");
+                let mut streamed = Af2Sender::from_manifest_streamed(manifest, config).unwrap();
+
+                let mut sorted = items;
+                sorted.sort_by(|a, b| a.1.as_bytes().cmp(b.1.as_bytes()));
+                let mut stream = Vec::new();
+                for (kind, _, content) in &sorted {
+                    if *kind != crate::id::KIND_DIRECTORY {
+                        stream.extend_from_slice(content);
+                    }
+                }
+                let crs = 1usize << 20;
+                // Stage FAITHFULLY: run the same lazy codec decision the
+                // buffered sender's rebuild will make (encode_chunk), so the
+                // rebuilt chunk META — codec_id, encoded_hash, OTI, K —
+                // matches byte-for-byte.
+                let stage = |s: &mut Af2Sender, index: u32| {
+                    if index as usize >= chunk_count {
+                        return;
+                    }
+                    let start = index as usize * crs;
+                    let end = ((index as usize + 1) * crs).min(stream.len());
+                    let (codec, encoded) = encode_chunk(&stream[start..end]);
+                    let _ = s.stage_chunk(index, codec, encoded);
+                };
+
+                let mut buffered_seq: Vec<Vec<u8>> = Vec::new();
+                let mut streamed_seq: Vec<Vec<u8>> = Vec::new();
+                let mut verified = 0usize;
+                let mut not_staged_events = 0usize;
+                // 600 ticks × ≤4 frames ≈ 2400 frames; the compressible
+                // content makes windows a handful of symbols, so this walks
+                // dozens of epochs — far past the "3 consecutive epochs" bar.
+                for _tick in 0..600 {
+                    if proactive {
+                        match streamed.current_chunk_index() {
+                            Some(cur) => stage(&mut streamed, (cur + 1) % chunk_count as u32),
+                            None => {
+                                stage(&mut streamed, 0);
+                                stage(&mut streamed, 1);
+                            }
+                        }
+                    }
+                    // next_qr_scratch(4) equivalent with the partial-batch
+                    // rule: a mid-batch not-staged keeps the already-pulled
+                    // frames and defers the marker to the next tick.
+                    let mut produced = 0usize;
+                    while produced < 4 {
+                        match streamed.next_frame() {
+                            Ok(f) => {
+                                streamed_seq.push(f);
+                                produced += 1;
+                            }
+                            Err(SenderError::ChunkNotStaged(i)) => {
+                                not_staged_events += 1;
+                                if produced == 0 {
+                                    stage(&mut streamed, i);
+                                    continue;
+                                }
+                                break; // partial batch: keep frames, defer marker
+                            }
+                            Err(e) => panic!("case {chunk_count}: unexpected error {e}"),
+                        }
+                    }
+                    for _ in 0..4 {
+                        buffered_seq.push(buffered.next_frame().unwrap());
+                    }
+                    // Incremental prefix check: streamed may lag by a partial
+                    // batch but must never skip, duplicate or alter a frame.
+                    assert!(
+                        streamed_seq.len() <= buffered_seq.len(),
+                        "case {chunk_count}/{proactive}: streamed ran ahead of the reference"
+                    );
+                    for (i, f) in streamed_seq[verified..].iter().enumerate() {
+                        assert_eq!(
+                            f, &buffered_seq[verified + i],
+                            "case {chunk_count}/{proactive}: frame {} diverges from the buffered reference",
+                            verified + i
+                        );
+                    }
+                    verified = streamed_seq.len();
+                }
+                // Reactive staging pays a partial-batch + retry tick at every
+                // window boundary, so its throughput floor is lower — the
+                // sequence equality above is the real invariant.
+                let floor = if proactive { 2_000 } else { 1_200 };
+                assert!(
+                    verified > floor,
+                    "case {chunk_count}/{proactive}: playback must progress (verified {verified})"
+                );
+                if proactive {
+                    assert_eq!(
+                        not_staged_events, 0,
+                        "case {chunk_count}: proactive arming must cover every window/epoch boundary"
+                    );
+                } else {
+                    assert!(
+                        not_staged_events > 0,
+                        "case {chunk_count}: reactive scenario must actually exercise the partial-batch path"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn streamed_sender_end_to_end() {
+        let items = vec![
+            (KIND_FILE, "a.bin".to_string(), vec![0x77u8; 250_000]),
+            (KIND_FILE, "b.bin".to_string(), b"second entry payload".to_vec()),
+        ];
+        let config = SenderConfig {
+            symbol_size: 512,
+            redundancy_pct: 5,
+            ..SenderConfig::default()
+        };
+        let buffered = Af2Sender::new(items.clone(), config.clone()).unwrap();
+        let (manifest, _) = crate::manifest::Manifest::parse(buffered.manifest_bytes()).unwrap();
+        let chunk_count = manifest.chunk_count as usize;
+        let mut streamed = Af2Sender::from_manifest_streamed(manifest, config).unwrap();
+
+        let mut sorted = items;
+        sorted.sort_by(|a, b| a.1.as_bytes().cmp(b.1.as_bytes()));
+        let mut stream = Vec::new();
+        for (kind, _, content) in &sorted {
+            if *kind != crate::id::KIND_DIRECTORY {
+                stream.extend_from_slice(content);
+            }
+        }
+        let crs = 8 * 1024 * 1024usize;
+        let stage = |s: &mut Af2Sender, index: u32| {
+            let start = index as usize * crs;
+            let end = ((index as usize + 1) * crs).min(stream.len());
+            s.stage_chunk(index, CODEC_RAW, stream[start..end].to_vec())
+                .unwrap();
+        };
+
+        let mut receiver = Af2Receiver::new();
+        let mut ready = std::collections::HashSet::new();
+        for _ in 0..8_000 {
+            let frame = loop {
+                match streamed.next_frame() {
+                    Ok(f) => break f,
+                    Err(SenderError::ChunkNotStaged(i)) => stage(&mut streamed, i),
+                    Err(e) => panic!("unexpected sender error: {e}"),
+                }
+            };
+            if let IngestEvent::ChunkReady { index, .. } = receiver.ingest(&frame).unwrap() {
+                ready.insert(index);
+                if ready.len() == chunk_count {
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            ready.len(),
+            chunk_count,
+            "streamed transfer must complete end-to-end"
+        );
+    }
 
     #[test]
     fn sender_receiver_end_to_end_playlist() {

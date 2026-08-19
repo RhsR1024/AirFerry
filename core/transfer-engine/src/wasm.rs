@@ -12,7 +12,7 @@
 
 use crate::receiver::ReceiverSession;
 use af2::{
-    plan_chunks as af2_plan_chunks, Af2Sender, PreencodedChunk, SenderConfig,
+    plan_chunks as af2_plan_chunks, Af2Sender, PreencodedChunk, SenderConfig, SenderError,
 };
 use wasm_bindgen::prelude::*;
 
@@ -24,7 +24,7 @@ const QR_SCRATCH_BYTES: usize =
 
 #[wasm_bindgen]
 pub struct Blake3Wasm {
-    bytes: Vec<u8>,
+    inner: af2::id::Blake3Hasher,
 }
 
 impl Default for Blake3Wasm {
@@ -37,15 +37,19 @@ impl Default for Blake3Wasm {
 impl Blake3Wasm {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Self {
-        Self { bytes: Vec::new() }
+        Self {
+            inner: af2::id::new_hasher(),
+        }
     }
 
+    /// Feed bytes incrementally — only the hasher's internal state is held
+    /// (~1 KiB), never the whole input (§9.3 single-pass preprocessing).
     pub fn update(&mut self, bytes: &[u8]) {
-        self.bytes.extend_from_slice(bytes);
+        self.inner.update(bytes);
     }
 
     pub fn digest(&self) -> Vec<u8> {
-        af2::id::hash(&self.bytes).to_vec()
+        self.inner.finalize().as_bytes().to_vec()
     }
 }
 
@@ -56,12 +60,26 @@ pub struct SenderBuilderWasm {
     /// codec_id, bytes)`; `codec_id == 0 && bytes.is_empty()` is the RAW
     /// marker ("compression cannot win — skip play-time attempts").
     preencoded: Vec<(u32, u8, Vec<u8>)>,
+    /// Hash-only entry metadata for the streamed (bounded-memory) build:
+    /// `(kind, path, content_size, BLAKE3-256)`. The content bytes never
+    /// cross into the core at build time — only at play time, chunk by
+    /// chunk, via `SenderSessionWasm::stage_chunk`.
+    metas: Vec<(u8, String, u64, [u8; 32])>,
+    chunk_hashes: Vec<[u8; 32]>,
 }
 
 impl Default for SenderBuilderWasm {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn hash32(bytes: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    if bytes.len() == 32 {
+        out.copy_from_slice(bytes);
+    }
+    out
 }
 
 #[wasm_bindgen]
@@ -71,11 +89,27 @@ impl SenderBuilderWasm {
         Self {
             items: Vec::new(),
             preencoded: Vec::new(),
+            metas: Vec::new(),
+            chunk_hashes: Vec::new(),
         }
     }
 
     pub fn add_entry(&mut self, kind: u8, path: &str, content: &[u8]) {
         self.items.push((kind, path.to_string(), content.to_vec()));
+    }
+
+    /// Streamed-build entry: kind + path + exact content size + BLAKE3-256 of
+    /// the content (computed by the host with [`Blake3Wasm`] while streaming).
+    /// `size` is an f64 only because JS numbers are doubles — values up to
+    /// 2^53 (well past the 4 TiB wire ceiling) round-trip exactly.
+    pub fn add_meta(&mut self, kind: u8, path: &str, size: f64, content_hash: &[u8]) {
+        self.metas
+            .push((kind, path.to_string(), size.max(0.0) as u64, hash32(content_hash)));
+    }
+
+    /// One BLAKE3-256 per canonical chunk, position-indexed (streamed build).
+    pub fn add_chunk_hash(&mut self, chunk_hash: &[u8]) {
+        self.chunk_hashes.push(hash32(chunk_hash));
     }
 
     /// Provision one pre-encoded chunk (see [`af2::chunk::encode_chunk_balanced`]).
@@ -143,6 +177,62 @@ impl SenderBuilderWasm {
             .map_err(|e| JsValue::from_str(&format!("AF2 cached sender build failed: {e}")))?;
         Ok(SenderSessionWasm::from_inner(inner))
     }
+
+    /// Streamed (bounded-memory) build from hash-only metadata: the manifest
+    /// is assembled from [`Self::add_meta`] entries + [`Self::add_chunk_hash`]
+    /// digests and the canonical stream NEVER materializes inside the core.
+    /// Each chunk must be provided at play time via
+    /// [`SenderSessionWasm::stage_chunk`]; `next_qr_scratch` rejects with the
+    /// marker `AF2_CHUNK_NOT_STAGED:<index>` when the playlist reaches an
+    /// unstaged chunk (stage it and retry — failed calls have no side
+    /// effects). Re-staging in later epochs must supply byte-identical
+    /// encoded bytes (deterministic `encode_chunk_balanced`) or the chunk's
+    /// object_id changes and receivers drop every symbol.
+    pub fn build_streamed(
+        mut self,
+        symbol_size: u32,
+        chunk_raw_size: u32,
+        redundancy_pct: u8,
+    ) -> Result<SenderSessionWasm, JsValue> {
+        let manifest = af2::manifest::build_manifest_from_hashes(
+            self.metas.drain(..),
+            chunk_raw_size,
+            std::mem::take(&mut self.chunk_hashes),
+        )
+        .map_err(|e| JsValue::from_str(&format!("AF2 streamed manifest build failed: {e}")))?;
+        let config = SenderConfig {
+            symbol_size: symbol_size as usize,
+            chunk_raw_size,
+            redundancy_pct,
+        };
+        let inner = Af2Sender::from_manifest_streamed(manifest, config)
+            .map_err(|e| JsValue::from_str(&format!("AF2 streamed sender build failed: {e}")))?;
+        Ok(SenderSessionWasm::from_inner(inner))
+    }
+
+    /// §9.3 resend-cache variant of [`Self::build_streamed`]: trust a
+    /// previously computed encoded Manifest (hex) and skip the manifest
+    /// assembly. Chunks are still staged at play time exactly the same way.
+    pub fn build_streamed_cached(
+        self,
+        manifest_hex: &str,
+        symbol_size: u32,
+        chunk_raw_size: u32,
+        redundancy_pct: u8,
+    ) -> Result<SenderSessionWasm, JsValue> {
+        let bytes = hex_decode(manifest_hex)
+            .map_err(|e| JsValue::from_str(&format!("AF2 cached manifest hex invalid: {e}")))?;
+        let (manifest, _) = af2::manifest::Manifest::parse(&bytes)
+            .map_err(|e| JsValue::from_str(&format!("AF2 cached manifest invalid: {e}")))?;
+        let config = SenderConfig {
+            symbol_size: symbol_size as usize,
+            chunk_raw_size,
+            redundancy_pct,
+        };
+        let inner = Af2Sender::from_manifest_streamed(manifest, config)
+            .map_err(|e| JsValue::from_str(&format!("AF2 streamed sender build failed: {e}")))?;
+        Ok(SenderSessionWasm::from_inner(inner))
+    }
 }
 
 #[wasm_bindgen]
@@ -198,10 +288,28 @@ impl SenderSessionWasm {
         let mut pos = 4usize;
         let mut produced = 0u32;
         for _ in 0..n {
-            let frame_bytes = self
-                .inner
-                .next_frame()
-                .map_err(|e| JsValue::from_str(&format!("AF2 frame generation failed: {e}")))?;
+            let frame_bytes = match self.inner.next_frame() {
+                Ok(f) => f,
+                Err(SenderError::ChunkNotStaged(index)) => {
+                    // Mid-batch not-staged: the frames already pulled in this
+                    // batch are committed (the transactional sender means the
+                    // FAILED call alone has no side effects) and MUST still be
+                    // rendered. Returning the partial batch defers the marker
+                    // to the next call, where produced == 0 turns it into the
+                    // host's stage-and-retry signal. Failing the whole batch
+                    // here would silently swallow every frame it contained —
+                    // in 4-code mode a chunk boundary lands mid-batch
+                    // routinely, so those symbols would never reach the
+                    // receiver.
+                    if produced == 0 {
+                        return Err(JsValue::from_str(&format!("AF2_CHUNK_NOT_STAGED:{index}")));
+                    }
+                    break;
+                }
+                Err(e) => {
+                    return Err(JsValue::from_str(&format!("AF2 frame generation failed: {e}")))
+                }
+            };
             self.frames_emitted += 1;
             self.bytes_emitted += frame_bytes.len() as u64;
             let matrix = qr_protocol::qr_render::encode(&frame_bytes)
@@ -230,6 +338,29 @@ impl SenderSessionWasm {
     /// consume it immediately, never cache it across frames.
     pub fn qr_scratch_view(&self) -> js_sys::Uint8Array {
         unsafe { js_sys::Uint8Array::view(&self.qr_scratch) }
+    }
+
+    /// Provide one chunk's encoded bytes for a streamed sender (see
+    /// [`SenderBuilderWasm::build_streamed`]). Validated fail-closed against
+    /// the manifest chunk hash table.
+    pub fn stage_chunk(&mut self, index: u32, codec_id: u8, bytes: &[u8]) -> Result<(), JsValue> {
+        self.inner
+            .stage_chunk(index, codec_id, bytes.to_vec())
+            .map_err(|e| JsValue::from_str(&format!("AF2 stage_chunk failed: {e}")))
+    }
+
+    /// Playlist position hint: `Some(chunk)` once playback is inside a
+    /// chunk window (`-1` during bootstrap). Hosts use it to prefetch the
+    /// next chunk before `next_qr_scratch` hits the NOT_STAGED marker.
+    pub fn current_chunk_index(&self) -> i32 {
+        self.inner.current_chunk_index().map(|i| i as i32).unwrap_or(-1)
+    }
+
+    /// 1-based broadcast epoch. Paired with `current_chunk_index` this
+    /// uniquely identifies the active window (a single-chunk transfer keeps
+    /// the same chunk index across every epoch wrap).
+    pub fn epoch(&self) -> u32 {
+        self.inner.epoch()
     }
 }
 
