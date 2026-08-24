@@ -108,13 +108,16 @@ jobs:
         with:
           version: 3.1.64
 
-      # cmake 增量缓存：zxing-c++ 的 FetchContent 下载与编译产物都在
+      # cmake 增量缓存：zxing-c++ 的源码下载与编译产物都在
       # build-wasm/ 下，命中时只做增量链接（计划 B5 的 fastzxing 缓存要求）。
+      # key 只哈希顶层源文件（`*` 不跨目录）：缓存保存在 job 结束时重新求值
+      # key，此时 build-wasm 已存在——`**` 会把整个构建树（上万文件）卷进
+      # hashFiles，超出其内部上限并让 web job 在 Post Cache 步骤失败。
       - name: Cache FAST ZXing build tree
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: core/zxing-decoder/build-wasm
-          key: fastzxing-${{ runner.os }}-emsdk3.1.64-${{ hashFiles('core/zxing-decoder/**') }}
+          key: fastzxing-${{ runner.os }}-emsdk3.1.64-${{ hashFiles('core/zxing-decoder/*') }}
 
       - name: Build FAST ZXing-C++ WASM
         run: ./scripts/build-fastzxing.sh
