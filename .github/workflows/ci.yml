@@ -110,14 +110,19 @@ jobs:
 
       # cmake 增量缓存：zxing-c++ 的源码下载与编译产物都在
       # build-wasm/ 下，命中时只做增量链接（计划 B5 的 fastzxing 缓存要求）。
-      # key 只哈希顶层源文件（`*` 不跨目录）：缓存保存在 job 结束时重新求值
-      # key，此时 build-wasm 已存在——`**` 会把整个构建树（上万文件）卷进
-      # hashFiles，超出其内部上限并让 web job 在 Post Cache 步骤失败。
+      # key 刻意不含 hashFiles：actions/cache 的保存（Post）阶段会在构建后
+      # 重新求值 key，此时 build-wasm 已存在——hashFiles 的全工作区遍历会
+      # 撞上 CMake/emsdk 构建树中的符号链接，直接报 "Fail to hash files
+      # under directory" 并让 web job 失败（`**` 与 `*` 两种模式均复现）。
+      # 改用 run_number 滚动键 + 前缀回退：每次运行保存新条目，恢复时取
+      # 最近一条做增量链接；源码变更的正确性由构建脚本自身的指纹校验兜底。
       - name: Cache FAST ZXing build tree
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: core/zxing-decoder/build-wasm
-          key: fastzxing-${{ runner.os }}-emsdk3.1.64-${{ hashFiles('core/zxing-decoder/*') }}
+          key: fastzxing-${{ runner.os }}-emsdk3.1.64-v2-${{ github.run_number }}
+          restore-keys: |
+            fastzxing-${{ runner.os }}-emsdk3.1.64-v2-
 
       - name: Build FAST ZXing-C++ WASM
         run: ./scripts/build-fastzxing.sh
