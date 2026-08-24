@@ -25,26 +25,24 @@ set -euo pipefail
 #   airferry-sender-web-v<VER>.zip              网页发送端静态站点
 #   airferry-receiver-web-v<VER>.zip            网页接收端静态站点（receiver.html）
 #   airferry-sender-web-standalone-v<VER>.html  网页发送端单文件版（双击即用，file:// 可运行）
-#   airferry-extension.pem                      Chrome 签名私钥（须预先配置）
 #
-# ⚠️ 上传 Release 切勿用裸 `gh release upload ... dist/*`：dist/ 同时存放
-#   airferry-extension.pem 与 airferry-release.keystore，裸通配会把密钥一并
-#   上传造成外泄。始终用 `$(./scripts/build-all.sh dist-upload-list)` 取扩展名
-#   白名单清单（仅 .apk/.zip/.crx/.xpi/.html，物理上排除了密钥）。
+# 签名输入必须位于 AIRFERRY_SIGNING_DIR（默认 .airferry-signing/），绝不
+# 放入 dist/。发布清单仍使用扩展名白名单，形成第二道防误传门禁。
 #
 # 版本号规范：
-#   • 唯一来源：apps/web/package.json 的 version（read_version() 读取），
-#     扩展 manifest 同步；改版本只改这一处。
+#   • 唯一来源：根 Cargo.toml [workspace.package].version；打包通过
+#     scripts/version.mjs 读取，其他版本位点由 version gate 校验同步。
 #   • 产物统一命名 airferry-<端>-<平台>-v<VER>.<ext>，VER 即该来源版本号。
 #   • 手动同步项（无自动派生，改版本时须同步）：
 #       - apps/scanner/app/build.gradle.kts  versionCode/versionName
 #       - apps/web/package.json               version
-#       - apps/windows/.../AssemblyInfo       版本
-#   • Android versionCode 需随版本递增（1.2.0 → 14），versionName 与 VER 一致。
+#       - apps/windows/.../AirFerry.Windows.csproj  <Version>
+#   • Android versionCode 需随版本递增，versionName 与 VER 一致。
 # ====================================================================
 
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
+SIGNING_DIR="${AIRFERRY_SIGNING_DIR:-$ROOT/.airferry-signing}"
 
 # 颜色输出
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
@@ -55,11 +53,15 @@ error() { echo -e "${RED}[✗]${NC} $1"; exit 1; }
 # 目标列表
 TARGET="${1:-all}"
 
-# 从 apps/web/package.json 读取版本号（与扩展 manifest.version 同源）。
+# 从根 Cargo.toml 的版本事实源读取，避免打包脚本依赖任一镜像位点。
 read_version() {
-  node -e "console.log(require('$ROOT/apps/web/package.json').version)"
+  node "$ROOT/scripts/version.mjs" print
 }
 VER="$(read_version)"
+# Every entry point (including direct `dist`) fails before building/packaging
+# when a platform mirror drifted from the root version fact source.
+node "$ROOT/scripts/version.mjs" check >/dev/null || \
+  error "版本位点不一致；请先运行 node scripts/version.mjs check 查看详情"
 
 # Chrome 二进制：允许显式 CHROME_BIN 覆盖，并自动探测 macOS/Linux 常见路径。
 # 普通 `dist` 可以在无签名环境只产 zip；`release` 必须 fail-closed 产出 CRX。
@@ -152,7 +154,7 @@ build_sender() {
 build_scanner() {
   info "构建 Android 扫码端 ..."
   [[ ! -f "$ROOT/apps/scanner/keystore.properties" ]] || chmod 600 "$ROOT/apps/scanner/keystore.properties"
-  [[ ! -f "$ROOT/dist/airferry-release.keystore" ]] || chmod 600 "$ROOT/dist/airferry-release.keystore"
+  [[ ! -f "$SIGNING_DIR/airferry-release.keystore" ]] || chmod 600 "$SIGNING_DIR/airferry-release.keystore"
 
   # 设置 Android SDK / NDK 环境变量（cargo-ndk 需要 ANDROID_NDK_HOME）。
   # 优先使用用户已设的值，否则按常见路径自动探测。
@@ -254,7 +256,7 @@ build_web() {
   elif [[ -f "$ROOT/apps/web/src/fastzxing/airferry_zxing.js" && -f "$ROOT/apps/web/src/fastzxing/airferry_zxing.wasm" ]]; then
     info "复用现有 FAST ZXing-C++ 缓存产物 (airferry_zxing.js/.wasm)"
   else
-    error "未找到 emcc（Emscripten），且缺失缓存产物。请安装 Emscripten 3.1.64 后运行: ./scripts/build-fastzxing.sh"
+    error "未找到 emcc（Emscripten），且缺失缓存产物。请安装 Emscripten 3.1.64+ 后运行: ./scripts/build-fastzxing.sh"
     exit 1
   fi
 
@@ -290,7 +292,7 @@ build_web() {
 pack_chrome_crx() {
   local prod_dir="$1"   # 如 chrome-mv3-prod
   local plat="${prod_dir%-prod}"   # chrome-mv3
-  local key="$ROOT/dist/airferry-extension.pem"
+  local key="$SIGNING_DIR/airferry-extension.pem"
 
   if ! detect_chrome_bin; then
     # 与 verify-dist.mjs 对齐：签名私钥存在本身就是签名意图，dist 模式也
@@ -333,7 +335,7 @@ pack_chrome_crx() {
 pack_dist() {
   info "打包产物到 dist/（版本 v${VER}）..."
   mkdir -p "$ROOT/dist"
-  # 清掉旧产物，避免新旧版本/命名混留（pem / keystore 不动）。
+  # 清掉旧产物，避免新旧版本/命名混留。签名输入不在 dist/。
   rm -f "$ROOT/dist"/airferry-receiver-android-*.apk \
         "$ROOT/dist"/airferry-android-*.apk \
         "$ROOT/dist"/airferry-receiver-windows-*.zip \
@@ -365,8 +367,24 @@ pack_dist() {
     win_publish="$ROOT/apps/windows/AirFerry.Windows/bin/x64/Release/net8.0-windows/publish"
   fi
   if [[ -d "$win_publish" ]]; then
-    ( cd "$win_publish" && zip -r -q -X "$ROOT/dist/airferry-receiver-windows-x64-v${VER}.zip" . )
-    info "Windows 接收端 → dist/airferry-receiver-windows-x64-v${VER}.zip"
+    case "$(uname -s)" in
+      MINGW*|MSYS*|CYGWIN*)
+        local pwsh_bin=""
+        if command -v pwsh >/dev/null 2>&1; then
+          pwsh_bin="$(command -v pwsh)"
+        elif command -v powershell.exe >/dev/null 2>&1; then
+          pwsh_bin="$(command -v powershell.exe)"
+        fi
+        [[ -n "$pwsh_bin" ]] || error "无法验证 Windows Authenticode：未找到 PowerShell"
+        "$pwsh_bin" -NoProfile -File "$ROOT/scripts/sign-windows.ps1" -PublishDir "$win_publish" || \
+          error "Windows Authenticode 签名/验证失败，拒绝打包"
+        ( cd "$win_publish" && zip -r -q -X "$ROOT/dist/airferry-receiver-windows-x64-v${VER}.zip" . )
+        info "Windows 接收端（Authenticode 已验证）→ dist/airferry-receiver-windows-x64-v${VER}.zip"
+        ;;
+      *)
+        warn "检测到 Windows publish 目录，但当前主机无法验证 Authenticode，跳过 Windows zip；请使用 scripts/build-windows.ps1 -Pack"
+        ;;
+    esac
   else
     warn "未找到 Windows 端 publish 产物。如需打包 Windows 端，请在 Windows 上运行: ./scripts/build-windows.ps1 -Pack"
   fi
@@ -429,18 +447,14 @@ pack_dist() {
   info "全部产物已打包到 dist/（版本 v${VER}）"
 
   # 打印可安全上传到 GitHub Release 的产物清单（见 release_upload_list 的安全说明）。
-  info "可上传到 GitHub Release 的产物清单（已排除 *.pem / *.keystore 密钥）:"
+  info "可上传到 GitHub Release 的产物清单:"
   release_upload_list | sed 's/^/    /'
 }
 
 # 列出 dist/ 中可安全上传到 GitHub Release 的当前版本产物。
 #
-# ⚠️ 安全要点（改动前务必理解）：dist/ 与产物同目录还存放两类签名密钥——
-#   • airferry-extension.pem     Chrome Cr24 签名私钥
-#   • airferry-release.keystore  Android 发布 keystore
-# 裸 `gh release upload ... dist/*` 的 shell 通配会把它们一并上传 → 密钥外泄。
-# 本函数用「当前版本号 airferry-*-v${VER}.* ＋ 扩展名白名单」双重过滤，物理上
-# 不可能命中 *.pem / *.keystore，也不会误带其它版本旧产物或 RELEASE_NOTES_*.md。
+# 签名输入位于 AIRFERRY_SIGNING_DIR，dist/ 只允许发布产物。本函数再用
+# 「当前版本号 + 扩展名白名单」过滤，避免误带其它版本或说明文件。
 # 上传命令（用命令替换取清单，勿用裸 dist/* 通配）：
 #   gh release upload v${VER} -R UR-SillyB/AirFerry \
 #     $(./scripts/build-all.sh dist-upload-list) --clobber
@@ -497,7 +511,7 @@ case "$TARGET" in
   *)
     echo "用法: $0 [all|sender|scanner|windows|web|wasm|dist|dist-upload-list|release]"
     echo "  windows 子命令须在 Windows + .NET 8 SDK + CMake/VS C++ 下运行（或用 scripts/build-windows.ps1）"
-    echo "  dist-upload-list 打印可安全上传到 GitHub Release 的产物清单（排除 *.pem/*.keystore 密钥）"
+    echo "  dist-upload-list 打印可安全上传到 GitHub Release 的产物清单"
     exit 1
     ;;
 esac

@@ -165,7 +165,8 @@ object_id = Trunc128(H(
 - 恒为 RAW 不压缩，上限 16 MiB。
 - 结构：`[Header 80 B][Entry Records][Chunk Hash Table][Manifest TLVs]`。
 - **Entry Record (60 B + path + TLV)**：`kind` (1=FILE, 2=UTF8_TEXT, 3=DIRECTORY)、`content_offset`、`content_size`、`content_hash`。
-- **路径约束**：Unicode NFC、严格 UTF-8、`/` 分隔、禁止 `..` 与绝对路径、总长 ≤ 1024 B、单段 ≤ 255 B。
+- **路径约束**：Unicode NFC、严格 UTF-8、`/` 分隔、禁止 `..` 与绝对路径、总长 ≤ 1024 B、单段 ≤ 255 B；非目录 Entry 不得同时成为另一 Entry 的祖先路径。
+- **Windows 保存名**：逐目录组件替换 `< > : " | ? *`、修复保留设备名与尾随点/空格，并在每个父目录下按大小写不敏感规则确定性去冲突；只改保存名，不改 Manifest 身份与哈希。
 
 ---
 
@@ -183,18 +184,26 @@ object_id = Trunc128(H(
 
 ### 7.2 标准 Playlist 调度
 ```text
-Bootstrap: ROOT × 4 → MANIFEST META × 4 → up to 32 Manifest Symbols
+Bootstrap: ROOT × 4 → MANIFEST META × 4 → one complete Manifest source-symbol pass
 Each Chunk i (Epoch 1):  ROOT × 1 → CHUNK i META × 2 → i's source symbols → fresh repair (redundancy 预算)
-Each Chunk i (Epoch ≥ 2): ROOT × 1 → CHUNK i META × 2 → K + redundancy 个全新 Repair ESI
+Each Chunk i (Epoch 2):   ROOT × 1 → CHUNK i META × 2 → K + redundancy 个全新 Repair ESI（快速恢复轮）
+Each Chunk i (odd Epoch ≥ 3):  ROOT × 1 → CHUNK i META × 2 → 4K + redundancy 个全新 Repair ESI（稳健恢复轮）
+Each Chunk i (even Epoch ≥ 4): ROOT × 1 → CHUNK i META × 2 → K + redundancy 个全新 Repair ESI（快速恢复轮）
+Between Epochs: MANIFEST META × 2 → K + redundancy 个 Manifest Symbol（期间仍重复 ROOT/META）
 Interleave: META 每 ~17 帧广播；ROOT 每 ~31 帧广播；每 ~8 个 Chunk Symbol 插入 1 个 Manifest Symbol
 ```
 
-> **Epoch ≥ 2 的每窗口预算必须是完整的 K + 冗余量**（而非仅冗余量）：接收端同时只保留
-> 一个活跃 Chunk Decoder，且在新 Chunk META 到达时零缓存丢弃未完成 Decoder 的全部已收
-> 符号（§11 资源策略）。任何在 Epoch 1 窗口内丢损超过冗余预算的 Chunk，后续每个窗口都
-> 从零开始收集——若窗口只携带冗余量的新 Repair ESI，该 Chunk 将永远无法凑齐 K 个符号
-> （表现为 received/total 持续攀升超过 100% 而永不完成）。携带 K + 冗余量全新 ESI 后，
-> 一个被完整观看的窗口即可独立完成解码。
+> Epoch 2 使用短的 K+冗余恢复轮：高捕获率接收端可以快速遍历并补齐少量漏块，不承担
+> 稳健长窗口导致的整轮延迟。若仍未完成，奇数恢复轮发送**实际 4K+冗余量**的新
+> Repair（状态目标为 5K+冗余，因为 repair-only 窗口从 symbol_index=K 开始）；偶数恢复轮
+> 恢复短窗口，避免接收率良好的设备永久降速。每轮之间的 Manifest 自包含窗口保证错过启动
+> 阶段或早期 Repair 的晚加入接收端仍可在有限时间内恢复 Manifest。
+> 接收端只保留一个 Chunk Decoder；因此每个稳健窗口必须自足。在均匀/固定码位捕获模型
+> 下，默认 5% 冗余的理论完成门槛约为 K/4.05K=24.7%（实际需为解码开销留余量）。协议
+> 不宣称低于该门槛跨 Chunk 窗口积累；这避免把有限 Decoder 资源错误描述为无条件活性。
+> 新鲜 Repair ESI 接近 24 位上限时 MUST 固定新鲜游标，并用独立游标显式循环重放合法的
+> Repair 命名空间，禁止把新鲜游标回绕、panic、停止对象或退化为仅 Source 的流。仅 Source
+> 重放会让固定四码位捕获者永久只看到约 1/4 Source；完整 Repair 重放仍维持上述捕获门槛。
 
 ---
 
@@ -239,6 +248,7 @@ total_raw_size, chunk_raw_size, chunk_count, completed_bitmap, chunk_hash[](Mani
 - **提交顺序**：恢复 Encoded → 验 object_id/encoded_hash → 有界解压 → 验 chunk hash → pwrite → fsync 数据 → 写临时账本 fsync → 原子 rename 账本 → 内存置位。
 - **重开复核**：重开任务必须重算已完成位对应范围的 chunk hash，不符位清零（治愈账本虚报）。
 - **跨实例复用**：完成位以 `(transfer_id, chunk_index, raw_hash)` 判定，跨 codec、压缩 level、T、修复调度变化均可复用。
+- **未完成 Decoder 切换**：同一 Transfer/T 下，同索引且字节完全相同的 META 保留现有 Decoder；若收到 object_id 自洽但编码字段不同的新 META，必须以新 Decoder 替换旧 Decoder。这样仅改变 Chunk codec/压缩参数而 Manifest Object ID 不变时也不会被旧实例永久占槽；不同 object_id 的 SYMBOL 仍严格隔离，绝不混入同一 Decoder。
 
 ---
 
@@ -252,10 +262,26 @@ total_raw_size, chunk_raw_size, chunk_count, completed_bitmap, chunk_hash[](Mani
 | chunk_raw_size | 1..32 MiB 2 的幂（默认 8） |
 | chunk_count / 总大小 | 131072 / 4 TiB（`total_raw_size ≥ 1`） |
 | 单 Encoded Object | 32 MiB（Manifest 16 MiB） |
-| Source Blocks / ESI | 255 / < 2²⁴（触顶停止，跨 Epoch 永不重复） |
+| Source Blocks / ESI | 255 / < 2²⁴（新鲜 Repair 触顶后显式循环重放合法 Repair；新鲜游标不回绕） |
 | zstd windowLog / XZ 内存 | 23 / 128 MiB |
 | 活跃 Decoder | Manifest 1 + Chunk 1 |
+| 每 Source Block 已接收唯一 ESI | `K + max(K/4, 64)`（超限后丢弃该 Decoder） |
 | 未知 Object 符号缓存 | **0** |
+
+宿主还必须设置可落盘的传输总量上限，且在建立 Decoder 前检查 ROOT：Web/WASM 默认
+8 GiB、Android 默认 16 GiB、桌面原生默认 128 GiB。协议的 4 TiB 是线格式上限，不是
+单个设备必须承诺的资源额度。由于单向信道无法协商能力，仓库内通用 Web 发送端以最小的
+8 GiB 接收预算为发送上限，确保发出的任务可被任一内置接收端接受。写盘失败时宿主必须
+停止摄入并显式报错，不得无限内存回退。
+
+### 12.1 安全边界
+
+AF2 v2 的 BLAKE3、Object ID 与 CRC 提供的是**意外损坏和对象混流检测**，不是发送者认证；
+二维码画面也不加密。能看见画面的观察者可复制内容，能持续覆盖摄像头视野的攻击者可注入
+另一条自洽广播。因此敏感内容必须在进入 AirFerry 前由用户使用受信工具加密，并通过带认证
+的外部渠道核对文件摘要/Content ID；公共或对抗环境不得把“完整性校验通过”等同于“来源可信”。
+加入发送者签名或分块 AEAD 会改变密钥分发、信任 UI 和线协议语义，必须以新的 Critical
+Profile/后续 wire version 完整设计，不能在 AF2 v2 中静默启用而破坏跨端兼容。
 
 ---
 
@@ -291,4 +317,3 @@ type:u16 || length:u16 || value          type & 0x8000 = Critical
 - 预留方向：Ed25519 签名、分块 AEAD、SHA-256 注册（外部合规核验）、双向确认 Profile、CDC 分块。
 - 已知 Entry 注解 TLV（均 Optional）：`0x0101` mtime_ms(u64)、`0x0102` unix_mode(u32)、
   `0x0103` mime(UTF-8 ≤ 255B)、`0x0104` type_class(u8，纯 UI 提示，非信任来源)。
-

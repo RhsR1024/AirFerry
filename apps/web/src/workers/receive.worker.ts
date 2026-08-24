@@ -17,7 +17,10 @@ export const KIND_FILE = 1
 export const KIND_UTF8_TEXT = 2
 export const KIND_DIRECTORY = 3
 
-const TEXT_UI_MAX_BYTES = 8 * 1024 * 1024
+// Keep text materialization aligned with Android/Windows. The final verifier
+// still validates arbitrarily large UTF-8 entries incrementally; only the
+// copy-to-UI path is capped so one hostile "text" entry cannot freeze the UI.
+const TEXT_UI_MAX_BYTES = 256 * 1024
 
 export interface ManifestEntryDto {
   kind: number
@@ -77,7 +80,11 @@ let opfsDirHandle: FileSystemDirectoryHandle | null = null
 let chunkStore = new ChunkStore()
 let journal = new OpfsJournal()
 let pendingReverify: Set<number> | null = null
+/** Chunk indices that completed BEFORE the Manifest decoded (§11 ⑥b gap). */
+let preManifestChunks: Set<number> | null = null
+let manifestDecoded = false
 let resumeChecked = false
+let ingestPaused = false
 
 async function getOpfsDir(): Promise<FileSystemDirectoryHandle | null> {
   if (opfsDirHandle) return opfsDirHandle
@@ -104,6 +111,10 @@ async function dropSession(): Promise<void> {
   lastMetaSent = false
   totalAcceptedSymbols = 0
   pendingReverify = null
+  preManifestChunks = null
+  manifestDecoded = false
+  invalidateMetaCache()
+  ingestPaused = false
   await chunkStore.discard()
   await journal.discard()
 }
@@ -136,6 +147,29 @@ function readMeta(s: ReceiverSessionWasm): MetaInfo {
     rootFrameHex: snap.root_frame_hex || "",
     entries: Array.isArray(snap.entries) ? snap.entries : [],
   }
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot cache: the Rust `snapshot_json` rebuilds the whole JSON (ids, ROOT
+// frame hex, sanitized entries) on EVERY call, and readMeta used to run on
+// every ingest batch (i.e. per decoded frame) — several full rebuild+parse
+// rounds per second for data that only changes at ROOT lock / Manifest decode
+// / relock. A short TTL + explicit force-refresh on those transitions keeps
+// the hot path allocation-free while staying correct.
+// ---------------------------------------------------------------------------
+const META_CACHE_TTL_MS = 150
+let metaCache: { at: number; meta: MetaInfo } | null = null
+
+function invalidateMetaCache(): void {
+  metaCache = null
+}
+
+function readMetaCached(s: ReceiverSessionWasm, force = false): MetaInfo {
+  const now = Date.now()
+  if (!force && metaCache && now - metaCache.at < META_CACHE_TTL_MS) return metaCache.meta
+  const meta = readMeta(s)
+  metaCache = { at: now, meta }
+  return meta
 }
 
 async function tryResume(): Promise<void> {
@@ -186,6 +220,26 @@ async function reverifyResumedChunks(meta: MetaInfo): Promise<void> {
   if (pendingReverify.size === 0) pendingReverify = null
 }
 
+// Chunks that completed BEFORE the Manifest decoded were accepted without the
+// ROOT-bound chunk-hash table (§11 ⑥b could not run). The core evicts such
+// chunks from its own resident ledger at ManifestReady, but spilled copies
+// live in this worker's store/journal — re-verify them against the
+// now-known table and invalidate the bad ones so the sender's next epoch
+// re-supplies them immediately instead of an epoch later at assemble time.
+async function reverifyPreManifestChunks(meta: MetaInfo): Promise<void> {
+  if (!preManifestChunks || preManifestChunks.size === 0 || !session) return
+  for (const idx of Array.from(preManifestChunks)) {
+    preManifestChunks.delete(idx)
+    if (!chunkStore.has(idx)) continue
+    const chunkBytes = chunkStore.readChunk(idx, meta.chunkRawSize, meta.totalRawSize)
+    if (chunkBytes && session.verify_chunk(idx, chunkBytes)) continue
+    session.invalidate_chunk(idx)
+    chunkStore.invalidate(idx)
+    await journal.invalidate(idx)
+  }
+  if (preManifestChunks.size === 0) preManifestChunks = null
+}
+
 async function ingestBatch(frames: Uint8Array[], jobId: number): Promise<{
   complete: boolean
   acceptedCount: number
@@ -215,10 +269,13 @@ async function ingestBatch(frames: Uint8Array[], jobId: number): Promise<{
     // resumed spill/ledger and making the transfer impossible to finish.
     const relocked = ((word >> 4n) & 1n) !== 0n
     const receivedSymbols = Number((word >> 32n) & 0xFFFFFFFFn)
+    // The packed counter is maintained by Rust from genuinely novel
+    // `(sbn, esi)` equations. Do not derive progress from the generic accepted
+    // bit: ROOT/META are accepted too, and camera duplicates add no rank.
+    totalAcceptedSymbols = receivedSymbols
 
     if (accepted) {
       acceptedCount++
-      totalAcceptedSymbols++
     }
     if (relocked) {
       // A foreign transfer owns the session now: discard old storage and journal
@@ -229,6 +286,9 @@ async function ingestBatch(frames: Uint8Array[], jobId: number): Promise<{
       lastPostedMetaTid = ""
       totalAcceptedSymbols = 0
       pendingReverify = null
+      preManifestChunks = null
+      manifestDecoded = false
+      invalidateMetaCache()
       post({ type: "relock", jobId })
     }
     // Also post initial meta when ROOT locks (entry count + total size available)
@@ -236,15 +296,24 @@ async function ingestBatch(frames: Uint8Array[], jobId: number): Promise<{
       maybePostMeta(jobId)
     }
     if (manifestReady) {
-      const m = readMeta(session)
+      manifestDecoded = true
+      // Manifest decode changes `entries` — force past the TTL.
+      const m = readMetaCached(session, true)
       await reverifyResumedChunks(m)
+      await reverifyPreManifestChunks(m)
       maybePostMeta(jobId)
     }
     if (chunkReady) {
       const idx = session.last_chunk_index()
+      if (!manifestDecoded) {
+        ;(preManifestChunks ??= new Set<number>()).add(idx)
+      }
       const bytes = new Uint8Array(session.assemble_chunk(idx))
       if (bytes.length > 0) {
-        const snap = readMeta(session)
+        // Force only when the cache predates the ROOT lock (journal.init
+        // needs rootFrameHex; a chunk completing before any fresh readMeta
+        // would otherwise see the empty placeholder).
+        const snap = readMetaCached(session, !metaCache || metaCache.meta.rootFrameHex === "")
         if (!chunkStore.has(idx)) {
           const dir = await getOpfsDir()
           await chunkStore.init(dir, snap.transferIdHex)
@@ -263,7 +332,7 @@ async function ingestBatch(frames: Uint8Array[], jobId: number): Promise<{
     }
   }
 
-  const meta = readMeta(session)
+  const meta = readMetaCached(session)
   // Completion requires the decoded Manifest (entries non-empty): the core may
   // report all chunks done BEFORE the Manifest object is recovered. Staging
   // without the entry table would fail the final gate (or emit an empty
@@ -322,7 +391,9 @@ let lastPostedMetaTid = ""
 
 function maybePostMeta(jobId: number): void {
   if (!session) return
-  const meta = readMeta(session)
+  // Force past the TTL only while the cache has no locked ROOT — that is the
+  // ROOT-lock moment, where transferIdHex/totalRawSize first become visible.
+  const meta = readMetaCached(session, !metaCache || metaCache.meta.transferIdHex === "")
   if (meta.totalRawSize === 0 && !meta.metaConfirmed) return
 
   const nonDirEntries = meta.entries.filter((e) => e.kind !== KIND_DIRECTORY)
@@ -388,7 +459,19 @@ let messageChain: Promise<void> = Promise.resolve()
 self.addEventListener("message", (e: MessageEvent) => {
   const data = e.data
   if (!data || typeof data !== "object") return
-  messageChain = messageChain.then(() => handleMessage(data))
+  messageChain = messageChain
+    .then(() => handleMessage(data))
+    .catch((err) => {
+      // Keep the queue usable after an unexpected handler failure. A rejected
+      // promise left as the chain head makes every future `.then` skip its
+      // handler, which otherwise wedges reset/retry and can look like a
+      // transfer that will never finish.
+      post({
+        type: "error",
+        message: `接收 worker 内部错误: ${err instanceof Error ? err.message : String(err)}`,
+        jobId: activeJobId,
+      })
+    })
 })
 
 async function handleMessage(data: Record<string, unknown>): Promise<void> {
@@ -429,6 +512,10 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
     const frames = (data.frames || data.payloads || []) as Uint8Array[]
     const jobId = typeof data.jobId === "number" ? data.jobId : activeJobId
     if (jobId !== activeJobId) return
+    if (ingestPaused) {
+      post({ type: "ingest_ack", jobId })
+      return
+    }
 
     try {
       const res = await ingestBatch(frames, jobId)
@@ -441,11 +528,15 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
         jobId,
       })
     } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err)
+      if (detail.includes("AF2_STORAGE_FATAL")) ingestPaused = true
       post({
         type: "error",
-        message: `帧处理失败: ${err instanceof Error ? err.message : String(err)}`,
+        message: `帧处理失败: ${detail}`,
         jobId,
       })
+    } finally {
+      post({ type: "ingest_ack", jobId })
     }
     return
   }
@@ -453,7 +544,7 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
   if (data.type === "assemble") {
     if (!session) return
     try {
-      const meta = readMeta(session)
+      const meta = readMetaCached(session, true)
       for (let i = 0; i < meta.chunkCount; i++) {
         if (!chunkStore.has(i)) {
           post({

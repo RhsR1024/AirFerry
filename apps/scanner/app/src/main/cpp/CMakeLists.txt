@@ -1,6 +1,6 @@
 # AirFerry Android native: ZXing-C++ QR decoder + JNI bridge.
 #
-# Fetches zxing-cpp from source (pinned tag) and builds a thin JNI wrapper
+# Fetches a SHA-256-pinned zxing-cpp source archive and builds a thin JNI wrapper
 # that exposes a luminance-decode entry point to Kotlin.
 
 cmake_minimum_required(VERSION 3.22.1)
@@ -26,36 +26,16 @@ add_compile_definitions(NDEBUG)
 # lib we link in.
 add_link_options("-Wl,-z,max-page-size=16384")
 
-# --- Fetch ZXing-C++ (zxing-cpp) ---
-# Correct repo: github.com/zxing-cpp/zxing-cpp. Pin the v3.0.2 commit digest;
-# a mutable tag name is not sufficient for reproducible native builds.
-set(ZXING_COMMIT "8dd1cf5c4fd6fb6211bb96713db926ac6f2cf825")
-set(ZXING_SRC_DIR "${CMAKE_BINARY_DIR}/zxing-src")
-
-include(FetchContent)
-FetchContent_Declare(
-    zxing
-    GIT_REPOSITORY https://github.com/zxing-cpp/zxing-cpp.git
-    GIT_TAG ${ZXING_COMMIT}
-    GIT_SHALLOW FALSE
-    SOURCE_DIR ${ZXING_SRC_DIR}
-)
-# Build only the core reader library (no examples, tests, writers, C-API).
-set(ZXING_READERS ON CACHE BOOL "" FORCE)
-set(ZXING_WRITERS OFF CACHE STRING "" FORCE)
-set(ZXING_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(ZXING_BLACKBOX_TESTS OFF CACHE BOOL "" FORCE)
-set(ZXING_UNIT_TESTS OFF CACHE BOOL "" FORCE)
-set(ZXING_C_API OFF CACHE BOOL "" FORCE)
-set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(zxing)
-
 # --- JNI bridge library ---
-# Android intentionally keeps the proven v1.1.3 JNI decode implementation.
-# Windows mirrors the same behavior through core/zxing-decoder and its C ABI.
+set(AIRFERRY_ZXING_CORE_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../../core/zxing-decoder")
+include("${AIRFERRY_ZXING_CORE_DIR}/zxing-source.cmake")
+airferry_add_zxing()
 add_library(airferry_zxing SHARED
     scan_jni.cpp
+    "${AIRFERRY_ZXING_CORE_DIR}/airferry_zxing_core.cpp"
 )
+target_include_directories(airferry_zxing PRIVATE "${AIRFERRY_ZXING_CORE_DIR}")
 target_link_libraries(airferry_zxing
     ZXing::ZXing
     log

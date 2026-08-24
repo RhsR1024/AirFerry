@@ -429,10 +429,10 @@ export function FileSelectPage({ items, onItemsChange, onPlay, busyLabel }: Prop
   /** Total original bytes of the selected items (pre-compression). */
   const selectedBytes = totalSize(items)
   /**
-   * Preparation is fully streamed (one chunk in memory at a time), so the
-   * only hard limit is the AF2 wire format (1 TiB at 8 MiB chunks). Larger-
-   * than-LARGE_TRANSFER_BYTES sends still work — they just take a long time,
-   * so confirm before committing the user to the duration.
+   * Preparation is fully streamed (one chunk in memory at a time), but the
+   * hard limit follows the smallest bundled receiver budget (Web: 8 GiB).
+   * Larger-than-LARGE_TRANSFER_BYTES sends still work — they just take a long
+   * time, so confirm before committing the user to the duration.
    */
   const handleSendClick = useCallback(() => {
     const total = totalSize(itemsRef.current)

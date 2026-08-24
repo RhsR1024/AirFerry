@@ -5,7 +5,6 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "AirFerry Protocol 2 (AF2) core: frames, three-layer ids, ROOT/OBJECT_META/Manifest, per-chunk codec, state machines."
-
 [dependencies]
 blake3.workspace = true
 raptorq.workspace = true

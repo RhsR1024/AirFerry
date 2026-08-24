@@ -59,6 +59,14 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     private bool _disposed;
     private int _recoveryStarted;
     /// <summary>
+    /// Latch for "the Manifest object has been decoded" (the status word's
+    /// ManifestReady bit is an EDGE event). Probing
+    /// <c>session.GetSnapshot().Entries.Count &gt; 0</c> instead rebuilt the
+    /// full native snapshot JSON on EVERY ingested symbol during the
+    /// "all chunks done but Manifest pending" window.
+    /// </summary>
+    private volatile bool _manifestDecoded;
+    /// <summary>
     /// Set when staging invalidated locally-corrupt spill chunks and returned
     /// None: the receiver stays armed awaiting the sender's next epoch to
     /// re-supply exactly those chunks (NOT a failed assembly).
@@ -263,6 +271,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             // previous spill + ledger journal stay bound; on failure both are
             // dropped like any other leftover.
             _session = new ReceiverSession();
+            _manifestDecoded = false;
             if (!TryResumeFromLedger())
             {
                 _chunkSpill?.Discard();
@@ -784,9 +793,11 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             Interlocked.Exchange(ref _recoveryStarted, 0);
             _preScanCheckedSession = null;
             _awaitingChunkResupply = false;
+            _manifestDecoded = false;
         }
         if (s.ManifestReady)
         {
+            _manifestDecoded = true;
             ReverifyResumedChunks(session);
         }
         if (s.ChunkReady)
@@ -814,9 +825,17 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             }
             catch (Exception ex)
             {
-                // A spilled-over disc / deleted temp dir must never kill the
-                // ingest path — the native copy stays resident instead.
+                // Continuing would retain every later completed chunk in native
+                // memory. Pause ingest with the current chunk still resident and
+                // surface an actionable storage error instead.
+                pool.IngestStopped = true;
                 System.Diagnostics.Debug.WriteLine($"chunk spill failed: {ex.Message}");
+                System.Windows.Application.Current?.Dispatcher.BeginInvoke(() =>
+                {
+                    StatusText = "临时存储写入失败，接收已暂停。请释放磁盘空间后重新开始。";
+                    IsScanning = false;
+                });
+                return false;
             }
         }
 
@@ -826,7 +845,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         // already holds every chunk). Staging without the entry table used to
         // fail the final gate and discard a fully received transfer. Keep
         // ingesting instead — every later frame re-announces Complete=true.
-        if (s.Complete && session.GetSnapshot().Entries.Count > 0)
+        if (s.Complete && _manifestDecoded)
         {
             if (Interlocked.Exchange(ref _recoveryStarted, 1) == 0)
             {
@@ -1452,6 +1471,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
                 _af2Ledger = null;
                 _pendingReverify = null;
                 _session = new ReceiverSession();
+                _manifestDecoded = false;
                 Interlocked.Exchange(ref _recoveryStarted, 0);
                 pool.IngestStopped = false;
                 return true;
@@ -1602,6 +1622,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
                 _af2Ledger = null;
                 _pendingReverify = null;
                 _session = new ReceiverSession();
+                _manifestDecoded = false;
                 Interlocked.Exchange(ref _recoveryStarted, 0);
                 pool.IngestStopped = false;
                 return true;

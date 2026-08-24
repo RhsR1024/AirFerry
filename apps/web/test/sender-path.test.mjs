@@ -4,9 +4,9 @@ import test from "node:test"
 import { normalizeSenderPath, senderPathForFile, uniqueSenderPath } from "../src/lib/sender-path.ts"
 import { AF2_MAX_ORIGINAL_BYTES, MAX_ORIGINAL_BYTES, MAX_ORIGINAL_MIB, LARGE_TRANSFER_BYTES } from "../src/types.ts"
 
-test("Web sender host limit matches the streamed wire capacity (8 MiB × 131072 chunks)", () => {
-  assert.equal(MAX_ORIGINAL_BYTES, 1024 * 1024 * 1024 * 1024)
-  assert.equal(MAX_ORIGINAL_MIB, 1024 * 1024)
+test("Web sender host limit matches the smallest bundled receiver budget", () => {
+  assert.equal(MAX_ORIGINAL_BYTES, 8 * 1024 * 1024 * 1024)
+  assert.equal(MAX_ORIGINAL_MIB, 8 * 1024)
   assert.ok(MAX_ORIGINAL_BYTES < AF2_MAX_ORIGINAL_BYTES)
   // The large-transfer confirmation sits strictly between normal and cap.
   assert.ok(LARGE_TRANSFER_BYTES < MAX_ORIGINAL_BYTES)

@@ -6,7 +6,7 @@
 
 - Node.js ≥ 18 + npm
 - Rust + wasm-pack（见 [开发环境搭建](dev-setup.md)）
-- Emscripten（emcc，接收端 FAST ZXing-C++ 解码后端必需，见下文）
+- Emscripten（`emcc`/`em++`；接收端 FAST ZXing-C++ 解码后端必需，已验证 3.1.64 与 6.0.8）
 - 打包发布产物（可选）：macOS 上安装的 Google Chrome，用于签名 `.crx`
 
 ## 构建 WASM 核心（单产物）
@@ -35,7 +35,7 @@ npm run wasm
 ./scripts/build-fastzxing.sh --use-cache # 复用缓存（日常）
 ```
 
-产物 `airferry_zxing.js/.wasm` 输出到 `apps/web/src/fastzxing/`（权威位置），再由 `prepare-wasm.cjs` 拷入 `apps/web/public/` 供接收端运行时 fetch。**产物缺失即构建失败**（emcc 不在 PATH 时 `build-all.sh web` 会直接报错退出并提示安装 Emscripten 3.1.64）。
+产物 `airferry_zxing.js/.wasm` 输出到 `apps/web/src/fastzxing/`（权威位置），再由 `prepare-wasm.cjs` 拷入 `apps/web/public/` 供接收端运行时 fetch。**产物缺失即构建失败**（`emcc` 不在 PATH 时 `build-all.sh web` 会直接报错退出并提示安装 Emscripten 3.1.64+）。源码归档固定 commit 并校验 SHA-256；`--use-cache` 只读复用现有源码目录，不会让 FetchContent 删除或更新它。
 
 ## 构建浏览器扩展（Vite）
 
@@ -211,9 +211,10 @@ npm run build:standalone    # 产出自包含单文件 dist-standalone/index.htm
 | `airferry-sender-chrome-mv2-v<VER>.crx` / `.zip` | Chrome/Edge MV2 |
 | `airferry-sender-firefox-mv3-v<VER>.xpi` | Firefox MV3（zip→xpi，未经 Mozilla 签名） |
 | `airferry-sender-firefox-mv2-v<VER>.xpi` | Firefox MV2 |
-| `airferry-extension.pem` | Chrome 固定签名私钥（须预先配置，git-ignored；脚本核对公钥指纹，绝不自动换钥） |
+| `.airferry-signing/airferry-extension.pem` | Chrome 固定签名私钥（不是发布产物；须预先配置，git-ignored；脚本核对公钥指纹） |
 
-**Chrome crx 签名机制**：脚本调用 Chrome `--pack-extension` 生成 Cr24 签名。首次（无 pem）由 Chrome 生成新私钥并挪到 `dist/airferry-extension.pem`；后续用 `--pack-extension-key` 复用同一私钥，MV2/MV3 得到**相同的扩展 ID**。找不到 Chrome（Linux/CI）时 warn 跳过 crx，仅保留 zip。**私钥决定扩展 ID，务必妥善保管；丢失后无法再为同一扩展 ID 签名。**
+**Chrome crx 签名机制**：脚本调用 Chrome `--pack-extension-key` 使用
+`.airferry-signing/airferry-extension.pem`（可用 `AIRFERRY_SIGNING_DIR` 改为仓库外目录）生成 Cr24 签名，MV2/MV3 得到固定扩展 ID。签名输入与 `dist/` 物理隔离，发布门禁发现 `dist/` 中有任何常见私钥格式会直接失败。找不到 Chrome 时普通打包只保留 zip；release 模式 fail-closed。**私钥决定扩展 ID，务必妥善保管。**
 
 ## 调试
 

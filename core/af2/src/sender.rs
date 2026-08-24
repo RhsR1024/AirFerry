@@ -4,12 +4,17 @@
 //! (OTI-only), and continuous emission via the §9.2 standard automatic playlist:
 //!
 //! ```text
-//! Bootstrap:  ROOT × 4 → MANIFEST META × 4 → up to 32 Manifest Symbols
+//! Bootstrap:  ROOT × 4 → MANIFEST META × 4 → one full Manifest source pass
 //! Each Chunk i:
-//!   ROOT × 1 → CHUNK i META × 2 → i's source symbols → fresh repair symbols (0.25 K)
+//!   Epoch 1: source symbols + configured repair redundancy
+//!   Epoch 2: one short K+R repair window (fast recovery / low revisit latency)
+//!   Epoch ≥3 odd: robust 4K+R fresh-repair windows (25% capture floor)
+//!   Epoch ≥4 even: short K+R windows (fast missing-chunk revisit)
+//! Between epochs: a self-contained Manifest K+R recovery window.
 //!   Interleaving: repeat current META every ~17 frames; repeat ROOT every ~31 frames;
 //!                 interleave 1 fresh Manifest Symbol every ~8 Chunk Symbols
-//! Next Epoch: advance to next epoch, using fresh repair ESIs across all objects.
+//! On fresh repair-ESI exhaustion, explicitly replay the legal Repair
+//! namespace instead of stopping, panicking, or degrading to source-only.
 //! ```
 //!
 //! Infinite generator: loops indefinitely until user stops playback.
@@ -97,6 +102,10 @@ struct ObjectEncoder {
     /// instead of O(K); mirrors raptorq-core's CachedBlock.
     source_packets: Vec<EncodingPacket>,
     source_symbol_count: u32,
+    /// Per-source-block K. `raptorq::repair_packets(r, 1)` places `K_block + r`
+    /// on the wire, so the 24-bit ESI guard must account for this offset.
+    block_source_symbol_counts: Vec<u32>,
+    /// Repair ordinal passed to raptorq (starts at zero; it is NOT a wire ESI).
     next_repair_esi: u32,
 }
 
@@ -118,9 +127,16 @@ pub struct Af2Sender {
     /// O(one chunk's encoder + packets), not O(whole file)).
     chunk_encoders: Vec<Option<ObjectEncoder>>,
     /// Per-chunk next repair ESI, surviving encoder free/rebuild (§9.2:
-    /// later epochs send only repair ESIs never used before). 0 = never
-    /// built (repair starts at the chunk's source symbol count).
+    /// later epochs send only repair ordinals never used before). Zero is the
+    /// correct first ordinal; raptorq adds each block's K to form the wire ESI.
     chunk_repair_esi: Vec<u32>,
+    /// Explicit replay cursor used only after the finite fresh-Repair namespace
+    /// is exhausted. It is separate from `chunk_repair_esi`: the latter stays
+    /// pinned at exhaustion (never wraps), while this cursor walks the legal
+    /// Repair namespace cyclically so a late joiner still receives a
+    /// self-sufficient fountain stream rather than only 1/4 of the sources in
+    /// a fixed four-code capture pattern.
+    chunk_repair_replay_cursor: Vec<u64>,
     /// Host pre-encoded chunks (balanced sender policy). `None` chunks fall
     /// back to lazy `encode_chunk` at play time, so partially-provisioned
     /// hosts (and all native/tests paths) keep working unchanged.
@@ -136,7 +152,8 @@ pub struct Af2Sender {
     staged_mode: bool,
     staged_chunks: Vec<Option<(u8, Vec<u8>)>>,
     /// 1-based broadcast epoch. Epoch 1 sends each chunk's source symbols
-    /// once; epoch ≥ 2 sends only fresh repair symbols.
+    /// once; later epochs prefer fresh repair symbols and explicitly replay
+    /// the legal repair namespace after it is exhausted.
     epoch: u32,
     // Playlist emission state
     state: PlaylistState,
@@ -148,6 +165,9 @@ pub struct Af2Sender {
     /// instead of a repair symbol, so a late joiner can still build the
     /// manifest decoder (bootstrap alone is not recurring).
     manifest_interleave_count: u32,
+    /// Explicit cyclic Repair replay after the finite fresh Manifest namespace
+    /// is exhausted. The fresh cursor remains pinned and never wraps.
+    manifest_repair_replay_cursor: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,6 +175,12 @@ enum PlaylistState {
     BootstrapRoot(u8),
     BootstrapManifestMeta(u8),
     BootstrapManifestSymbols(u32),
+    /// A self-contained Manifest recovery window between chunk epochs. Late
+    /// joiners no longer depend on the very low-rate background interleave.
+    EpochManifestWindow {
+        meta_count: u8,
+        symbols_remaining: u32,
+    },
     ChunkLoop {
         chunk_index: usize,
         root_sent: bool,
@@ -229,10 +255,11 @@ impl Af2Sender {
     /// the canonical stream. Each chunk must be provided at play time via
     /// [`Self::stage_chunk`] (validated against the manifest's chunk hashes);
     /// [`Self::next_frame`] fails closed with [`SenderError::ChunkNotStaged`]
-    /// when the playlist reaches an unstaged chunk. Re-staging a chunk in a
-    /// later epoch MUST supply byte-identical encoded bytes — the chunk META's
-    /// encoded_hash (and thus its object_id) is derived from them, and a
-    /// differing object_id would make the receiver drop every symbol.
+    /// when the playlist reaches an unstaged chunk. Re-staging may choose a
+    /// different valid encoding: the chunk META's encoded_hash (and thus its
+    /// object_id) changes, and receivers replace an unfinished decoder for
+    /// that index after validating the new META. Deterministic encoding is
+    /// still preferred because it preserves useful symbols already captured.
     ///
     /// Use [`crate::manifest::build_manifest_from_hashes`] (or the §9.3
     /// resend cache) to build `manifest` without ever holding content bytes.
@@ -329,7 +356,12 @@ impl Af2Sender {
             raptorq_encoder: manifest_enc,
             source_packets: manifest_source_packets,
             source_symbol_count: manifest_source_count,
-            next_repair_esi: manifest_source_count,
+            block_source_symbol_counts: manifest_meta_obj
+                .blocks
+                .iter()
+                .map(|b| b.num_source_symbols)
+                .collect(),
+            next_repair_esi: 0,
         };
 
         // 2. Build Root Record & Frame
@@ -409,6 +441,7 @@ impl Af2Sender {
         let mut chunk_encoders = Vec::with_capacity(chunk_count);
         chunk_encoders.resize_with(chunk_count, || None);
         let chunk_repair_esi = vec![0u32; chunk_count];
+        let chunk_repair_replay_cursor = vec![0u64; chunk_count];
 
         // Validate + index the host pre-encoded chunks against the assembled
         // canonical stream (the authoritative chunking lives in the manifest).
@@ -434,8 +467,7 @@ impl Af2Sender {
                 }
                 let start = idx as u64 * u64::from(manifest.chunk_raw_size);
                 let raw_len = (manifest.total_raw_size.saturating_sub(start))
-                    .min(u64::from(manifest.chunk_raw_size))
-                    as usize;
+                    .min(u64::from(manifest.chunk_raw_size)) as usize;
                 if bytes.len() >= raw_len {
                     return Err(SenderError::Config(format!(
                         "preencoded chunk {index} violates strictly-smaller ({} >= {raw_len})",
@@ -456,6 +488,7 @@ impl Af2Sender {
             stream,
             chunk_encoders,
             chunk_repair_esi,
+            chunk_repair_replay_cursor,
             preencoded_chunks,
             chunk_hashes: manifest.chunk_hashes,
             staged_mode,
@@ -467,6 +500,7 @@ impl Af2Sender {
             since_root_counter: 0,
             since_manifest_counter: 0,
             manifest_interleave_count: 0,
+            manifest_repair_replay_cursor: 0,
         })
     }
 
@@ -525,10 +559,11 @@ impl Af2Sender {
     /// hash to the table entry; Zstd/Xz bytes must be strictly smaller AND
     /// either carry a host-precomputed RAW digest (`stage_chunk_with_raw_hash`)
     /// matching the table entry or bounded-decompress here to bytes hashing to
-    /// that entry. The staged
-    /// bytes are consumed when the playlist reaches the chunk and dropped
-    /// when the window moves on — later epochs must re-stage byte-identical
-    /// bytes (deterministic re-encode) to keep the object_id stable.
+    /// that entry. The staged bytes are consumed when the playlist reaches the
+    /// chunk and dropped when the window moves on. A deterministic re-encode
+    /// keeps the object_id stable and preserves receiver progress; a different
+    /// valid encoding is safe but restarts any unfinished decoder for that
+    /// chunk index.
     pub fn stage_chunk(
         &mut self,
         index: u32,
@@ -620,9 +655,7 @@ impl Af2Sender {
                             self.config.chunk_raw_size,
                         )
                         .map_err(|e| {
-                            SenderError::Config(format!(
-                                "staged chunk {index} decode: {e}"
-                            ))
+                            SenderError::Config(format!("staged chunk {index} decode: {e}"))
                         })?;
                         hash(&raw)
                     }
@@ -659,12 +692,19 @@ impl Af2Sender {
             self.since_root_counter,
             self.since_manifest_counter,
             self.manifest_interleave_count,
+            self.manifest_repair_replay_cursor,
         );
         let cursor_chunk = match self.state {
             PlaylistState::ChunkLoop { chunk_index, .. } => Some(chunk_index),
             _ => None,
         };
-        let cursor_checkpoint = cursor_chunk.map(|i| self.chunk_repair_esi[i]);
+        let cursor_checkpoint = cursor_chunk.map(|i| {
+            (
+                self.chunk_repair_esi[i],
+                self.chunk_repair_replay_cursor[i],
+            )
+        });
+        let manifest_repair_checkpoint = self.manifest_encoder.next_repair_esi;
         self.global_frame_count += 1;
         self.since_meta_counter += 1;
         self.since_root_counter += 1;
@@ -677,9 +717,12 @@ impl Af2Sender {
                 self.since_root_counter,
                 self.since_manifest_counter,
                 self.manifest_interleave_count,
+                self.manifest_repair_replay_cursor,
             ) = counters;
-            if let (Some(i), Some(cursor)) = (cursor_chunk, cursor_checkpoint) {
+            self.manifest_encoder.next_repair_esi = manifest_repair_checkpoint;
+            if let (Some(i), Some((cursor, replay_cursor))) = (cursor_chunk, cursor_checkpoint) {
                 self.chunk_repair_esi[i] = cursor;
+                self.chunk_repair_replay_cursor[i] = replay_cursor;
                 // The LIVE encoder's internal cursor is the authoritative
                 // value while its window is active (the persisted array only
                 // feeds encoder rebuilds). Without restoring it too, a failed
@@ -707,7 +750,11 @@ impl Af2Sender {
             }
             PlaylistState::BootstrapManifestMeta(rem) => {
                 if rem <= 1 {
-                    let target = self.manifest_encoder.source_symbol_count.min(32);
+                    // A Manifest is required to materialize even a transfer whose
+                    // chunks are already complete. Send its full source pass at
+                    // channel rate instead of leaving all but 32 symbols to the
+                    // ~1/8-rate background interleave.
+                    let target = self.manifest_encoder.source_symbol_count;
                     self.state = PlaylistState::BootstrapManifestSymbols(target);
                 } else {
                     self.state = PlaylistState::BootstrapManifestMeta(rem - 1);
@@ -716,7 +763,7 @@ impl Af2Sender {
                 Ok(self.manifest_encoder.meta_frame_bytes.clone())
             }
             PlaylistState::BootstrapManifestSymbols(rem) => {
-                let target = self.manifest_encoder.source_symbol_count.min(32);
+                let target = self.manifest_encoder.source_symbol_count;
                 let symbol_idx = target.saturating_sub(rem);
                 let frame = self.get_manifest_symbol_frame(symbol_idx)?;
                 if rem <= 1 {
@@ -736,6 +783,55 @@ impl Af2Sender {
                     }
                 } else {
                     self.state = PlaylistState::BootstrapManifestSymbols(rem - 1);
+                }
+                Ok(frame)
+            }
+            PlaylistState::EpochManifestWindow {
+                meta_count,
+                symbols_remaining,
+            } => {
+                // Long recovery windows must repeat ROOT/META so a receiver that
+                // joins inside the window can immediately bind the object.
+                if self.since_root_counter >= 31 {
+                    self.since_root_counter = 0;
+                    return Ok(self.root_frame_bytes.clone());
+                }
+                if meta_count > 0 || self.since_meta_counter >= 17 {
+                    self.since_meta_counter = 0;
+                    self.state = PlaylistState::EpochManifestWindow {
+                        meta_count: meta_count.saturating_sub(1),
+                        symbols_remaining,
+                    };
+                    return Ok(self.manifest_encoder.meta_frame_bytes.clone());
+                }
+
+                // Preserve next_frame's transactional guarantee: staging may
+                // fail in streamed mode, so perform that fallible check before
+                // consuming the final Manifest repair ESI.
+                if symbols_remaining <= 1 {
+                    self.ensure_chunk_encoder(0)?;
+                }
+                let frame = self
+                    .get_manifest_interleave_frame()?
+                    .ok_or_else(|| SenderError::Config("manifest recovery produced no frame".into()))?;
+                if symbols_remaining <= 1 {
+                    let k = self.chunk_encoders[0]
+                        .as_ref()
+                        .map(|e| e.source_symbol_count)
+                        .unwrap_or(1);
+                    let target = self.chunk_target_symbols(0);
+                    self.state = PlaylistState::ChunkLoop {
+                        chunk_index: 0,
+                        root_sent: false,
+                        meta_count: 2,
+                        symbol_index: k,
+                        symbols_target: target,
+                    };
+                } else {
+                    self.state = PlaylistState::EpochManifestWindow {
+                        meta_count: 0,
+                        symbols_remaining: symbols_remaining - 1,
+                    };
                 }
                 Ok(frame)
             }
@@ -774,8 +870,8 @@ impl Af2Sender {
                     if let Some(frame) = self.get_manifest_interleave_frame()? {
                         return Ok(frame);
                     }
-                    // Manifest repair ESI exhausted (§9.1: stop at 2^24, never
-                    // re-issue) — fall through to the chunk symbol flow.
+                    // Defensive only: the generator normally replays a source
+                    // symbol at repair exhaustion, so late joiners stay viable.
                 }
 
                 // Normal Chunk Playlist: §9.2 "ROOT ×1 → CHUNK i META × 2 → symbols"
@@ -809,10 +905,9 @@ impl Af2Sender {
                 let frame = match self.get_chunk_symbol_frame(chunk_index, symbol_index)? {
                     Some(f) => f,
                     None => {
-                        // §9.1: this chunk's repair ESI space is exhausted —
-                        // no fresh symbols left. Advance exactly as if its
-                        // target had been reached; the returned frame is the
-                        // next playlist step's leading ROOT (§9.2).
+                        // Defensive only: repair exhaustion normally falls back
+                        // to source replay. If an encoder cannot emit anything,
+                        // advance rather than wedge the playlist.
                         self.advance_past_chunk(chunk_index)?;
                         self.since_root_counter = 0;
                         if let PlaylistState::ChunkLoop { root_sent, .. } = &mut self.state {
@@ -839,10 +934,10 @@ impl Af2Sender {
     }
 
     /// Chunk `chunk_index` is finished (symbol target reached, or its repair
-    /// ESI space exhausted per §9.1): move the playlist to the next chunk —
+    /// window target reached: move the playlist to the next chunk —
     /// or, on the last chunk, restart the epoch from Chunk 0. Later epochs
-    /// skip the source-symbol pass and send only fresh repair ESIs (§9.2),
-    /// resuming from the persisted per-chunk ESI.
+    /// skip the normal source-symbol pass and send fresh repair ESIs (§9.2),
+    /// resuming from the persisted ordinal (source replay only at exhaustion).
     ///
     /// The next chunk's encoder is built BEFORE the current one is freed and
     /// the state moves: in streamed mode an unstaged next chunk fails here
@@ -872,21 +967,16 @@ impl Af2Sender {
             // chunk_target_symbols depends on the epoch, so pass next_epoch
             // explicitly instead of mutating self.epoch before the (fallible)
             // staging is known to succeed.
-            let next_epoch = self.epoch + 1;
-            self.ensure_chunk_encoder(0)?;
-            let k = self.chunk_encoders[0].as_ref().unwrap().source_symbol_count;
-            // Epoch 1 already sent every source symbol once; epoch ≥ 2 sends
-            // only repair symbols the receiver has never seen (§9.2).
-            let start = if next_epoch == 1 { 0 } else { k };
-            let next_target = self.chunk_target_symbols_at(0, next_epoch);
+            let next_epoch = self.epoch.saturating_add(1);
             self.retire_chunk(chunk_index);
             self.epoch = next_epoch;
-            self.state = PlaylistState::ChunkLoop {
-                chunk_index: 0,
-                root_sent: false,
+            let manifest_k = self.manifest_encoder.source_symbol_count;
+            let redundancy =
+                (u64::from(manifest_k) * u64::from(self.config.redundancy_pct) / 100)
+                    .max(1) as u32;
+            self.state = PlaylistState::EpochManifestWindow {
                 meta_count: 2,
-                symbol_index: start,
-                symbols_target: next_target,
+                symbols_remaining: manifest_k.saturating_add(redundancy),
             };
         }
         Ok(())
@@ -918,14 +1008,14 @@ impl Af2Sender {
         // canonical raw never materializes here; the META's raw_hash comes
         // straight from the table (no play-time decompression).
         let (codec, encoded, raw_hash): (u8, Cow<'_, [u8]>, [u8; 32]) = if self.staged_mode {
-            let (codec, bytes) = self
-                .staged_chunks[index]
+            let (codec, bytes) = self.staged_chunks[index]
                 .take()
                 .ok_or(SenderError::ChunkNotStaged(index as u32))?;
             (codec, Cow::Owned(bytes), self.chunk_hashes[index])
         } else {
             let start64 = u64::from(index as u32) * u64::from(self.config.chunk_raw_size);
-            let end64 = (start64 + u64::from(self.config.chunk_raw_size)).min(self.stream.len() as u64);
+            let end64 =
+                (start64 + u64::from(self.config.chunk_raw_size)).min(self.stream.len() as u64);
             let raw = if start64 < self.stream.len() as u64 {
                 &self.stream[start64 as usize..end64 as usize]
             } else {
@@ -993,12 +1083,12 @@ impl Af2Sender {
             raptorq_encoder: chunk_enc,
             source_packets: chunk_source_packets,
             source_symbol_count: chunk_source_count,
-            // Resume the persisted never-repeated repair cursor; 0 marks a
-            // chunk never encoded before (repair starts at its source count).
-            next_repair_esi: match self.chunk_repair_esi[index] {
-                0 => chunk_source_count,
-                saved => saved,
-            },
+            block_source_symbol_counts: chunk_meta_obj
+                .blocks
+                .iter()
+                .map(|b| b.num_source_symbols)
+                .collect(),
+            next_repair_esi: self.chunk_repair_esi[index],
         });
         Ok(())
     }
@@ -1016,18 +1106,22 @@ impl Af2Sender {
         if epoch == 1 {
             // Epoch 1: the source-symbol pass plus the configured redundancy.
             k + redundancy
+        } else if epoch == 2 {
+            // First recovery pass stays short: start = K and target = 2K+R,
+            // therefore it emits exactly K+R fresh repairs. High-capture
+            // receivers revisit every missing chunk with the same latency as
+            // the pre-robust scheduler instead of paying a ~4x full epoch.
+            k.saturating_mul(2) + redundancy
+        } else if epoch % 2 == 1 {
+            // Robust fallback: start = K and target = 5K+R, therefore the wire
+            // carries exactly 4K+R FRESH repairs. A receiver capturing any
+            // stable quarter of the QR payloads can complete inside one such
+            // window even when its older decoder was evicted by other chunks.
+            k.saturating_mul(5) + redundancy
         } else {
-            // Epoch ≥ 2 sends repair-only (start = k). The receiver holds
-            // exactly ONE chunk decoder and drops it (with every collected
-            // symbol — zero cache, §11 resource policy) the moment the next
-            // chunk's META arrives, so a chunk that missed more than the
-            // redundancy budget inside its epoch-1 window starts every later
-            // window FROM SCRATCH. A window carrying only `redundancy` fresh
-            // symbols could therefore never reach K again — a permanently
-            // starved chunk and an unfinishable transfer (observed as
-            // received/total climbing past 100% forever). Every later epoch
-            // must carry a full K-symbol budget of fresh repair ESI plus the
-            // same slack as epoch 1, so one watched window suffices to decode.
+            // Alternate robust and short recovery windows. Low-capture peers
+            // complete inside an odd robust window; common high-capture peers
+            // regain the fast missing-chunk revisit cadence on even epochs.
             k.saturating_mul(2) + redundancy
         }
     }
@@ -1048,17 +1142,47 @@ impl Af2Sender {
     }
 
     /// Produce a fresh repair symbol for the Manifest (§9.1 monotonic ESI,
-    /// never repeated). Returns `None` once the ESI space is exhausted
-    /// (2^24 − 1): per §9.1 the sender stops rather than re-issuing.
+    /// never repeated). At the 24-bit boundary, keep that cursor pinned and
+    /// explicitly replay the legal Repair namespace instead of wrapping it or
+    /// falling back to a source-only stream that fixed four-code capture can
+    /// observe only partially.
     fn get_manifest_interleave_frame(&mut self) -> Result<Option<Vec<u8>>, SenderError> {
         let t = self.config.symbol_size;
         let current_esi = self.manifest_encoder.next_repair_esi;
-        if current_esi >= MAX_ESI {
-            return Ok(None);
-        }
-        self.manifest_encoder.next_repair_esi += 1;
         let block_encoders = self.manifest_encoder.raptorq_encoder.get_block_encoders();
         let block_idx = (current_esi as usize) % block_encoders.len().max(1);
+        let block_k = self.manifest_encoder.block_source_symbol_counts[block_idx];
+        if current_esi
+            .checked_add(block_k)
+            .map_or(true, |wire_esi| wire_esi > MAX_ESI)
+        {
+            let max_k = self
+                .manifest_encoder
+                .block_source_symbol_counts
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(1);
+            let replay_space = MAX_ESI.saturating_sub(max_k).saturating_add(1).max(1);
+            let replay_ordinal =
+                (self.manifest_repair_replay_cursor % u64::from(replay_space)) as u32;
+            self.manifest_repair_replay_cursor =
+                self.manifest_repair_replay_cursor.wrapping_add(1);
+            let replay_block = (replay_ordinal as usize) % block_encoders.len().max(1);
+            let pkt = &block_encoders[replay_block].repair_packets(replay_ordinal, 1)[0];
+            return Ok(Some(
+                Af2Frame {
+                    frame_type: FrameType::Symbol,
+                    object_id: self.manifest_encoder.object_id,
+                    sbn: pkt.payload_id().source_block_number(),
+                    esi: pkt.payload_id().encoding_symbol_id(),
+                    body: pkt.data().to_vec(),
+                    t,
+                }
+                .to_bytes()?,
+            ));
+        }
+        self.manifest_encoder.next_repair_esi += 1;
         let repair_pkts = block_encoders[block_idx].repair_packets(current_esi, 1);
         let pkt = &repair_pkts[0];
         Ok(Some(
@@ -1077,8 +1201,9 @@ impl Af2Sender {
     /// Produce the chunk's `symbol_index`-th symbol frame. Source symbols are
     /// replayable; repair symbols use a monotonically advancing ESI that is
     /// persisted across encoder free/rebuild so later epochs never re-issue a
-    /// repair ESI (§9.1/§9.2). Returns `None` when the repair ESI space is
-    /// exhausted — the caller must treat the chunk as finished.
+    /// repair ESI (§9.1/§9.2). At exhaustion the fresh cursor stays pinned and
+    /// an independent cursor explicitly replays the legal Repair namespace;
+    /// the optional return remains only as a defensive playlist escape hatch.
     fn get_chunk_symbol_frame(
         &mut self,
         chunk_index: usize,
@@ -1101,12 +1226,43 @@ impl Af2Sender {
             } else {
                 // Fresh repair symbol (monotonic ESI, never repeated, stop at 2^24 §9.1)
                 let current_repair_esi = enc.next_repair_esi;
-                if current_repair_esi >= MAX_ESI {
-                    return Ok(None);
-                }
-                enc.next_repair_esi += 1;
                 let block_encoders = enc.raptorq_encoder.get_block_encoders();
                 let block_idx = (current_repair_esi as usize) % block_encoders.len().max(1);
+                let block_k = enc.block_source_symbol_counts[block_idx];
+                if current_repair_esi
+                    .checked_add(block_k)
+                    .map_or(true, |wire_esi| wire_esi > MAX_ESI)
+                {
+                    let max_k = enc
+                        .block_source_symbol_counts
+                        .iter()
+                        .copied()
+                        .max()
+                        .unwrap_or(1);
+                    let replay_space =
+                        MAX_ESI.saturating_sub(max_k).saturating_add(1).max(1);
+                    let replay_ordinal = (self.chunk_repair_replay_cursor[chunk_index]
+                        % u64::from(replay_space)) as u32;
+                    self.chunk_repair_replay_cursor[chunk_index] = self
+                        .chunk_repair_replay_cursor[chunk_index]
+                        .wrapping_add(1);
+                    let replay_block =
+                        (replay_ordinal as usize) % block_encoders.len().max(1);
+                    let pkt =
+                        &block_encoders[replay_block].repair_packets(replay_ordinal, 1)[0];
+                    return Ok(Some(
+                        Af2Frame {
+                            frame_type: FrameType::Symbol,
+                            object_id: enc.object_id,
+                            sbn: pkt.payload_id().source_block_number(),
+                            esi: pkt.payload_id().encoding_symbol_id(),
+                            body: pkt.data().to_vec(),
+                            t,
+                        }
+                        .to_bytes()?,
+                    ));
+                }
+                enc.next_repair_esi += 1;
                 let repair_pkts = block_encoders[block_idx].repair_packets(current_repair_esi, 1);
                 let pkt = &repair_pkts[0];
                 (
@@ -1250,9 +1406,7 @@ mod tests {
                 let parsed = Af2Frame::from_bytes(&frame).unwrap();
                 if parsed.frame_type == FrameType::ObjectMeta {
                     if let Ok(rec) = ObjectMetaRecord::parse(&parsed.body) {
-                        if rec.role == ROLE_CHUNK
-                            && rec.object_index != 2
-                            && rec.object_index != 3
+                        if rec.role == ROLE_CHUNK && rec.object_index != 2 && rec.object_index != 3
                         {
                             drop_window = false;
                         }
@@ -1312,7 +1466,11 @@ mod tests {
         };
         let items = vec![
             (KIND_FILE, "a.bin".to_string(), next_bytes(300_000)),
-            (KIND_UTF8_TEXT, "b.txt".to_string(), b"streamed text entry".to_vec()),
+            (
+                KIND_UTF8_TEXT,
+                "b.txt".to_string(),
+                b"streamed text entry".to_vec(),
+            ),
         ];
         let config = SenderConfig {
             symbol_size: 512,
@@ -1423,11 +1581,9 @@ mod tests {
             loop {
                 match streamed.next_frame() {
                     Ok(_) => break,
-                    Err(SenderError::ChunkNotStaged(0)) => {
-                        streamed
-                            .stage_chunk(0, CODEC_RAW, vec![0x5Au8; 4096])
-                            .unwrap()
-                    }
+                    Err(SenderError::ChunkNotStaged(0)) => streamed
+                        .stage_chunk(0, CODEC_RAW, vec![0x5Au8; 4096])
+                        .unwrap(),
                     Err(e) => panic!("frame {frame_no}: unexpected error {e}"),
                 }
             }
@@ -1456,7 +1612,9 @@ mod tests {
                 items.push((
                     KIND_FILE,
                     format!("f{i}.bin"),
-                    (0..per).map(|j| ((i * 37 + j * 31) & 0xff) as u8).collect::<Vec<u8>>(),
+                    (0..per)
+                        .map(|j| ((i * 37 + j * 31) & 0xff) as u8)
+                        .collect::<Vec<u8>>(),
                 ));
             }
             let config = SenderConfig {
@@ -1468,7 +1626,10 @@ mod tests {
             let (manifest, _) =
                 crate::manifest::Manifest::parse(buffered.manifest_bytes()).unwrap();
             let chunk_count = manifest.chunk_count as usize;
-            assert_eq!(chunk_count, case, "case setup must produce the wanted chunk count");
+            assert_eq!(
+                chunk_count, case,
+                "case setup must produce the wanted chunk count"
+            );
             let mut streamed = Af2Sender::from_manifest_streamed(manifest, config).unwrap();
 
             let mut sorted = items;
@@ -1548,7 +1709,9 @@ mod tests {
                     items.push((
                         KIND_FILE,
                         format!("f{i}.bin"),
-                        (0..per).map(|j| ((i * 37 + j * 31) & 0xff) as u8).collect::<Vec<u8>>(),
+                        (0..per)
+                            .map(|j| ((i * 37 + j * 31) & 0xff) as u8)
+                            .collect::<Vec<u8>>(),
                     ));
                 }
                 let config = SenderConfig {
@@ -1668,7 +1831,11 @@ mod tests {
     fn streamed_sender_end_to_end() {
         let items = vec![
             (KIND_FILE, "a.bin".to_string(), vec![0x77u8; 250_000]),
-            (KIND_FILE, "b.bin".to_string(), b"second entry payload".to_vec()),
+            (
+                KIND_FILE,
+                "b.bin".to_string(),
+                b"second entry payload".to_vec(),
+            ),
         ];
         let config = SenderConfig {
             symbol_size: 512,
@@ -1796,11 +1963,9 @@ mod tests {
     #[test]
     fn from_manifest_rejects_chunk_raw_size_mismatch() {
         let items = vec![(KIND_FILE, "a.bin".to_string(), vec![0x11u8; 4096])];
-        let manifest = crate::manifest::build_manifest(
-            vec![(KIND_FILE, "a.bin", &items[0].2[..])],
-            1 << 20,
-        )
-        .unwrap();
+        let manifest =
+            crate::manifest::build_manifest(vec![(KIND_FILE, "a.bin", &items[0].2[..])], 1 << 20)
+                .unwrap();
         match Af2Sender::from_manifest(
             manifest,
             items,
@@ -1827,7 +1992,7 @@ mod tests {
         )];
         let mut sender = Af2Sender::new(items, SenderConfig::default()).unwrap();
         let mut frames = Vec::new();
-        // Skip bootstrap (4 ROOT + 4 META + up to 32 Manifest symbols)
+        // Skip bootstrap (4 ROOT + 4 META + one full Manifest source pass)
         for _ in 0..60 {
             let f = Af2Frame::from_bytes(&sender.next_frame().unwrap()).unwrap();
             frames.push(f.frame_type);
@@ -1960,11 +2125,9 @@ mod tests {
         for _ in 0..4000 {
             let f = sender.next_frame().unwrap();
             let parsed = Af2Frame::from_bytes(&f).unwrap();
-            if parsed.frame_type == FrameType::Symbol && !seen.insert((
-                parsed.object_id,
-                parsed.sbn,
-                parsed.esi,
-            )) {
+            if parsed.frame_type == FrameType::Symbol
+                && !seen.insert((parsed.object_id, parsed.sbn, parsed.esi))
+            {
                 duplicates += 1;
             }
         }
@@ -1972,7 +2135,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_repair_esi_exhaustion_stops() {
+    fn manifest_repair_esi_exhaustion_replays_legal_repairs() {
         let mut sender = Af2Sender::new(
             vec![(KIND_FILE, "x.bin".to_string(), vec![0x55u8; 2048])],
             SenderConfig {
@@ -1981,18 +2144,63 @@ mod tests {
             },
         )
         .unwrap();
-        sender.manifest_encoder.next_repair_esi = MAX_ESI;
+        let block_k = sender.manifest_encoder.block_source_symbol_counts[0];
+        // This is the first invalid repair ordinal for block 0. The old guard
+        // compared only the ordinal with MAX_ESI and let raptorq panic on
+        // `block_k + ordinal` several symbols before nominal exhaustion.
+        sender.manifest_encoder.next_repair_esi = MAX_ESI - block_k + 1;
+        let frame = sender
+            .get_manifest_interleave_frame()
+            .unwrap()
+            .expect("exhaustion must replay a legal repair symbol");
+        let parsed = Af2Frame::from_bytes(&frame).unwrap();
+        assert_eq!(parsed.frame_type, FrameType::Symbol);
         assert!(
-            sender.get_manifest_interleave_frame().unwrap().is_none(),
-            "§9.1: exhausted repair ESI space must stop, not wrap"
+            parsed.esi >= block_k && parsed.esi <= MAX_ESI,
+            "repair exhaustion replay must remain in the legal Repair ESI range"
+        );
+        assert_eq!(sender.manifest_encoder.next_repair_esi, MAX_ESI - block_k + 1);
+    }
+
+    #[test]
+    fn recovery_windows_have_exact_fresh_symbol_budgets() {
+        let mut sender = Af2Sender::new(
+            vec![(KIND_FILE, "x.bin".to_string(), vec![0xA5u8; 700 << 10])],
+            SenderConfig {
+                symbol_size: 512,
+                chunk_raw_size: 1 << 20,
+                redundancy_pct: 10,
+            },
+        )
+        .unwrap();
+        sender.ensure_chunk_encoder(0).unwrap();
+        let k = sender.chunk_encoders[0]
+            .as_ref()
+            .unwrap()
+            .source_symbol_count;
+        let redundancy = (u64::from(k) * 10 / 100).max(1) as u32;
+        assert_eq!(sender.chunk_target_symbols_at(0, 1), k + redundancy);
+        assert_eq!(
+            sender.chunk_target_symbols_at(0, 2) - k,
+            k + redundancy,
+            "epoch 2 is the short recovery pass"
+        );
+        assert_eq!(
+            sender.chunk_target_symbols_at(0, 3) - k,
+            k.saturating_mul(4) + redundancy,
+            "robust windows must carry 4K+R fresh repairs, not an absolute 4K target"
+        );
+        assert_eq!(
+            sender.chunk_target_symbols_at(0, 4) - k,
+            k + redundancy,
+            "even recovery epochs must restore the fast revisit cadence"
         );
     }
 
     #[test]
-    fn chunk_repair_esi_exhaustion_advances_playlist() {
-        // Exhausting chunk 0's repair ESI cursor mid-playlist: the sender must
-        // stop emitting chunk-0 symbols (forever — the cursor persists across
-        // rebuilds) and advance to the next chunk instead of re-issuing.
+    fn chunk_repair_esi_exhaustion_replays_repairs_and_advances_playlist() {
+        // Exhausting chunk 0's fresh ESI cursor must explicitly replay legal
+        // Repair packets without wrapping that cursor, then advance normally.
         let mut sender = Af2Sender::new(
             vec![
                 (KIND_FILE, "a.bin".to_string(), vec![0x41u8; 700 << 10]),
@@ -2017,42 +2225,114 @@ mod tests {
             sender.chunk_encoders[0].is_some(),
             "chunk 0 encoder must be live in its symbol phase"
         );
-        let chunk0_k = sender.chunk_encoders[0].as_ref().unwrap().source_symbol_count;
+        let chunk0_k = sender.chunk_encoders[0]
+            .as_ref()
+            .unwrap()
+            .source_symbol_count;
+        let first_invalid_repair = {
+            let enc = sender.chunk_encoders[0].as_ref().unwrap();
+            MAX_ESI - enc.block_source_symbol_counts[0] + 1
+        };
         if let Some(enc) = sender.chunk_encoders[0].as_mut() {
-            enc.next_repair_esi = MAX_ESI;
+            enc.next_repair_esi = first_invalid_repair;
         }
-        sender.chunk_repair_esi[0] = MAX_ESI;
+        sender.chunk_repair_esi[0] = first_invalid_repair;
         let chunk0_oid = sender.chunk_encoders[0].as_ref().unwrap().object_id;
+        let replay = sender
+            .get_chunk_symbol_frame(0, chunk0_k)
+            .unwrap()
+            .expect("exhausted chunk must replay a repair");
+        let replay = Af2Frame::from_bytes(&replay).unwrap();
+        assert!(replay.esi >= chunk0_k && replay.esi <= MAX_ESI);
+        assert_eq!(sender.chunk_repair_esi[0], first_invalid_repair);
         let chunk1_oid = {
             sender.ensure_chunk_encoder(1).unwrap();
             sender.chunk_encoders[1].as_ref().unwrap().object_id
         };
-        let mut chunk0_repairs = 0usize;
+        let mut chunk0_symbols = 0usize;
         let mut chunk1_symbols = 0usize;
         for _ in 0..600 {
             let f = sender.next_frame().unwrap();
             let parsed = Af2Frame::from_bytes(&f).unwrap();
             if parsed.frame_type == FrameType::Symbol {
                 if parsed.object_id == chunk0_oid {
-                    // Source symbols (esi < k) may still finish their epoch-1
-                    // pass; no repair symbol may ever be issued after the
-                    // cursor is exhausted.
-                    if parsed.esi >= chunk0_k {
-                        chunk0_repairs += 1;
-                    }
+                    chunk0_symbols += 1;
                 } else if parsed.object_id == chunk1_oid {
                     chunk1_symbols += 1;
                 }
             }
         }
-        assert_eq!(
-            chunk0_repairs, 0,
-            "exhausted chunk must never issue repair symbols (also across epochs)"
+        assert!(
+            chunk0_symbols > 0,
+            "exhausted chunk must remain broadcastable via explicit Repair replay"
         );
         assert!(
             chunk1_symbols > 0,
             "playlist must advance to the next chunk after exhaustion"
         );
+    }
+
+    #[test]
+    fn exhausted_repair_replay_recovers_a_fixed_four_code_lane() {
+        // A source-only fallback exposes the same source-index residue class
+        // to a receiver that can consistently see only one of four tiles, so
+        // it can never reach K. A 4K+R replay of the full Repair namespace
+        // must remain independently decodable under that capture pattern.
+        let mut x = 0x1234_5678u32;
+        let data: Vec<u8> = (0..(64 << 10))
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect();
+        let mut sender = Af2Sender::new(
+            vec![(KIND_FILE, "fixed-lane.bin".to_string(), data)],
+            SenderConfig {
+                symbol_size: 512,
+                chunk_raw_size: 1 << 20,
+                redundancy_pct: 25,
+            },
+        )
+        .unwrap();
+        sender.ensure_chunk_encoder(0).unwrap();
+        let enc = sender.chunk_encoders[0].as_ref().unwrap();
+        let k = enc.source_symbol_count;
+        let meta_frame = Af2Frame::from_bytes(&enc.meta_frame_bytes).unwrap();
+        let meta_record = ObjectMetaRecord::parse(&meta_frame.body).unwrap();
+        let object_meta = object_meta_from_oti(&meta_record.oti, 32 << 20).unwrap();
+        let mut decoder = raptorq_core::Decoder::new(object_meta).unwrap();
+
+        // MAX_ESI is invalid as a repair ordinal for every non-empty block,
+        // forcing the explicit replay path while leaving the fresh cursor
+        // pinned at its exhausted sentinel.
+        sender.chunk_encoders[0].as_mut().unwrap().next_repair_esi = MAX_ESI;
+        sender.chunk_repair_esi[0] = MAX_ESI;
+        let redundancy = (u64::from(k) * 25 / 100).max(1) as u32;
+        for displayed in 0..k.saturating_mul(4).saturating_add(redundancy) {
+            let bytes = sender
+                .get_chunk_symbol_frame(0, k.saturating_add(displayed))
+                .unwrap()
+                .unwrap();
+            // Model a fixed physical tile: only every fourth displayed code
+            // reaches this decoder.
+            if displayed % 4 == 0 {
+                let frame = Af2Frame::from_bytes(&bytes).unwrap();
+                decoder
+                    .add_symbol(&raptorq_core::Symbol::new(
+                        frame.sbn as u32,
+                        frame.esi,
+                        frame.body,
+                    ))
+                    .unwrap();
+            }
+        }
+        assert!(
+            decoder.is_complete(),
+            "fixed 1-of-4 capture must still converge after fresh ESI exhaustion"
+        );
+        assert_eq!(sender.chunk_repair_esi[0], MAX_ESI);
     }
 
     /// Host-side prep flow: plan_chunks → assemble → encode_chunk_balanced →
@@ -2091,8 +2371,7 @@ mod tests {
                 let (.., content) = &items[seg.item as usize];
                 raw.extend_from_slice(&content[seg.start as usize..(seg.start + seg.len) as usize]);
             }
-            let (codec, encoded) =
-                crate::chunk::encode_chunk_balanced(&raw, 0, true);
+            let (codec, encoded) = crate::chunk::encode_chunk_balanced(&raw, 0, true);
             let pc = if codec == crate::meta::CODEC_RAW {
                 PreencodedChunk::RawMarker
             } else {
@@ -2133,14 +2412,20 @@ mod tests {
         let err = Af2Sender::new_with_preencoded(
             items.clone(),
             config.clone(),
-            vec![(0, PreencodedChunk::Encoded(crate::meta::CODEC_ZSTD, raw_clone))],
+            vec![(
+                0,
+                PreencodedChunk::Encoded(crate::meta::CODEC_ZSTD, raw_clone),
+            )],
         );
         assert!(err.err().unwrap().to_string().contains("strictly-smaller"));
         // RAW bytes must use the marker, not carried bytes.
         let err = Af2Sender::new_with_preencoded(
             items.clone(),
             config.clone(),
-            vec![(0, PreencodedChunk::Encoded(crate::meta::CODEC_RAW, vec![1, 2, 3]))],
+            vec![(
+                0,
+                PreencodedChunk::Encoded(crate::meta::CODEC_RAW, vec![1, 2, 3]),
+            )],
         );
         assert!(err.err().unwrap().to_string().contains("RawMarker"));
         // Out-of-range index.
@@ -2159,7 +2444,10 @@ mod tests {
         let err = Af2Sender::new_with_preencoded(
             items,
             config,
-            vec![(0, PreencodedChunk::RawMarker), (0, PreencodedChunk::RawMarker)],
+            vec![
+                (0, PreencodedChunk::RawMarker),
+                (0, PreencodedChunk::RawMarker),
+            ],
         );
         assert!(err.err().unwrap().to_string().contains("twice"));
     }
@@ -2188,7 +2476,8 @@ mod tests {
         let mut assembled = Vec::new();
         for seg in &plan[0] {
             let content = &items[seg.item as usize].2;
-            assembled.extend_from_slice(&content[seg.start as usize..(seg.start + seg.len) as usize]);
+            assembled
+                .extend_from_slice(&content[seg.start as usize..(seg.start + seg.len) as usize]);
         }
         // NFC-normalized "méxico.txt" ('m' = 0x6d) sorts AFTER "b.bin"
         // ('b' = 0x62) in path-byte order, so b.bin's bytes come first.

@@ -104,24 +104,24 @@ buildTypes {
 // taskGraph guard: 任一 release 任务在 !releaseSigningReady 时抛 GradleException。
 ```
 
-`keystore.properties`（每个构建环境各一份，git-ignored）指向 `dist/` 下的 release keystore：
+`keystore.properties`（每个构建环境各一份，git-ignored）指向与发布产物隔离的签名目录：
 
 ```properties
 # apps/scanner/keystore.properties
-storeFile=../../dist/airferry-release.keystore
+storeFile=../../.airferry-signing/airferry-release.keystore
 storePassword=airferry
 keyAlias=airferry
 keyPassword=airferry
 ```
 
-> keystore 路径相对于 Gradle `rootProject`（即 `apps/scanner/`），解析到 `<repo>/dist/airferry-release.keystore`。`dist/` 与 `*.keystore` 均在 `.gitignore` 中，密钥随 release 产物一起放在 `dist/`、不入 git。
+> keystore 路径相对于 Gradle `rootProject`（即 `apps/scanner/`），解析到 `<repo>/.airferry-signing/airferry-release.keystore`。该目录与 `dist/` 物理隔离并被 Git 忽略；`dist/` 中发现任何私钥都会让发布门禁失败。根构建脚本也可用 `AIRFERRY_SIGNING_DIR` 指向仓库外的受控密钥目录。
 >
 > 示例口令仅供本地说明；正式分发必须使用 AirFerry 的固定 release keystore。缺少文件、字段或 keystore 时 `assembleRelease` 会直接失败，绝不会回退到 debug key。根脚本还会用 `apksigner` 核对内置的发布证书 SHA-256 指纹 `44577EDA2C6D4F44638C9D61DC161F08FDB30FCEE6A3410AADAEB7CE65A97FDD`；签名变化会直接终止打包。
 
 ## 安装到设备
 
 ```bash
-adb install app/build/outputs/apk/dist/app-release.apk
+adb install app/build/outputs/apk/release/app-release.apk
 ```
 
 ## 原生库说明
@@ -136,13 +136,13 @@ APK 包含三个原生库：
 
 ## ZXing-C++ 构建
 
-ZXing-C++ 通过 CMake `FetchContent` 从 GitHub 拉取（固定到 v3.0.2 的 commit），首次构建时自动编译。Android 的完整识别逻辑位于 `scan_jni.cpp`，并与 `QrDecodePool.kt`、`ZxingDecoder.kt` 一起锁定为 v1.1.3 的解码实现；Windows 用 C#/C ABI 镜像相同模式，但不直接编译这份 JNI 文件。依赖仍固定到不可变 commit，不回退供应链加固。
+ZXing-C++ 通过 CMake `FetchContent` 下载固定 commit 的源码归档，并校验 SHA-256，首次构建时自动编译。跨端识别策略位于 `core/zxing-decoder/airferry_zxing_core.cpp`；`scan_jni.cpp` 只保留 JNI 参数/结果适配，Android、Web、Windows 共用同一解码核心。构建过程不执行嵌套 Git 更新，也不拉取已禁用写码器所需的 zint 子模块。
 
 ```cmake
 # app/src/main/cpp/CMakeLists.txt
 FetchContent_Declare(zxing
-    GIT_REPOSITORY https://github.com/zxing-cpp/zxing-cpp.git
-    GIT_TAG 8dd1cf5c4fd6fb6211bb96713db926ac6f2cf825
+    URL https://github.com/zxing-cpp/zxing-cpp/archive/8dd1cf5c4fd6fb6211bb96713db926ac6f2cf825.tar.gz
+    URL_HASH SHA256=8d9f87adfc45cd83735f23b8f1302b3c700b78804f2e4a1eac9ff779dd8d5f86
 )
 ```
 

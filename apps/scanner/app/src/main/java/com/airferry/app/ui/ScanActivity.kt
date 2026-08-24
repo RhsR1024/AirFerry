@@ -75,6 +75,15 @@ class ScanActivity : ComponentActivity() {
     /** Resumed chunk indices awaiting post-manifest re-verification (§12:
      *  reopen must re-verify completed bits against the manifest table). */
     private var pendingReverify: MutableSet<Int>? = null
+    /**
+     * Latch for "the Manifest object has been decoded" (status bit
+     * ManifestReady is an EDGE event). Probing `session.snapshot().entries`
+     * instead used to rebuild + parse the full JNI snapshot JSON on EVERY
+     * ingested symbol during the "all chunks done but Manifest pending"
+     * window — exactly when symbol throughput matters most.
+     */
+    @Volatile
+    private var manifestDecodedLatch = false
     private val cameraExecutor = Executors.newSingleThreadExecutor()
     /** Dedicated single-thread executor for the post-recovery heavy work
      *  (JNI assemble, CRC, disk writes, bundle unpacking) so it never blocks
@@ -673,23 +682,49 @@ class ScanActivity : ComponentActivity() {
             ledger?.discard()
             ledger = null
             pendingReverify = null
+            manifestDecodedLatch = false
         }
         if (status.manifestReady) {
+            manifestDecodedLatch = true
             reverifyResumedChunks()
         }
         if (status.chunkReady) {
             val snap = session.snapshot()
+            if (snap.transferIdHex.isEmpty() || snap.chunkRawSize <= 0) {
+                // Transient snapshot failure (JNI/JSON): no identity/geometry
+                // for the spill. Skip this frame's drain — the chunk stays
+                // resident and the next ChunkReady retries. Forcing the drain
+                // here would write junk spill files or be misread as a DISK
+                // failure, permanently pausing reception.
+                return
+            }
             val spill = chunkSpill ?: ChunkSpillStore(
                 cacheDir, snap.transferIdHex
             ).also { chunkSpill = it }
-            session.drainLastChunk { index, chunkRawSize, bytes ->
-                spill.write(index, chunkRawSize, bytes)
-                // §12 commit order: chunk bytes are fsync'd into the spill
-                // above; only then may the ledger journal record the bit.
-                val led = ledger ?: Af2LedgerStore.create(
-                    cacheDir, snap.transferIdHex, snap.chunkRawSize, snap.rootFrameBytes
-                ).also { ledger = it }
-                led.commit(index)
+            try {
+                session.drainLastChunk { index, chunkRawSize, bytes ->
+                    spill.write(index, chunkRawSize, bytes)
+                    // §12 commit order: chunk bytes are fsync'd into the spill
+                    // above; only then may the ledger journal record the bit.
+                    val led = ledger ?: Af2LedgerStore.create(
+                        cacheDir, snap.transferIdHex, snap.chunkRawSize, snap.rootFrameBytes
+                    ).also { ledger = it }
+                    led.commit(index)
+                }
+            } catch (e: Exception) {
+                // Do not continue decoding into an ever-growing native fallback
+                // when disk space/quota is exhausted. The just-completed chunk
+                // remains resident and the user can free space then restart.
+                ingestStopped.set(true)
+                Log.e(TAG, "chunk spill failed; reception paused", e)
+                runOnUiThread {
+                    Toast.makeText(
+                        this,
+                        "临时存储写入失败，接收已暂停。请释放存储空间后重新接收。",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
+                return
             }
         }
 
@@ -701,8 +736,7 @@ class ScanActivity : ComponentActivity() {
         // chain at camera fps and starve symbol ingest.
         val now = System.currentTimeMillis()
         if (status.complete) {
-            val manifestDecoded = session.snapshot().entries.isNotEmpty()
-            if (!manifestDecoded && now - lastUiUpdate < 150) return
+            if (!manifestDecodedLatch && now - lastUiUpdate < 150) return
         } else if (now - lastUiUpdate < 150) {
             return
         }
@@ -736,7 +770,7 @@ class ScanActivity : ComponentActivity() {
         // with "块校验失败" and discard a fully received transfer. Keep
         // ingesting instead — the recurring MANIFEST META + interleave symbols
         // decode it, and every later frame re-announces complete=true.
-        val manifestDecoded = session.snapshot().entries.isNotEmpty()
+        val manifestDecoded = manifestDecodedLatch
         val completionEligible = status.complete && manifestDecoded
         val displayProgress =
             if (status.complete && !manifestDecoded) progress.copy(complete = false) else progress
@@ -930,7 +964,7 @@ class ScanActivity : ComponentActivity() {
                             intent?.let { runOnUiThread { startActivity(it) } }
                         } catch (e: Exception) {
                             clearRecoveryStage()
-                            resetReceiverAfterRecoveryFailure()
+                            resetReceiverAfterRecoveryFailure(poolAtEnqueue)
                             runOnUiThread {
                                 Toast.makeText(
                                     this,
@@ -946,7 +980,7 @@ class ScanActivity : ComponentActivity() {
                             // user can reopen the file from the list.
                             android.util.Log.e("ScanActivity", "recoverAndStage OOM", e)
                             clearRecoveryStage()
-                            resetReceiverAfterRecoveryFailure()
+                            resetReceiverAfterRecoveryFailure(poolAtEnqueue)
                             runOnUiThread {
                                 Toast.makeText(this, "文件过大，接收内存不足", Toast.LENGTH_LONG).show()
                             }
@@ -1090,7 +1124,7 @@ class ScanActivity : ComponentActivity() {
             if (!session.finalVerifyFinish()) {
                 throw IllegalStateException("最终校验失败，请对准二维码重新接收")
             }
-        } else if (stream != null && !session.verifyFinalStream(stream!!)) {
+        } else if (stream != null && !session.verifyFinalStream(stream)) {
             throw IllegalStateException("最终校验失败，请对准二维码重新接收")
         }
 
@@ -1160,7 +1194,7 @@ class ScanActivity : ComponentActivity() {
             if (text != null) {
                 updateRecoveryStage("正在保存文字…")
                 val put = store.putBytes(
-                    this, textName, textBytes!!,
+                    this, textName, textBytes,
                     crcUnknown = true, kind = "text",
                 )
                 clearRecoveryStage()
@@ -1284,8 +1318,13 @@ class ScanActivity : ComponentActivity() {
     }
 
     /** Recover from any post-decode failure without stranding the scanner in
-     * `completedHandled=true` / `ingestStopped=true`. */
-    private fun resetReceiverAfterRecoveryFailure() {
+     * `completedHandled=true` / `ingestStopped=true`.
+     *
+     * `poolAtEnqueue` is the pool captured when the recovery task was queued
+     * (see the completion path) — re-reading `decodePool` here would take the
+     * lock-less branch once onDestroy nulls the field and race a straggler
+     * worker's ingest on the freshly swapped manager. */
+    private fun resetReceiverAfterRecoveryFailure(poolAtEnqueue: QrDecodePool?) {
         val swap = {
             session.destroy()
             session = ReceiverSessionManager()
@@ -1294,13 +1333,14 @@ class ScanActivity : ComponentActivity() {
             ledger?.discard()
             ledger = null
             pendingReverify = null
+            manifestDecodedLatch = false
             ingestStopped.set(false)
             completedHandled = false
             lastUiUpdate = 0
             rateSamples.clear()
         }
         try {
-            decodePool?.runExclusive(swap) ?: swap()
+            poolAtEnqueue?.runExclusive(swap) ?: swap()
         } catch (resetError: Exception) {
             Log.e(TAG, "failed to reset receiver after recovery error", resetError)
         }
@@ -1329,6 +1369,7 @@ class ScanActivity : ComponentActivity() {
                 ledger?.discard()
                 ledger = null
                 pendingReverify = null
+                manifestDecodedLatch = false
                 ingestStopped.set(false)
             }
             try {

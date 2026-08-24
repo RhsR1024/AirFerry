@@ -13,7 +13,7 @@ internal static class ZxingDecoder
 {
     internal readonly record struct MultiResult(byte[] Payload, int[] Bbox);
 
-    private const int MaxResults = 64;
+    private const int MaxResults = 4;
     private const int MaxPackedBytes = 16 * 1024 * 1024;
 
     internal static uint AbiVersion() => NativeZxingBridge.AbiVersion();

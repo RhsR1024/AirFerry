@@ -49,6 +49,8 @@ pub enum Error {
     NotDecodable { sbn: u32 },
     #[error("symbol (sbn={sbn}, esi={esi}) does not belong to this object")]
     UnknownSymbol { sbn: u32, esi: u32 },
+    #[error("source block {sbn} exceeded its bounded symbol budget ({limit})")]
+    SymbolBudgetExceeded { sbn: u32, limit: u32 },
 }
 
 pub(crate) type Result<T> = core::result::Result<T, Error>;

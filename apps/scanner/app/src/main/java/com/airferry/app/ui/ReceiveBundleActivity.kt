@@ -348,7 +348,7 @@ class ReceiveBundleActivity : ComponentActivity() {
                 Intent(this, ReceiveTextActivity::class.java).apply {
                     // M5: 只传 FILE_PATH — ReceiveTextActivity 从落盘文件加载
                     // 文字（其类注释明确设计为从 staged file 加载以避开 Binder
-                    // 事务限制）。文本上限 8 MiB，作为 Intent extra 传输必撞
+                    // 事务限制）。文本上限 256 KiB，作为 Intent extra 传输仍可能撞
                     // TransactionTooLargeException 直接崩溃。
                     putExtra("FILE_PATH", info.filePath)
                     putExtra("FILE_NAME", info.name)

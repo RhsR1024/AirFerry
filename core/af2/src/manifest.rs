@@ -184,7 +184,7 @@ pub fn validate_path(path: &str) -> Result<(), &'static str> {
         return Err("empty path");
     }
     if !is_nfc(path) {
-        return Err("path is not in Unicode NFC (or carries combining marks)");
+        return Err("path is not in Unicode NFC");
     }
     if path.len() > MAX_PATH_BYTES {
         return Err("path exceeds 1024 bytes");
@@ -231,13 +231,44 @@ fn is_windows_reserved_name(comp: &str) -> bool {
 
 /// Sanitize one path component for a Windows-targeted save.
 fn sanitize_component_windows(comp: &str) -> String {
-    let mut out = comp.replace(':', "_");
+    let mut out: String = comp
+        .chars()
+        .map(|c| if matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') { '_' } else { c })
+        .collect();
     if is_windows_reserved_name(&out) {
-        out.push('~');
+        // Windows applies the device-name rule to the stem even when an
+        // extension is present. Appending after the extension (`CON.txt~`)
+        // therefore remains a reserved device path; put the discriminator
+        // before the first dot (`CON~.txt`) instead.
+        let extension_at = out.find('.').unwrap_or(out.len());
+        let extension = &out[extension_at..];
+        let stem = &out[..extension_at];
+        let keep = MAX_COMPONENT_BYTES.saturating_sub(extension.len() + 1);
+        let mut boundary = stem.len().min(keep);
+        while !stem.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        let mut safe = String::with_capacity(boundary + 1 + extension.len());
+        safe.push_str(&stem[..boundary]);
+        safe.push('~');
+        safe.push_str(extension);
+        out = safe;
     }
     if out.ends_with('.') || out.ends_with(' ') {
-        out.push('~');
+        out = append_windows_suffix(&out, "~");
     }
+    out
+}
+
+fn append_windows_suffix(base: &str, suffix: &str) -> String {
+    let keep = MAX_COMPONENT_BYTES.saturating_sub(suffix.len());
+    let mut boundary = base.len().min(keep);
+    while !base.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    let mut out = String::with_capacity(boundary + suffix.len());
+    out.push_str(&base[..boundary]);
+    out.push_str(suffix);
     out
 }
 
@@ -247,7 +278,8 @@ fn sanitize_component_windows(comp: &str) -> String {
 ///
 /// - `windows == false`: names return unchanged (POSIX-family filesystems
 ///   accept every wire-legal path).
-/// - `windows == true`: per component, `:` → `_` (drive/ADS separator);
+/// - `windows == true`: per component, all Win32-forbidden punctuation is
+///   replaced by `_`;
 ///   reserved device names and trailing dots/spaces (unsavable on NTFS)
 ///   get a `~`; entries that collide under case-folding get deterministic
 ///   `~1`, `~2`, … suffixes in manifest order.
@@ -259,27 +291,43 @@ pub fn sanitize_save_paths(paths: &[&str], windows: bool) -> Vec<String> {
     if !windows {
         return paths.iter().map(|p| p.to_string()).collect();
     }
-    let mut out: Vec<String> = paths
+    use std::collections::{HashMap, HashSet};
+
+    // Allocate names per directory component, not only for complete paths.
+    // This prevents `A/x` and `a/y` from aliasing the same Windows directory.
+    let mut assigned: HashMap<(String, String), String> = HashMap::new();
+    let mut used: HashMap<String, HashSet<String>> = HashMap::new();
+    paths
         .iter()
-        .map(|p| {
-            p.split('/')
-                .map(sanitize_component_windows)
-                .collect::<Vec<_>>()
-                .join("/")
+        .map(|path| {
+            let mut parent = String::new();
+            let mut components = Vec::new();
+            for original in path.split('/') {
+                let map_key = (parent.clone(), original.to_string());
+                let component = if let Some(existing) = assigned.get(&map_key) {
+                    existing.clone()
+                } else {
+                    let base = sanitize_component_windows(original);
+                    let names = used.entry(parent.clone()).or_default();
+                    let mut candidate = base.clone();
+                    let mut ordinal = 1usize;
+                    while names.contains(&candidate.to_lowercase()) {
+                        candidate = append_windows_suffix(&base, &format!("~{ordinal}"));
+                        ordinal += 1;
+                    }
+                    names.insert(candidate.to_lowercase());
+                    assigned.insert(map_key, candidate.clone());
+                    candidate
+                };
+                if !parent.is_empty() {
+                    parent.push('/');
+                }
+                parent.push_str(&component.to_lowercase());
+                components.push(component);
+            }
+            components.join("/")
         })
-        .collect();
-    // Case-fold collisions: first occurrence keeps the name, later ones get
-    // ~k (k = occurrence number), deterministic in manifest order.
-    let mut folds: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for p in out.iter_mut() {
-        let key = p.to_lowercase();
-        let next = folds.entry(key).or_insert(0);
-        if *next > 0 {
-            p.push_str(&format!("~{}", *next));
-        }
-        *next += 1;
-    }
-    out
+        .collect()
 }
 
 impl Manifest {
@@ -307,6 +355,7 @@ impl Manifest {
             return Err(ManifestError::BadChunkHashesLen(self.chunk_count));
         }
         let mut prev_path: Option<&str> = None;
+        let mut non_directory_paths = std::collections::HashSet::new();
         let mut stream_end: u64 = 0;
         for (index, e) in self.entries.iter().enumerate() {
             validate_path(&e.path)
@@ -323,6 +372,18 @@ impl Manifest {
                 }
             }
             prev_path = Some(e.path.as_str());
+            if e.path
+                .match_indices('/')
+                .any(|(boundary, _)| non_directory_paths.contains(&e.path[..boundary]))
+            {
+                return Err(ManifestError::BadEntry {
+                    index,
+                    reason: "path descends through a non-directory entry",
+                });
+            }
+            if e.kind != KIND_DIRECTORY {
+                non_directory_paths.insert(e.path.as_str());
+            }
             if e.kind == KIND_DIRECTORY {
                 if e.content_offset != 0 || e.content_size != 0 || e.content_hash != empty_hash() {
                     return Err(ManifestError::BadEntry {
@@ -745,7 +806,21 @@ mod tests {
             ["aux~/config.txt", "notes_a.txt", "tail.~"]
         );
         assert_eq!(sanitize_save_paths(&["CON"], true), ["CON~"]);
-        assert_eq!(sanitize_save_paths(&["com3.bin"], true), ["com3.bin~"]);
+        assert_eq!(sanitize_save_paths(&["com3.bin"], true), ["com3~.bin"]);
+        assert_eq!(sanitize_save_paths(&["CON.txt"], true), ["CON~.txt"]);
+        assert_eq!(
+            sanitize_save_paths(&["bad<name>|?.txt", "bad_name___.txt"], true),
+            ["bad_name___.txt", "bad_name___.txt~1"]
+        );
+        assert_eq!(
+            sanitize_save_paths(&["A/x.txt", "a/y.txt", "A/z.txt"], true),
+            ["A/x.txt", "a~1/y.txt", "A/z.txt"]
+        );
+        // A generated suffix must not collide with a canonical input name.
+        assert_eq!(
+            sanitize_save_paths(&["a.txt", "A.txt", "A.txt~1"], true),
+            ["a.txt", "A.txt~1", "A.txt~1~1"]
+        );
         // Same path twice (multi-entry manifests forbid duplicates, but the
         // sanitizer must stay deterministic if a caller misuses it).
         assert_eq!(
@@ -784,6 +859,20 @@ mod tests {
         assert!(matches!(
             m.encode(),
             Err(ManifestError::StreamEndMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_file_used_as_parent_directory() {
+        let mut m = sample();
+        m.entries[0].path = "data".into();
+        m.entries[1].path = "data/child.txt".into();
+        assert!(matches!(
+            m.encode(),
+            Err(ManifestError::BadEntry {
+                reason: "path descends through a non-directory entry",
+                ..
+            })
         ));
     }
 

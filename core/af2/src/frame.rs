@@ -36,7 +36,7 @@ pub const FOOTER_SIZE: usize = 4;
 pub const MIN_T: usize = 256;
 pub const MAX_T: usize = 2400;
 
-/// ESI upper bound (2²⁴); the wire field is a u24.
+/// Largest legal ESI value; the wire field is an unsigned 24-bit integer.
 pub const MAX_ESI: u32 = (1 << 24) - 1;
 /// SBN legal domain 0..=254 (255 is reserved by RFC 6330).
 pub const MAX_SBN: u8 = 254;

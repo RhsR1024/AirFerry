@@ -19,7 +19,8 @@ namespace AirFerry.Windows.Bundle;
 /// <b>Windows extras</b> (beyond the Android version):
 /// <list type="bullet">
 /// <item>Reserved device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9) get a
-/// trailing <c>_</c> so they're no longer treated as devices.</item>
+/// <c>_</c> inserted before the extension so they're no longer treated as
+/// devices.</item>
 /// <item>Trailing dots/spaces are stripped (Win32 drops them silently, which
 /// would change the displayed name).</item>
 /// <item>Truncation respects char surrogate pairs to avoid splitting a
@@ -91,7 +92,9 @@ public static class FileNameUtil
         }
 
         // Windows reserved device names: CON, PRN, AUX, NUL, COM1..9, LPT1..9.
-        // Append "_" so "CON" becomes "CON_" (no longer a device).
+        // Insert "_" before the extension: Win32 ignores the extension while
+        // resolving device names, so appending after it ("CON.txt_") would
+        // still address CON. "CON_.txt" is an ordinary file.
         return NeutralizeReservedName(cleaned);
     }
 
@@ -203,7 +206,18 @@ public static class FileNameUtil
         }
         if (stem.Length is >= 3 and <= 4 && IsReservedStem(stem))
         {
-            return name + "_";
+            int insertAt = dot >= 0 ? dot : name.Length;
+            string safe = name.Insert(insertAt, "_");
+            if (safe.Length > MaxComponentChars)
+            {
+                int cut = MaxComponentChars;
+                if (char.IsLowSurrogate(safe[cut]))
+                {
+                    cut--;
+                }
+                safe = safe[..cut];
+            }
+            return safe;
         }
         return name;
     }
@@ -228,7 +242,7 @@ public static class FileNameUtil
         {
             bool isComOrLpt = stem.StartsWith("COM", StringComparison.OrdinalIgnoreCase)
                 || stem.StartsWith("LPT", StringComparison.OrdinalIgnoreCase);
-            return isComOrLpt && char.IsDigit(stem[3]);
+            return isComOrLpt && stem[3] is >= '1' and <= '9';
         }
         return false;
     }

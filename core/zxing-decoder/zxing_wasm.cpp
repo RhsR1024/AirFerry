@@ -57,6 +57,48 @@ __attribute__((used)) uint8_t* airferry_wasm_decode_multi_y(
     }
 }
 
+// Tracked-region hot path (the web mirror of Android/Windows
+// QrDecodePool::decodeMultiYTracked): decode only the expanded windows around
+// the caller's last-known per-code bboxes instead of scanning the full frame.
+// `hints` is a packed array of `hint_count` × 4 int32 {minX,minY,maxX,maxY} in
+// full-frame pixel coords; `margin_fraction` expands each window (0.35 like
+// the native tracker). Same packed wire layout as above — returned bboxes are
+// in FULL-frame coords, ready to feed the tracker's nearest-slot update.
+__attribute__((used)) uint8_t* airferry_wasm_decode_regions_y(
+    const uint8_t* pixels,
+    size_t pixel_len,
+    int32_t width,
+    int32_t height,
+    int32_t row_stride,
+    const int32_t* hints,
+    size_t hint_count,
+    float margin_fraction,
+    size_t* out_len)
+{
+    if (out_len == nullptr) {
+        return nullptr;
+    }
+    *out_len = 0;
+    try {
+        const auto results = AirFerryZxing::DecodeMultiRegions(
+            pixels, pixel_len, width, height, row_stride,
+            hints, hint_count, margin_fraction);
+        const std::vector<uint8_t> packed = AirFerryZxing::PackMultiResults(results);
+        if (packed.empty()) {
+            return nullptr;
+        }
+        auto* buffer = static_cast<uint8_t*>(std::malloc(packed.size()));
+        if (buffer == nullptr) {
+            return nullptr;
+        }
+        std::memcpy(buffer, packed.data(), packed.size());
+        *out_len = packed.size();
+        return buffer;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
 __attribute__((used)) void airferry_wasm_free(void* ptr)
 {
     std::free(ptr);

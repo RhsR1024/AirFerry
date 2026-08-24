@@ -201,20 +201,26 @@ class ReceiverSessionManager {
         val legacyPeerFrames: Int = 0
     )
 
-    private var cachedSnapshot: Snapshot? = null
+    private class SnapshotCache(val snap: Snapshot, val atNs: Long)
+
+    private var cachedSnapshot: SnapshotCache? = null
 
     fun snapshot(): Snapshot {
-        if (!initialized) return Snapshot(false, "", "", ByteArray(0), 0L, 0, 0, 0, emptyList(), 0)
-        cachedSnapshot?.let { snap ->
+        if (!initialized) return EMPTY_SNAPSHOT
+        val now = System.nanoTime()
+        cachedSnapshot?.let { c ->
             // Freeze only once the Manifest is decoded. `meta_confirmed` in the
             // AF2 snapshot merely means the ROOT locked — freezing there (as a
             // v1-era refactor did) pins `entries = []` for the whole session
             // and staging falls back to one nameless concatenated file.
-            if (snap.metaConfirmed && snap.entries.isNotEmpty()) return snap
+            if (snapIsFrozen(c.snap)) return c.snap
+            // Pre-manifest: a short TTL coalesces the per-UI-tick getter burst
+            // (fileName/fileSize/segmentCount/… each used to run its own
+            // snapshot JNI round-trip — ~8 JSON builds+parses per 150 ms tick).
+            if (now - c.atNs < SNAPSHOT_TTL_NS) return c.snap
         }
         val json = NativeBridge.receiverSnapshotJson(handle)
-            ?: return cachedSnapshot
-                ?: Snapshot(false, "", "", ByteArray(0), 0L, 0, 0, 0, emptyList(), 0)
+            ?: return cachedSnapshot?.snap ?: EMPTY_SNAPSHOT
         return try {
             val o = JSONObject(json)
             val rootHex = o.optString("root_frame_hex", "")
@@ -248,11 +254,10 @@ class ReceiverSessionManager {
                 entries = entriesList,
                 legacyPeerFrames = o.optInt("legacy_peer_frames", 0)
             )
-            cachedSnapshot = snap
+            cachedSnapshot = SnapshotCache(snap, now)
             snap
         } catch (_: Exception) {
-            cachedSnapshot
-                ?: Snapshot(false, "", "", ByteArray(0), 0L, 0, 0, 0, emptyList(), 0)
+            cachedSnapshot?.snap ?: EMPTY_SNAPSHOT
         }
     }
 
@@ -263,6 +268,9 @@ class ReceiverSessionManager {
                 Character.digit(s[i * 2 + 1], 16)).toByte()
         }
     }
+
+    private fun snapIsFrozen(snap: Snapshot): Boolean =
+        snap.metaConfirmed && snap.entries.isNotEmpty()
 
     fun fileName(): String {
         val snap = snapshot()
@@ -315,8 +323,16 @@ class ReceiverSessionManager {
     fun drainLastChunk(sink: (index: Int, chunkRawSize: Int, bytes: ByteArray) -> Unit) {
         val index = lastChunkIndex()
         if (index < 0) return
-        val bytes = assembleChunk(index) ?: return
         val chunkRawSize = snapshot().chunkRawSize
+        if (chunkRawSize <= 0) {
+            // Geometry unknown (snapshot JNI/JSON failure before any good
+            // read): the spill sink cannot compute offsets without it and its
+            // failure would be misread as a DISK failure, permanently pausing
+            // reception. Leave the chunk resident; the next ChunkReady drains
+            // it once a good snapshot is available.
+            return
+        }
+        val bytes = assembleChunk(index) ?: return
         sink(index, chunkRawSize, bytes)
         forgetChunk(index)
     }
@@ -334,5 +350,10 @@ class ReceiverSessionManager {
     companion object {
         const val MAGIC = 0x4146 // ASCII 'AF' (protocol 2)
         const val PROTOCOL_VERSION = 2
+
+        /** Pre-manifest snapshot coalescing window (matches the web's TTL). */
+        private const val SNAPSHOT_TTL_NS = 150_000_000L
+        private val EMPTY_SNAPSHOT =
+            Snapshot(false, "", "", ByteArray(0), 0L, 0, 0, 0, emptyList(), 0)
     }
 }

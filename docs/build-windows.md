@@ -12,7 +12,7 @@
 | 相机/采集卡 | OpenCvSharp4 (DirectShow 后端) | 单句柄读取；Gray 送解码、池化 BGR24 快照送预览 |
 | 设备枚举 | DirectShowLib (DsDevice) | `FilterCategory.VideoInputDevice` 同时覆盖摄像头+采集卡 |
 | 屏幕区域/窗口捕获 | GDI（`BitBlt`/`PrintWindow`/`GetDIBits`，P/Invoke） | 零新增 NuGet 依赖；`ScreenCapture.cs` 实现 `IFrameSource`，与设备源同管线（详见 §7.1） |
-| QR 解码 | ZXing-C++（全帧/ROI 均 TryHarder + TryInvert） | `core/zxing-decoder/` + Windows 薄 C ABI，选项与 Android v1.1.3 相同 |
+| QR 解码 | ZXing-C++（全帧 TryHarder+TryInvert；已锁定 ROI 跳过反色重试） | `core/zxing-decoder/` + Windows 薄 C ABI，与 Android/Web 共享策略 |
 | 核心引擎 | Rust `transfer-engine` (C ABI, `--features cffi`) | 编解码逻辑与 Android/WASM 共享，编译为 `transfer_engine.dll` |
 | MVVM | CommunityToolkit.Mvvm | ObservableObject / RelayCommand 源生成器 |
 
@@ -27,7 +27,7 @@
 | Windows | 10 (10.0.17763+) / 11 | DirectShow/Media Foundation 仅桌面版 Windows 有 |
 | .NET SDK | 8.0+ | WPF 需要 `net8.0-windows` TFM |
 | Rust | 1.75+ (stable) | 默认 `x86_64-pc-windows-msvc` target（`rustup` 默认安装） |
-| CMake | 3.22+ | 配置/构建 `airferry_zxing.dll`，首次会获取固定 commit 的 zxing-cpp |
+| CMake | 3.22+ | 配置/构建 `airferry_zxing.dll`，首次会获取并校验固定 commit 的 zxing-cpp 归档 |
 | Visual Studio | 2022，Desktop development with C++ | MSVC x64 编译器和 Windows SDK |
 
 验证：
@@ -85,7 +85,7 @@ $dll = Get-ChildItem apps/windows/native/build -Recurse -Filter airferry_zxing.d
 Copy-Item $dll.FullName apps/windows/AirFerry.Windows/runtime/airferry_zxing.dll -Force
 ```
 
-> CMake 固定 zxing-cpp v3.0.2 对应 commit。Windows 算法位于 `core/zxing-decoder/`，C ABI 负责传参、异常边界和结果内存所有权；C#/C ABI 行为镜像 Android v1.1.3 JNI 模式。
+> CMake 固定 zxing-cpp v3.0.2 对应 commit 及归档 SHA-256。Windows 算法位于 `core/zxing-decoder/`，C ABI 负责传参、异常边界和结果内存所有权；Android JNI 与 Web WASM 也调用同一核心。
 
 ### 4.3 构建 C# WPF
 
@@ -234,9 +234,20 @@ ctest --test-dir apps/windows/native/build -C Release --output-on-failure
 | 相机 | CameraX (Y plane) | OpenCvSharp VideoCapture (BGR→Gray) |
 | 设备枚举 | CameraX 自动 | DirectShow DsDevice（★新增设备选择） |
 | 屏幕捕获 | （无） | ★GDI BitBlt/PrintWindow：屏幕区域 + 独立窗口作为视频源（`ScreenCapture.cs` + 截图式 `RegionPicker`） |
-| QR 解码 | ZXing-C++ v1.1.3 路径（JNI） | 等价 ZXing-C++ 模式（C ABI/P/Invoke） |
+| QR 解码 | 共享 `core/zxing-decoder` + 薄 JNI | 共享 `core/zxing-decoder` + C ABI/P/Invoke |
 | 核心引擎 | Rust `jni.rs` (JNI) | Rust `cffi.rs` (C ABI) |
-| 并行解码 | 2–6 workers + v1.1.3 调度/4 符号批摄入 | 同 worker/队列/批量/miss 状态机 + ingestLock |
+| 并行解码 | 2–6 workers + 4 码上限/批摄入 | 同 worker/队列/批量/miss 状态机 + ingestLock |
 | 落盘 | ContentStore blob + `index.json` | `%USERPROFILE%\Documents\AirFerry\store\blobs\<hh>\<sha256>` + `index.json` |
 | 多文件包 | 经 Rust 快照 entries 还原（无本地解析器） | 经 Rust 快照 entries 还原（无本地解析器） |
-| 签名 | keystore.properties | （暂无 Authenticode 签名） |
+| 签名 | keystore.properties | Authenticode（发布工作流强制） |
+
+Windows 的手动发布工作流要求仓库 Secrets：`WINDOWS_SIGNING_PFX_B64`、
+`WINDOWS_SIGNING_PASSWORD`、`WINDOWS_SIGNING_CERT_THUMBPRINT`。工作流在压缩前使用
+SHA-256 + RFC 3161 时间戳签署 `AirFerry.exe`、`transfer_engine.dll` 与
+`airferry_zxing.dll`，逐个验证签名状态和证书指纹，并在 `finally` 中删除临时 PFX；任一
+密钥、签名或验证缺失都会停止发布。
+
+本地 `scripts/build-windows.ps1 -Pack` 同样 fail-closed，要求设置
+`AIRFERRY_WINDOWS_PFX`、`AIRFERRY_WINDOWS_PFX_PASSWORD`、
+`AIRFERRY_WINDOWS_CERT_THUMBPRINT`；它复用 `scripts/sign-windows.ps1`，因此本地 zip
+与 CI 发布执行完全相同的签名和签后校验。普通不带 `-Pack` 的开发构建不要求证书。

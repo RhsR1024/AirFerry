@@ -11,6 +11,7 @@
  */
 const fs = require("fs")
 const path = require("path")
+const { execFileSync } = require("child_process")
 
 const webRoot = path.resolve(__dirname, "..")
 const wasmPkgDir = path.join(webRoot, "wasm-pkg")
@@ -32,7 +33,16 @@ fs.mkdirSync(publicDir, { recursive: true })
 // Copy the self-compiled FAST ZXing-C++ backend (airferry_zxing.js + .wasm)
 // into public/ for the QR decode worker. Produced by scripts/build-fastzxing.sh.
 const fastzxingDir = path.join(webRoot, "src", "fastzxing")
-const fastFiles = ["airferry_zxing.js", "airferry_zxing.wasm"]
+try {
+  execFileSync(
+    process.execPath,
+    [path.resolve(webRoot, "../../scripts/fastzxing-fingerprint.mjs"), "check", fastzxingDir],
+    { stdio: "inherit" }
+  )
+} catch {
+  process.exit(1)
+}
+const fastFiles = ["airferry_zxing.js", "airferry_zxing.wasm", "SOURCE.sha256"]
 let fastCopied = false
 const missingFast = []
 for (const f of fastFiles) {

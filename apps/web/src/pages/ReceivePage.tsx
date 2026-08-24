@@ -78,6 +78,10 @@ interface ProgressInfo {
 /** Sliding-window constants (match Android ScanActivity). */
 const RATE_WINDOW_MS = 3000
 const RATE_MIN_DT_MS = 300
+/** UI refresh cadence for per-frame counter/state merges. 7 Hz is plenty for
+ *  human eyes and keeps React re-renders from competing with the capture /
+ *  decode pipeline for main-thread time. */
+const UI_COUNTER_INTERVAL_MS = 140
 
 /**
  * Decode at the camera's native resolution — never downscale. Downscaling
@@ -337,6 +341,10 @@ export function ReceivePage(): React.ReactElement {
   // Total QR symbols decoded (one per decoded payload) — drives decodePerSec,
   // mirroring Android's QrDecodePool.decodedCount().
   const decodedCodesRef = useRef<number>(0)
+  // Credit-based backpressure between parallel QR decoders and the single
+  // serialized receiver/OPFS worker. Fountain symbols may be dropped safely;
+  // queued payload buffers must not grow without bound when storage is slow.
+  const recvInFlightRef = useRef<number>(0)
   const stageRef = useRef<Stage>("camera")
   const assemblingRef = useRef<boolean>(false)
   // Last wall-clock time recordPartialTransfer ran (throttled to 1/s).
@@ -348,18 +356,23 @@ export function ReceivePage(): React.ReactElement {
   // The pending requestVideoFrameCallback handle (rVFC has no global cancel;
   // the element's own cancelVideoFrameCallback must be used).
   const rvfcRef = useRef<number | null>(null)
-  // OffscreenCanvas Y-plane extraction worker state. `yBusyRef` caps the
-  // extract pipeline at ONE in-flight frame (drop otherwise, like the qr
-  // pool); `yFallbackRef` switches back to the legacy main-thread extractor
-  // when the worker path is unsupported or failing.
+  // Last wall-clock time the frame-counter slice of `progress` was refreshed.
+  const lastFrameCountersTsRef = useRef<number>(0)
+  // Last wall-clock time applyStatus merged a (non-completion) status update.
+  const lastStatusApplyTsRef = useRef<number>(0)
+  // OffscreenCanvas Y-plane extraction worker state. `yInFlightSlotsRef` holds
+  // the decode-pool slots with a frame currently between snapshot → extract →
+  // decode-dispatch — MULTIPLE frames may be in flight (one per free qr slot),
+  // keeping the 4-way decode pool fed instead of serializing the whole
+  // pipeline through one extraction; `yFallbackRef` switches back to the
+  // legacy main-thread extractor when the worker path is unsupported/failing.
   const yWorkerRef = useRef<Worker | null>(null)
-  const yBusyRef = useRef<boolean>(false)
   const yFallbackRef = useRef<boolean>(false)
   const yFailStreakRef = useRef<number>(0)
-  /** The single yplane frame in flight: {jobId, qrSlot}. Ownership token —
-   *  only the current job's reply (or fatal-error handler) may clear it and
-   *  release its decode slot. */
-  const yInFlightRef = useRef<{ jobId: number; qrSlot: number } | null>(null)
+  /** Slots with an extraction in flight. A slot's busy flag already bounds
+   *  the set at the pool size; entries are ownership tokens — only the
+   *  matching slot's reply (or the fatal-error handler) may remove one. */
+  const yInFlightSlotsRef = useRef<Set<number>>(new Set())
 
   // keep stageRef in sync so the rAF loop can read the latest stage.
   useEffect(() => {
@@ -388,6 +401,7 @@ export function ReceivePage(): React.ReactElement {
   /** Stop camera + workers + rAF. */
   const teardown = useCallback(() => {
     scanningActiveRef.current = false
+    recvInFlightRef.current = 0
     framePendingRef.current = false
     if (rafRef.current !== null) {
       cancelAnimationFrame(rafRef.current)
@@ -538,6 +552,11 @@ export function ReceivePage(): React.ReactElement {
   const applyStatus = useCallback((d: Record<string, unknown>) => {
     const snap = d.snapshot as ProgressSnapshot | null
     const nowMs = (typeof d.nowMs === "number" ? d.nowMs : Date.now()) as number
+    // Status arrives per ingest batch (tens per second); merging into React
+    // state at that rate re-rendered the whole page continuously. 7 Hz is
+    // plenty — completion bypasses so the final snapshot lands immediately.
+    if (!d.complete && nowMs - lastStatusApplyTsRef.current < UI_COUNTER_INTERVAL_MS) return
+    lastStatusApplyTsRef.current = nowMs
     setProgress((prev) => {
       const p: ProgressInfo = { ...prev }
       p.complete = !!d.complete
@@ -655,10 +674,10 @@ export function ReceivePage(): React.ReactElement {
     recvWorkerRef.current?.terminate()
     yWorkerRef.current?.terminate()
     yWorkerRef.current = null
-    yBusyRef.current = false
-    yInFlightRef.current = null
+    yInFlightSlotsRef.current = new Set()
     yFallbackRef.current = false
     yFailStreakRef.current = 0
+    recvInFlightRef.current = 0
 
     // Y-plane extraction worker (OffscreenCanvas): keeps the ~8 MB readback +
     // 2M-pixel RGBA→Y loop off the main thread. Replies are forwarded straight
@@ -682,16 +701,11 @@ export function ReceivePage(): React.ReactElement {
         if (
           yWorkerRef.current !== yworker ||
           typeof d.jobId !== "number" ||
-          d.jobId !== jobIdRef.current
+          d.jobId !== jobIdRef.current ||
+          typeof d.qrSlot !== "number" ||
+          !yInFlightSlotsRef.current.has(d.qrSlot)
         ) return
-        const inflight = yInFlightRef.current
-        if (
-          !inflight ||
-          inflight.jobId !== d.jobId ||
-          inflight.qrSlot !== d.qrSlot
-        ) return
-        yBusyRef.current = false
-        yInFlightRef.current = null
+        yInFlightSlotsRef.current.delete(d.qrSlot)
         if (d.type === "yerror") {
           qrBusyRef.current[d.qrSlot] = false
           framesDroppedRef.current += 1
@@ -724,21 +738,30 @@ export function ReceivePage(): React.ReactElement {
         )
       })
       // Fatal worker-level error: switch to the main-thread extractor rather
-      // than killing reception. The frame in flight will never get its reply,
-      // so release ITS reserved decode slot here — otherwise the pool
-      // permanently loses one worker (the slot's busy flag would never clear).
+      // than killing reception. Frames in flight will never get their replies,
+      // so release THEIR reserved decode slots here — otherwise the pool
+      // permanently loses those workers (their busy flags would never clear).
       yworker.addEventListener("error", (ev: ErrorEvent) => {
         // An old worker can still have an error event queued after terminate;
         // never let it switch a newly-created session into fallback mode.
         if (yWorkerRef.current !== yworker) return
         dbg(`[yplane] WORKER ERROR: ${ev.message || ""} — falling back to main-thread extraction`)
         yFallbackRef.current = true
-        yBusyRef.current = false
-        const inflight = yInFlightRef.current
-        yInFlightRef.current = null
-        if (inflight && inflight.jobId === jobIdRef.current) {
-          qrBusyRef.current[inflight.qrSlot] = false
+        for (const slot of yInFlightSlotsRef.current) {
+          qrBusyRef.current[slot] = false
         }
+        yInFlightSlotsRef.current = new Set()
+      })
+      // A reply whose structured-clone deserialization failed never arrives —
+      // without this, its decode slot stays busy forever (mirrors the qr
+      // workers' messageerror handling).
+      yworker.addEventListener("messageerror", (ev) => {
+        if (yWorkerRef.current !== yworker) return
+        dbg(`[yplane] MESSAGE ERROR: ${String(ev.data || "")}`)
+        for (const slot of yInFlightSlotsRef.current) {
+          qrBusyRef.current[slot] = false
+        }
+        yInFlightSlotsRef.current = new Set()
       })
     } else {
       dbg("[yplane] OffscreenCanvas/ImageBitmap unavailable — main-thread extraction")
@@ -747,6 +770,18 @@ export function ReceivePage(): React.ReactElement {
     // Receive worker (single; ingest stays serialized).
     const recv = createReceiveWorker()
     recvWorkerRef.current = recv
+    let receiveWorkerFailed = false
+    const failReceivePipeline = (message: string): void => {
+      if (recvWorkerRef.current !== recv || receiveWorkerFailed) return
+      receiveWorkerFailed = true
+      dbg(`[recv] FATAL: ${message}`)
+      scanningActiveRef.current = false
+      assemblingRef.current = false
+      setError(message)
+      stageRef.current = "error"
+      setStage("error")
+      teardown()
+    }
 
     const recvReady = new Promise<void>((resolve, reject) => {
       const h = (e: MessageEvent) => {
@@ -782,6 +817,7 @@ export function ReceivePage(): React.ReactElement {
     const qrReadyAll: Promise<void>[] = []
     const readyResolvers: (() => void)[] = new Array(QR_WORKER_POOL)
     const readyRejecters: ((reason: Error) => void)[] = new Array(QR_WORKER_POOL)
+    const qrAbandoned: boolean[] = new Array(QR_WORKER_POOL).fill(false)
     // Consecutive fatal failures per slot without an intervening "ready".
     // If the worker script/wasm can't load at all, every replacement dies
     // instantly — without a cap that becomes an infinite respawn loop.
@@ -813,10 +849,15 @@ export function ReceivePage(): React.ReactElement {
 
       qr.addEventListener("message", (e: MessageEvent) => {
         const d = e.data
-        if (!d) return
+        if (!d || qrWorkersRef.current[i] !== qr) return
+        // A terminated worker can have a reply queued while a reset creates a
+        // replacement in the same slot. Never let that stale reply clear the
+        // new worker's busy flag or forward old symbols into the new session.
+        if (typeof d.jobId === "number" && d.jobId !== jobIdRef.current) return
         if (d.type === "ready") {
           qrBusyRef.current[i] = false
           qrSpawnFails[i] = 0
+          qrAbandoned[i] = false
           if (trackReady) readyResolvers[i]()
           dbg(`[qr#${i}] READY ✓`)
           return
@@ -831,15 +872,30 @@ export function ReceivePage(): React.ReactElement {
             if (framesDecodedRef.current % 10 === 1) {
               dbg(`[qr#${i}] decoded #${framesDecodedRef.current}: ${n} payload(s)`)
             }
-            recv.postMessage({
-              type: "ingest",
-              frames: d.payloads,
-              jobId: jobIdRef.current,
-            })
+            if (recvInFlightRef.current >= 2) {
+              framesDroppedRef.current += 1
+              return
+            }
+            recvInFlightRef.current += 1
+            recv.postMessage(
+              {
+                type: "ingest",
+                frames: d.payloads,
+                jobId: jobIdRef.current,
+              },
+              // Payload buffers are fresh slices owned by the qr worker's
+              // reply — transfer them instead of structured-cloning every
+              // symbol batch.
+              (d.payloads as Uint8Array[]).map((p) => p.buffer as ArrayBuffer)
+            )
           }
         } else if (d.type === "error") {
           qrBusyRef.current[i] = false
           dbg(`[qr#${i}] decode error: ${d.message}`)
+          // Init failures carry no job id. Replace the unusable worker now;
+          // merely freeing its slot would dispatch decode jobs to a worker
+          // whose WASM backend never loaded, producing empty results forever.
+          if (d.jobId === undefined) onSlotDeath(d.message || "decoder init failed")
         }
       })
 
@@ -857,10 +913,14 @@ export function ReceivePage(): React.ReactElement {
         qrSpawnFails[i] += 1
         qr.terminate()
         if (qrSpawnFails[i] > 3) {
+          qrAbandoned[i] = true
           dbg(`[qr#${i}] giving up after ${qrSpawnFails[i]} consecutive failures (${reason})`)
           readyRejecters[i]?.(
             new Error(`二维码解码 worker 连续失败（${reason}），请刷新页面重试`)
           )
+          if (qrAbandoned.every(Boolean)) {
+            failReceivePipeline("所有二维码解码 worker 均已停止，请刷新页面重试")
+          }
           return
         }
         dbg(`[qr#${i}] replacing dead worker (${reason})...`)
@@ -892,12 +952,14 @@ export function ReceivePage(): React.ReactElement {
     const qrReady = Promise.all(qrReadyAll)
 
     // 捕获 worker 级错误（脚本解析失败 / 未捕获异常 / message 反序列化失败）
-    recv.addEventListener("error", (ev) =>
-      dbg(`[recv] WORKER ERROR: ${ev.message || ""} @${ev.filename}:${ev.lineno}`)
-    )
-    recv.addEventListener("messageerror", (ev) =>
-      dbg(`[recv] MESSAGE ERROR: ${String(ev.data || "")}`)
-    )
+    recv.addEventListener("error", (ev) => {
+      failReceivePipeline(
+        `接收 worker 异常退出：${ev.message || "未知错误"}，请重新开始接收`
+      )
+    })
+    recv.addEventListener("messageerror", () => {
+      failReceivePipeline("接收 worker 消息损坏，请重新开始接收")
+    })
 
     // (The AF2 receive worker decompresses chunks inside the Rust WASM
     // instance — no zstd WASM preload message exists anymore.)
@@ -937,6 +999,10 @@ export function ReceivePage(): React.ReactElement {
       const d = e.data
       if (!d) return
       if (d.jobId !== undefined && d.jobId !== jobIdRef.current) return // stale
+      if (d.type === "ingest_ack") {
+        recvInFlightRef.current = Math.max(0, recvInFlightRef.current - 1)
+        return
+      }
       if (d.type === "status") {
         if (d.complete && !assemblingRef.current) {
           assemblingRef.current = true
@@ -958,8 +1024,8 @@ export function ReceivePage(): React.ReactElement {
               activeNameRef.current,
               activeTotalSizeRef.current,
               activeEntryCountRef.current,
-              Number(d.decodedBlocks) || 0,
-              Number(d.totalBlocks) || activeChunkCountRef.current,
+              Number(d.snapshot?.decodedBlocks) || 0,
+              Number(d.snapshot?.totalBlocks) || activeChunkCountRef.current,
               activeEntryCountRef.current > 1 ? "bundle" : "file"
             )
           }
@@ -1127,7 +1193,12 @@ export function ReceivePage(): React.ReactElement {
     // qrBusyRef to a fresh array; releasing via the captured reference can
     // then only touch the (garbage) old one, never the new session's slots.
     const busyArr = qrBusyRef.current
-    const refreshFrameCounters = () => {
+    // 7 Hz is plenty for two integer counters; a setProgress per capture tick
+    // (~30-60/s) re-rendered the whole page every frame and competed with the
+    // capture/decode pipeline for main-thread time.
+    const now = performance.now()
+    if (now - lastFrameCountersTsRef.current >= UI_COUNTER_INTERVAL_MS) {
+      lastFrameCountersTsRef.current = now
       setProgress((p) => ({
         ...p,
         framesSeen: framesDecodedRef.current,
@@ -1139,19 +1210,12 @@ export function ReceivePage(): React.ReactElement {
     // (the pixel copy happens off-thread) and hand it to the yplane worker —
     // the RGBA→Y conversion and its ~10 MB/frame allocations stay OFF the
     // main thread (they used to cause periodic GC hitches that stalled the
-    // capture loop). Legacy main-thread path remains the fallback.
+    // capture loop). Multiple frames may be in flight (one per reserved qr
+    // slot), so extraction and the 4-way decode stay pipelined. Legacy
+    // main-thread path remains the fallback.
     const yWorker = yWorkerRef.current
     if (yWorker && !yFallbackRef.current) {
-      if (yBusyRef.current) {
-        // Previous frame still extracting — drop this one (back-pressure,
-        // same semantics as a full decode pool).
-        busyArr[freeIdx] = false
-        framesDroppedRef.current += 1
-        scheduleNextFrame()
-        return
-      }
-      yBusyRef.current = true
-      yInFlightRef.current = { jobId, qrSlot: freeIdx }
+      yInFlightSlotsRef.current.add(freeIdx)
       createImageBitmap(video)
         .then((bitmap) => {
           if (
@@ -1160,17 +1224,12 @@ export function ReceivePage(): React.ReactElement {
             jobIdRef.current !== jobId ||
             yWorkerRef.current !== yWorker
           ) {
-            // Session moved on while the snapshot was being taken. Clear the
-            // ownership token ONLY if it still belongs to this attempt (a
-            // newer session already reset it via initWorkers).
+            // Session moved on while the snapshot was being taken. Drop this
+            // attempt's ownership token ONLY if the live worker still belongs
+            // to the same session (a newer one already reset the set).
             bitmap.close()
-            if (
-              yWorkerRef.current === yWorker &&
-              yInFlightRef.current?.jobId === jobId &&
-              yInFlightRef.current?.qrSlot === freeIdx
-            ) {
-              yInFlightRef.current = null
-              yBusyRef.current = false
+            if (yWorkerRef.current === yWorker) {
+              yInFlightSlotsRef.current.delete(freeIdx)
             }
             busyArr[freeIdx] = false
             return
@@ -1181,14 +1240,9 @@ export function ReceivePage(): React.ReactElement {
           )
         })
         .catch(() => {
-          const ownsCurrentAttempt =
-            yWorkerRef.current === yWorker &&
-            jobIdRef.current === jobId &&
-            yInFlightRef.current?.jobId === jobId &&
-            yInFlightRef.current?.qrSlot === freeIdx
+          const ownsCurrentAttempt = yWorkerRef.current === yWorker && jobIdRef.current === jobId
           if (ownsCurrentAttempt) {
-            yInFlightRef.current = null
-            yBusyRef.current = false
+            yInFlightSlotsRef.current.delete(freeIdx)
             framesDroppedRef.current += 1
             if (++yFailStreakRef.current >= 10) {
               yFallbackRef.current = true
@@ -1197,7 +1251,6 @@ export function ReceivePage(): React.ReactElement {
           }
           busyArr[freeIdx] = false
         })
-      refreshFrameCounters()
       scheduleNextFrame()
       return
     }
@@ -1224,9 +1277,8 @@ export function ReceivePage(): React.ReactElement {
       [yPlane.buffer]
     )
     // Each worker's decoded handler (wired in initWorkers) marks it free again
-    // and forwards payloads to the receive worker; just refresh frame counters.
-    // busy cleared by that handler.
-    refreshFrameCounters()
+    // and forwards payloads to the receive worker; frame counters refresh on
+    // the throttled tick at the top of this loop.
     scheduleNextFrame()
   }, [])
 
@@ -1738,4 +1790,3 @@ function BundleView({
 }
 
 export default ReceivePage
-

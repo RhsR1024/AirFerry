@@ -24,8 +24,10 @@ import path from "node:path"
 import { fileURLToPath } from "node:url"
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
-const pkg = JSON.parse(readFileSync(path.join(root, "apps/web/package.json"), "utf8"))
-const version = pkg.version
+const version = execFileSync(process.execPath, ["scripts/version.mjs", "print"], {
+  cwd: root,
+  encoding: "utf8",
+}).trim()
 
 function requireFile(filePath, label, minBytes = 1) {
   if (!existsSync(filePath)) {
@@ -63,7 +65,7 @@ function runBuildAll(target, options = {}) {
 
 console.log("▶ 1. Version gate check")
 // Delegate to the real gate (root Cargo.toml [workspace.package].version is
-// the single source of truth; version.mjs checks all 6 declared sites).
+// the single source of truth; version.mjs checks every declared mirror site).
 try {
   execFileSync(process.execPath, ["scripts/version.mjs", "check"], {
     cwd: root,
@@ -83,33 +85,24 @@ const releaseName = new RegExp(`^airferry-.*-v${version.replace(/[.*+?^${}()|[\]
 const uploadFiles = existsSync(distDir)
   ? readdirSync(distDir).filter((name) => releaseName.test(name)).sort()
   : []
-// dist/ intentionally also stores local signing inputs. The security
-// invariant is that the *release upload set* excludes them, not that dist/
-// contains no keys at all. Permit only the two fixed, documented local inputs;
-// any other PEM/keystore in dist is suspicious and fails closed.
-const allowedLocalSigningInputs = new Set([
-  "airferry-extension.pem",
-  "airferry-release.keystore",
-])
+// Signing inputs belong in AIRFERRY_SIGNING_DIR (default .airferry-signing),
+// never beside release artifacts. Fail closed on all common private-key forms.
+const secretFile = /\.(?:pem|key|keystore|jks|p12|pfx)$/i
 const unexpectedSecretFiles = existsSync(distDir)
-  ? readdirSync(distDir).filter(
-      (name) =>
-        (name.endsWith(".pem") || name.endsWith(".keystore")) &&
-        !allowedLocalSigningInputs.has(name)
-    )
+  ? readdirSync(distDir).filter((name) => secretFile.test(name))
   : []
 if (unexpectedSecretFiles.length > 0) {
   console.error(`✗ CRITICAL: unexpected secret/key file(s) in dist/: ${unexpectedSecretFiles.join(", ")}`)
   process.exit(1)
 }
 const secretUploadHits = uploadFiles.filter(
-  (name) => name.endsWith(".pem") || name.endsWith(".keystore")
+  (name) => secretFile.test(name)
 )
 if (secretUploadHits.length > 0) {
   console.error(`✗ CRITICAL: secret/key file(s) in release upload set: ${secretUploadHits.join(", ")}`)
   process.exit(1)
 }
-console.log("   release upload list is safe (local signing keys excluded)")
+console.log("   dist contains no private-key material; release upload list is safe")
 
 console.log("▶ 3. Package current build to dist/")
 // verify-dist is intentionally self-sufficient: CI historically invoked this
@@ -144,7 +137,8 @@ for (const [name, label] of requiredDist) {
   requireFile(path.join(dist, name), label, 64)
 }
 
-const signingKey = path.join(dist, "airferry-extension.pem")
+const signingDir = process.env.AIRFERRY_SIGNING_DIR || path.join(root, ".airferry-signing")
+const signingKey = path.join(signingDir, "airferry-extension.pem")
 const requireSigned = process.env.AIRFERRY_REQUIRE_SIGNED_RELEASE === "1" || existsSync(signingKey)
 if (requireSigned) {
   requireFile(path.join(dist, `airferry-sender-chrome-mv3-v${version}.crx`), "signed Chrome MV3 CRX", 64)
@@ -202,6 +196,16 @@ function listZipEntries(file) {
 }
 
 console.log("▶ 6. FAST ZXing receiver payload check")
+try {
+  execFileSync(
+    process.execPath,
+    ["scripts/fastzxing-fingerprint.mjs", "check", "apps/web/src/fastzxing"],
+    { cwd: root, stdio: "inherit" }
+  )
+} catch {
+  console.error("✗ FAST ZXing artifact does not match the checked-in decoder source")
+  process.exit(1)
+}
 // Build-tree check (what Vite just produced)…
 const fastJs = requireFile(path.join(root, "apps/web/dist-receiver/airferry_zxing.js"), "FAST ZXing JS", 1024)
 requireFile(path.join(root, "apps/web/dist-receiver/airferry_zxing.wasm"), "FAST ZXing WASM", 64 * 1024)
@@ -213,7 +217,7 @@ if (!readFileSync(fastJs, "utf8").includes("_airferry_wasm_decode_multi_y")) {
 // payload inside it (a size check alone would false-pass on a divergent pack).
 try {
   const zipEntries = listZipEntries(path.join(dist, `airferry-receiver-web-v${version}.zip`))
-  for (const needed of ["airferry_zxing.js", "airferry_zxing.wasm"]) {
+  for (const needed of ["airferry_zxing.js", "airferry_zxing.wasm", "SOURCE.sha256"]) {
     if (!zipEntries.some((n) => n === needed || n.endsWith(`/${needed}`))) {
       console.error(`✗ receiver-web zip does not contain ${needed}`)
       process.exit(1)

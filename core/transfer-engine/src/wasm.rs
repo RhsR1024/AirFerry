@@ -11,9 +11,7 @@
 #![cfg(all(feature = "wasm", target_arch = "wasm32"))]
 
 use crate::receiver::ReceiverSession;
-use af2::{
-    plan_chunks as af2_plan_chunks, Af2Sender, PreencodedChunk, SenderConfig, SenderError,
-};
+use af2::{plan_chunks as af2_plan_chunks, Af2Sender, PreencodedChunk, SenderConfig, SenderError};
 use wasm_bindgen::prelude::*;
 
 const MAX_UI_QR_COUNT: usize = 4;
@@ -103,8 +101,12 @@ impl SenderBuilderWasm {
     /// `size` is an f64 only because JS numbers are doubles — values up to
     /// 2^53 (well past the 4 TiB wire ceiling) round-trip exactly.
     pub fn add_meta(&mut self, kind: u8, path: &str, size: f64, content_hash: &[u8]) {
-        self.metas
-            .push((kind, path.to_string(), size.max(0.0) as u64, hash32(content_hash)));
+        self.metas.push((
+            kind,
+            path.to_string(),
+            size.max(0.0) as u64,
+            hash32(content_hash),
+        ));
     }
 
     /// One BLAKE3-256 per canonical chunk, position-indexed (streamed build).
@@ -173,8 +175,9 @@ impl SenderBuilderWasm {
             redundancy_pct,
         };
         let preencoded = self.take_preencoded();
-        let inner = Af2Sender::from_manifest_with_preencoded(manifest, self.items, config, preencoded)
-            .map_err(|e| JsValue::from_str(&format!("AF2 cached sender build failed: {e}")))?;
+        let inner =
+            Af2Sender::from_manifest_with_preencoded(manifest, self.items, config, preencoded)
+                .map_err(|e| JsValue::from_str(&format!("AF2 cached sender build failed: {e}")))?;
         Ok(SenderSessionWasm::from_inner(inner))
     }
 
@@ -185,9 +188,10 @@ impl SenderBuilderWasm {
     /// [`SenderSessionWasm::stage_chunk`]; `next_qr_scratch` rejects with the
     /// marker `AF2_CHUNK_NOT_STAGED:<index>` when the playlist reaches an
     /// unstaged chunk (stage it and retry — failed calls have no side
-    /// effects). Re-staging in later epochs must supply byte-identical
-    /// encoded bytes (deterministic `encode_chunk_balanced`) or the chunk's
-    /// object_id changes and receivers drop every symbol.
+    /// effects). Deterministic `encode_chunk_balanced` output is preferred on
+    /// later epochs because it keeps the object_id stable and preserves
+    /// receiver progress. A different valid encoding changes object_id; the
+    /// receiver safely replaces an unfinished decoder for that chunk index.
     pub fn build_streamed(
         mut self,
         symbol_size: u32,
@@ -307,7 +311,9 @@ impl SenderSessionWasm {
                     break;
                 }
                 Err(e) => {
-                    return Err(JsValue::from_str(&format!("AF2 frame generation failed: {e}")))
+                    return Err(JsValue::from_str(&format!(
+                        "AF2 frame generation failed: {e}"
+                    )))
                 }
             };
             self.frames_emitted += 1;
@@ -349,16 +355,20 @@ impl SenderSessionWasm {
         &mut self,
         index: u32,
         codec_id: u8,
-        bytes: &[u8],
+        // `Vec<u8>` (not `&[u8]`): wasm-bindgen copies the JS buffer into
+        // linear memory exactly once and the Vec moves straight into the
+        // sender — an `&[u8]` parameter would add a second full-chunk copy
+        // via `to_vec()` below on the render thread.
+        bytes: Vec<u8>,
         raw_hash: &[u8],
     ) -> Result<(), JsValue> {
         let inner = &mut self.inner;
         let result = if raw_hash.len() == 32 {
             let mut digest = [0u8; 32];
             digest.copy_from_slice(raw_hash);
-            inner.stage_chunk_with_raw_hash(index, codec_id, bytes.to_vec(), digest)
+            inner.stage_chunk_with_raw_hash(index, codec_id, bytes, digest)
         } else {
-            inner.stage_chunk(index, codec_id, bytes.to_vec())
+            inner.stage_chunk(index, codec_id, bytes)
         };
         result.map_err(|e| JsValue::from_str(&format!("AF2 stage_chunk failed: {e}")))
     }
@@ -367,7 +377,10 @@ impl SenderSessionWasm {
     /// chunk window (`-1` during bootstrap). Hosts use it to prefetch the
     /// next chunk before `next_qr_scratch` hits the NOT_STAGED marker.
     pub fn current_chunk_index(&self) -> i32 {
-        self.inner.current_chunk_index().map(|i| i as i32).unwrap_or(-1)
+        self.inner
+            .current_chunk_index()
+            .map(|i| i as i32)
+            .unwrap_or(-1)
     }
 
     /// 1-based broadcast epoch. Paired with `current_chunk_index` this
@@ -472,10 +485,15 @@ impl ReceiverSessionWasm {
     }
 }
 
+/// Lowercase hex via a digit LUT — `format!("{b:02x}")` per byte costs a
+/// String allocation each; manifests for max-size transfers carry millions of
+/// hash bytes and turned this into a multi-second main-thread stall.
 fn hex_lower(bytes: &[u8]) -> String {
+    const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for &b in bytes {
-        out.push_str(&format!("{b:02x}"));
+        out.push(HEX_DIGITS[(b >> 4) as usize] as char);
+        out.push(HEX_DIGITS[(b & 0x0F) as usize] as char);
     }
     out
 }
@@ -532,6 +550,14 @@ impl EncodedChunkWasm {
     pub fn data(&self) -> Vec<u8> {
         self.data.clone()
     }
+
+    /// Consuming variant of [`Self::data`]: moves the encoded bytes out
+    /// instead of cloning them, saving one full-chunk copy out of WASM linear
+    /// memory per encode (the caller on the JS side discards the handle
+    /// right after reading the bytes).
+    pub fn into_data(self) -> Vec<u8> {
+        self.data
+    }
 }
 
 /// Balanced per-chunk encode for the host prep pass (SPEC §10.1 sender
@@ -540,11 +566,7 @@ impl EncodedChunkWasm {
 /// disables escalation. `force_full` escalates unconditionally (use for
 /// single-chunk transfers).
 #[wasm_bindgen]
-pub fn encode_chunk_balanced(
-    raw: &[u8],
-    channel_bps: u64,
-    force_full: bool,
-) -> EncodedChunkWasm {
+pub fn encode_chunk_balanced(raw: &[u8], channel_bps: u64, force_full: bool) -> EncodedChunkWasm {
     let (codec, data) = af2::chunk::encode_chunk_balanced(raw, channel_bps, force_full);
     EncodedChunkWasm { codec, data }
 }

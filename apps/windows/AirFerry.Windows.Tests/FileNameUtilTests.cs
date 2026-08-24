@@ -123,11 +123,12 @@ public class FileNameUtilTests
         Assert.Equal("COM1_", FileNameUtil.Sanitize("COM1"));
         Assert.Equal("LPT9_", FileNameUtil.Sanitize("LPT9"));
         // Even with an extension, Win32 treats CON.txt as the CON device.
-        Assert.Equal("CON.txt_", FileNameUtil.Sanitize("CON.txt"));
+        Assert.Equal("CON_.txt", FileNameUtil.Sanitize("CON.txt"));
         // Non-reserved names pass through.
         Assert.Equal("normal.txt", FileNameUtil.Sanitize("normal.txt"));
         // COM10+ are NOT reserved (only COM1-9).
         Assert.Equal("COM10", FileNameUtil.Sanitize("COM10"));
+        Assert.Equal("COM0", FileNameUtil.Sanitize("COM0"));
     }
 
     [Theory]

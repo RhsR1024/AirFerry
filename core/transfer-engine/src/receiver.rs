@@ -3,14 +3,23 @@
 //! Provides the shared API consumed by the JNI (Android) and C-ABI (Windows)
 //! native bindings.
 
-use af2::{Af2Receiver, FinalStreamVerifier, IngestEvent};
 use crate::ingest_status::pack;
+use af2::{Af2Receiver, FinalStreamVerifier, IngestEvent};
 use std::collections::HashMap;
+
+#[cfg(target_arch = "wasm32")]
+const HOST_MAX_RECEIVE_BYTES: u64 = 8 << 30;
+#[cfg(target_os = "android")]
+const HOST_MAX_RECEIVE_BYTES: u64 = 16 << 30;
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+const HOST_MAX_RECEIVE_BYTES: u64 = 128 << 30;
 
 /// A receiver session driven by AF2.
 pub struct ReceiverSession {
     inner: Af2Receiver,
     frames_seen: u64,
+    frames_duplicate: u64,
+    frames_corrupt: u64,
     received_symbols: u32,
     session_mismatch_streak: u32,
     last_chunk: Option<(u32, Vec<u8>)>,
@@ -40,6 +49,34 @@ fn escape_json(s: &str) -> String {
     out
 }
 
+/// Lowercase hex via a digit LUT. Hosts call `snapshot_json` per ingest batch
+/// (web) — the old per-byte `format!("{b:02x}")` allocated a String per byte
+/// and dominated the call for ids + the re-encoded ROOT frame.
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX_DIGITS[(b >> 4) as usize] as char);
+        out.push(HEX_DIGITS[(b & 0x0F) as usize] as char);
+    }
+    out
+}
+
+/// Decimal append without the `format!` machinery (see [`hex_lower`]).
+fn push_u64(out: &mut String, mut v: u64) {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    out.push_str(std::str::from_utf8(&buf[i..]).unwrap_or("0"));
+}
+
 impl Default for ReceiverSession {
     fn default() -> Self {
         Self::new()
@@ -47,10 +84,24 @@ impl Default for ReceiverSession {
 }
 
 impl ReceiverSession {
+    fn root_within_host_budget(frame_bytes: &[u8]) -> bool {
+        let Ok(frame) = af2::Af2Frame::from_bytes(frame_bytes) else {
+            return true;
+        };
+        if frame.frame_type != af2::FrameType::Root {
+            return true;
+        }
+        af2::root::RootRecord::parse(&frame.body)
+            .map(|root| root.total_raw_size <= HOST_MAX_RECEIVE_BYTES)
+            .unwrap_or(true)
+    }
+
     pub fn new() -> Self {
         Self {
             inner: Af2Receiver::new(),
             frames_seen: 0,
+            frames_duplicate: 0,
+            frames_corrupt: 0,
             received_symbols: 0,
             session_mismatch_streak: 0,
             last_chunk: None,
@@ -68,14 +119,32 @@ impl ReceiverSession {
     pub fn ingest(&mut self, frame_bytes: &[u8]) -> u64 {
         self.frames_seen += 1;
         self.last_chunk = None;
+        if !Self::root_within_host_budget(frame_bytes) {
+            self.frames_corrupt = self.frames_corrupt.saturating_add(1);
+            return crate::ingest_status::INGEST_ERROR;
+        }
         match self.inner.ingest(frame_bytes) {
             Ok(IngestEvent::RootLocked) => {
                 self.session_mismatch_streak = 0;
-                pack(self.is_complete(), true, false, false, 0, self.received_symbols)
+                pack(
+                    self.is_complete(),
+                    true,
+                    false,
+                    false,
+                    0,
+                    self.received_symbols,
+                )
             }
             Ok(IngestEvent::RootMismatch { streak }) => {
                 self.session_mismatch_streak = streak;
-                pack(self.is_complete(), false, false, false, streak, self.received_symbols)
+                pack(
+                    self.is_complete(),
+                    false,
+                    false,
+                    false,
+                    streak,
+                    self.received_symbols,
+                )
             }
             Ok(IngestEvent::Relocked) => {
                 self.session_mismatch_streak = 0;
@@ -90,19 +159,49 @@ impl ReceiverSession {
                 // §12 resume).
                 pack(false, true, false, false, 0, 0) | crate::ingest_status::RELOCKED_BIT
             }
-            Ok(IngestEvent::MetaBound { .. }) => {
-                pack(self.is_complete(), true, false, false, 0, self.received_symbols)
-            }
+            Ok(IngestEvent::MetaBound { .. }) => pack(
+                self.is_complete(),
+                true,
+                false,
+                false,
+                0,
+                self.received_symbols,
+            ),
             Ok(IngestEvent::InstanceSwitched) => {
                 // New Broadcast Instance of the SAME transfer: the chunk ledger
                 // (completed_chunks / completed_count) stays valid — canonical
                 // chunks are identical across instances. last_chunk survives so
                 // a host that has not drained it yet still can.
-                pack(self.is_complete(), true, false, false, 0, self.received_symbols)
+                pack(
+                    self.is_complete(),
+                    true,
+                    false,
+                    false,
+                    0,
+                    self.received_symbols,
+                )
             }
             Ok(IngestEvent::SymbolAccepted) => {
                 self.received_symbols = self.received_symbols.saturating_add(1);
-                pack(self.is_complete(), true, false, false, 0, self.received_symbols)
+                pack(
+                    self.is_complete(),
+                    true,
+                    false,
+                    false,
+                    0,
+                    self.received_symbols,
+                )
+            }
+            Ok(IngestEvent::SymbolDuplicate) => {
+                self.frames_duplicate = self.frames_duplicate.saturating_add(1);
+                pack(
+                    self.is_complete(),
+                    false,
+                    false,
+                    false,
+                    0,
+                    self.received_symbols,
+                )
             }
             Ok(IngestEvent::ManifestReady) => {
                 self.received_symbols = self.received_symbols.saturating_add(1);
@@ -113,7 +212,14 @@ impl ReceiverSession {
                 // self-consistent but contradicts the Manifest would be
                 // materialized at publish time.
                 self.reverify_against_manifest();
-                pack(self.is_complete(), true, true, false, 0, self.received_symbols)
+                pack(
+                    self.is_complete(),
+                    true,
+                    true,
+                    false,
+                    0,
+                    self.received_symbols,
+                )
             }
             Ok(IngestEvent::ChunkReady { index, raw }) => {
                 self.received_symbols = self.received_symbols.saturating_add(1);
@@ -123,7 +229,14 @@ impl ReceiverSession {
                     self.completed_count = self.completed_count.saturating_add(1);
                 }
                 self.last_chunk = Some((index, raw));
-                pack(self.is_complete(), true, false, true, 0, self.received_symbols)
+                pack(
+                    self.is_complete(),
+                    true,
+                    false,
+                    true,
+                    0,
+                    self.received_symbols,
+                )
             }
             Ok(IngestEvent::MetaRejected | IngestEvent::ChunkRejected | IngestEvent::Dropped) => {
                 pack(
@@ -135,7 +248,10 @@ impl ReceiverSession {
                     self.received_symbols,
                 )
             }
-            Err(_) => crate::ingest_status::INGEST_ERROR,
+            Err(_) => {
+                self.frames_corrupt = self.frames_corrupt.saturating_add(1);
+                crate::ingest_status::INGEST_ERROR
+            }
         }
     }
 
@@ -209,6 +325,9 @@ impl ReceiverSession {
     /// the full parse + id-binding path.
     pub fn resume(&mut self, root_frame_bytes: &[u8], completed: &[u32]) -> bool {
         self.final_verifier = None;
+        if !Self::root_within_host_budget(root_frame_bytes) {
+            return false;
+        }
         match self.inner.resume(root_frame_bytes, completed) {
             Ok(accepted) => {
                 // Only indices actually inside the transfer count (af2 drops
@@ -232,9 +351,10 @@ impl ReceiverSession {
             .map(|(index, _)| *index)
             .collect();
         for index in evicted {
-            self.completed_chunks.remove(&index);
+            // invalidate_chunk owns BOTH ledger removals and the single count
+            // decrement. Removing/decrementing here as well made a two-chunk
+            // session fall 2 -> 0 when only one poisoned chunk was evicted.
             self.invalidate_chunk(index);
-            self.completed_count = self.completed_count.saturating_sub(1);
             if self.last_chunk.as_ref().is_some_and(|(i, _)| *i == index) {
                 self.last_chunk = None;
             }
@@ -261,8 +381,8 @@ impl ReceiverSession {
     pub fn snapshot_json(&self) -> String {
         match self.inner.root() {
             Some(r) => {
-                let tid_hex: String = r.transfer().iter().map(|b| format!("{b:02x}")).collect();
-                let cid_hex: String = r.content_id.iter().map(|b| format!("{b:02x}")).collect();
+                let tid_hex = hex_lower(&r.transfer());
+                let cid_hex = hex_lower(&r.content_id);
                 // Canonical ROOT frame re-encode (deterministic: same record,
                 // same T ⇒ byte-identical to the wire frame that locked the
                 // session). Hosts persist it in their §12 ledger and feed it
@@ -276,7 +396,7 @@ impl ReceiverSession {
                     t: self.inner.symbol_size(),
                 }
                 .to_bytes()
-                .map(|b| b.iter().map(|x| format!("{x:02x}")).collect::<String>())
+                .map(|b| hex_lower(&b))
                 .unwrap_or_default();
                 let mut entries_json = String::from("[");
                 if let Some(m) = self.inner.manifest() {
@@ -297,14 +417,20 @@ impl ReceiverSession {
                         if i > 0 {
                             entries_json.push(',');
                         }
-                        entries_json.push_str(&format!(
-                            r#"{{"kind":{},"path":"{}","save_path":"{}","offset":{},"size":{}}}"#,
-                            e.kind,
-                            escape_json(&e.path),
-                            escape_json(save),
-                            e.content_offset,
-                            e.content_size
-                        ));
+                        // Hand-rolled field appends (not one format! per
+                        // entry): a 4096-entry manifest is rebuilt on every
+                        // snapshot call and the format machinery dominated it.
+                        entries_json.push_str(r#"{"kind":"#);
+                        push_u64(&mut entries_json, e.kind as u64);
+                        entries_json.push_str(r#","path":""#);
+                        entries_json.push_str(&escape_json(&e.path));
+                        entries_json.push_str(r#"","save_path":""#);
+                        entries_json.push_str(&escape_json(save));
+                        entries_json.push_str(r#"","offset":"#);
+                        push_u64(&mut entries_json, e.content_offset);
+                        entries_json.push_str(r#","size":"#);
+                        push_u64(&mut entries_json, e.content_size);
+                        entries_json.push('}');
                     }
                 }
                 entries_json.push(']');
@@ -353,9 +479,7 @@ impl ReceiverSession {
             .unwrap_or(0)
         };
         let total_symbols = root
-            .map(|r| {
-                u32::try_from(r.total_raw_size.div_ceil(u64::from(t))).unwrap_or(u32::MAX)
-            })
+            .map(|r| u32::try_from(r.total_raw_size.div_ceil(u64::from(t))).unwrap_or(u32::MAX))
             .unwrap_or(0);
         let decoded_symbols = est_symbols(self.completed_count).min(total_symbols);
         crate::Progress {
@@ -364,8 +488,8 @@ impl ReceiverSession {
             symbol_size: t,
             received_symbols: self.received_symbols,
             frames_seen: self.frames_seen,
-            frames_duplicate: 0,
-            frames_corrupt: 0,
+            frames_duplicate: self.frames_duplicate,
+            frames_corrupt: self.frames_corrupt,
             decoded_blocks: self.completed_count,
             total_blocks: root.map(|r| r.chunk_count).unwrap_or(0),
             meta_confirmed: root.is_some(),
@@ -383,9 +507,23 @@ impl ReceiverSession {
         if self.completed_count < root.chunk_count {
             return None;
         }
-        let mut out = Vec::with_capacity(root.total_raw_size as usize);
+        // Resume/spill ledgers contribute to completed_count even when their
+        // bytes are intentionally not resident. Validate residency before any
+        // allocation derived from an attacker-controlled ROOT.
+        let mut chunks = Vec::with_capacity(root.chunk_count as usize);
+        let mut resident_len = 0u64;
         for i in 0..root.chunk_count {
             let chunk = self.completed_chunks.get(&i)?;
+            resident_len = resident_len.checked_add(chunk.len() as u64)?;
+            chunks.push(chunk);
+        }
+        if resident_len != root.total_raw_size {
+            return None;
+        }
+        let capacity = usize::try_from(root.total_raw_size).ok()?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(capacity).ok()?;
+        for chunk in chunks {
             out.extend_from_slice(chunk);
         }
         Some(out)
@@ -404,11 +542,41 @@ mod tests {
     /// IngestStatus bits mirror ingest_status::pack.
     fn bits(word: u64) -> (bool, bool, bool, bool) {
         (
-            word & 1 != 0,                // complete
-            word >> 1 & 1 != 0,           // accepted
-            word >> 2 & 1 != 0,           // manifest_ready
-            word >> 3 & 1 != 0,           // chunk_ready
+            word & 1 != 0,      // complete
+            word >> 1 & 1 != 0, // accepted
+            word >> 2 & 1 != 0, // manifest_ready
+            word >> 3 & 1 != 0, // chunk_ready
         )
+    }
+
+    #[test]
+    fn oversized_root_is_rejected_before_lock_or_decoder_allocation() {
+        let total = HOST_MAX_RECEIVE_BYTES + 1;
+        let chunk_raw_size = 32 << 20;
+        let manifest_hash = [0x11; 32];
+        let root = af2::root::RootRecord {
+            content_id: [0x22; 32],
+            manifest_object_id: [0x33; 16],
+            manifest_hash,
+            total_raw_size: total,
+            entry_count: 1,
+            chunk_count: af2::root::expected_chunk_count(total, chunk_raw_size),
+            chunk_raw_size,
+            extensions: vec![],
+        };
+        let frame = Af2Frame {
+            frame_type: FrameType::Root,
+            object_id: root.transfer(),
+            sbn: 0,
+            esi: 0,
+            body: root.encode().unwrap(),
+            t: 1024,
+        }
+        .to_bytes()
+        .unwrap();
+        let mut session = ReceiverSession::new();
+        assert_eq!(session.ingest(&frame), crate::ingest_status::INGEST_ERROR);
+        assert!(session.inner.root().is_none());
     }
 
     /// Craft a self-consistent CHUNK object whose raw bytes (Y) differ from
@@ -417,6 +585,7 @@ mod tests {
     /// the post-manifest re-verification can catch it.
     fn craft_foreign_chunk_frames(
         tid: [u8; 16],
+        index: u32,
         y: &[u8],
         t: usize,
     ) -> (Vec<u8>, Vec<Vec<u8>>) {
@@ -428,7 +597,7 @@ mod tests {
         let oid = object_id(
             &tid,
             ROLE_CHUNK,
-            0,
+            index,
             codec,
             FEC_ID_RAPTORQ,
             &meta_obj.oti_bytes,
@@ -437,7 +606,7 @@ mod tests {
         let record = ObjectMetaRecord {
             role: ROLE_CHUNK,
             transfer_id: tid,
-            object_index: 0,
+            object_index: index,
             codec_id: codec,
             fec_id: FEC_ID_RAPTORQ,
             oti: meta_obj.oti_bytes,
@@ -536,7 +705,10 @@ mod tests {
             }
         }
         assert!(saw_first_accepted);
-        assert!(completed, "resumed session (chunk 0 from ledger) must complete");
+        assert!(
+            completed,
+            "resumed session (chunk 0 from ledger) must complete"
+        );
 
         // A genuinely foreign transfer must set the bit — after the ≥3-frame
         // mismatch debounce (a single foreign ROOT only counts a streak).
@@ -562,6 +734,42 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_symbol_does_not_inflate_received_or_rate_counters() {
+        let mut state = 0x1234_5678u64;
+        let data: Vec<u8> = (0..64 << 10)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                (state >> 32) as u8
+            })
+            .collect();
+        let mut sender = Af2Sender::new(
+            vec![(KIND_FILE, "dup.bin".to_string(), data)],
+            SenderConfig::default(),
+        )
+        .unwrap();
+        let mut session = ReceiverSession::new();
+        let mut novel_frame = None;
+        for _ in 0..256 {
+            let frame = sender.next_frame().unwrap();
+            let before = session.received_symbols;
+            let word = session.ingest(&frame);
+            let event = bits(word);
+            if session.received_symbols > before && !event.2 && !event.3 {
+                novel_frame = Some(frame);
+                break;
+            }
+        }
+        let frame = novel_frame.expect("sender must emit a routed symbol");
+        let received = session.received_symbols;
+        let duplicates = session.frames_duplicate;
+        let word = session.ingest(&frame);
+        assert_eq!(session.received_symbols, received);
+        assert_eq!(session.frames_duplicate, duplicates + 1);
+        assert_eq!((word >> 32) as u32, received);
+        assert_eq!(word >> 1 & 1, 0, "duplicate must not set accepted");
+    }
+
+    #[test]
     fn manifest_ready_evicts_and_resupplies_poisoned_chunk() {
         let x = vec![0x58u8; 3000];
         let y = vec![0x59u8; 3000];
@@ -577,7 +785,7 @@ mod tests {
         assert!(accepted && !complete);
 
         // 2. Complete the POISONED chunk (Y) before any manifest arrives.
-        let (meta_frame, symbols) = craft_foreign_chunk_frames(sender.transfer_id(), &y, 1024);
+        let (meta_frame, symbols) = craft_foreign_chunk_frames(sender.transfer_id(), 0, &y, 1024);
         let (_, _, _, chunk_ready) = bits(session.ingest(&meta_frame));
         assert!(!chunk_ready);
         let mut poisoned_done = false;
@@ -595,7 +803,8 @@ mod tests {
         // 3. Keep feeding the real broadcast until the Manifest arrives.
         let mut manifest_seen = false;
         for _ in 0..4000 {
-            let (complete, _, manifest_ready, _) = bits(session.ingest(&sender.next_frame().unwrap()));
+            let (complete, _, manifest_ready, _) =
+                bits(session.ingest(&sender.next_frame().unwrap()));
             if manifest_ready {
                 manifest_seen = true;
                 // §11: the poisoned chunk must be evicted from BOTH ledgers.
@@ -604,7 +813,10 @@ mod tests {
                 break;
             }
         }
-        assert!(manifest_seen, "recurring manifest interleave must deliver the manifest");
+        assert!(
+            manifest_seen,
+            "recurring manifest interleave must deliver the manifest"
+        );
 
         // 4. The sender's next epoch re-supplies the real chunk (X) — the core
         //    chunk_done bit was invalidated, so the META binds again.
@@ -624,6 +836,60 @@ mod tests {
         let stream = session.assemble_all().unwrap();
         assert_eq!(stream, x);
         assert!(session.verify_final_stream(&stream));
+    }
+
+    #[test]
+    fn manifest_reverify_decrements_each_poisoned_chunk_once() {
+        let chunk_size = 1 << 20;
+        let x = vec![0x58u8; chunk_size * 2];
+        let poisoned = vec![0x59u8; chunk_size];
+        let mut sender = Af2Sender::new(
+            vec![(KIND_FILE, "two.bin".to_string(), x.clone())],
+            SenderConfig {
+                symbol_size: 1024,
+                chunk_raw_size: chunk_size as u32,
+                ..SenderConfig::default()
+            },
+        )
+        .unwrap();
+        let tid = sender.transfer_id();
+        let mut session = ReceiverSession::new();
+        let _ = session.ingest(&sender.next_frame().unwrap());
+
+        // Complete a poisoned chunk 0 and the legitimate chunk 1 before the
+        // Manifest. Both are self-consistent at META/encoded-hash time.
+        for (index, raw) in [(0u32, poisoned.as_slice()), (1u32, &x[chunk_size..])] {
+            let (meta, symbols) = craft_foreign_chunk_frames(tid, index, raw, 1024);
+            let _ = session.ingest(&meta);
+            for symbol in symbols {
+                let _ = session.ingest(&symbol);
+            }
+        }
+        assert_eq!(session.completed_count, 2);
+        assert!(session.is_complete());
+
+        // Manifest arrival evicts only chunk 0. The count must remain 1, not
+        // fall to zero through a caller + callee double decrement.
+        for _ in 0..4000 {
+            let word = session.ingest(&sender.next_frame().unwrap());
+            if bits(word).2 {
+                break;
+            }
+        }
+        assert_eq!(session.completed_count, 1);
+        assert!(session.assemble_chunk(1).is_some());
+        assert!(!session.is_complete());
+
+        let (meta, symbols) = craft_foreign_chunk_frames(tid, 0, &x[..chunk_size], 1024);
+        let _ = session.ingest(&meta);
+        for symbol in symbols {
+            let _ = session.ingest(&symbol);
+            if session.is_complete() {
+                break;
+            }
+        }
+        assert_eq!(session.completed_count, 2);
+        assert!(session.is_complete());
     }
 
     #[test]
@@ -647,7 +913,10 @@ mod tests {
         // §12 resume with every chunk already committed: complete, no manifest.
         let mut session = ReceiverSession::new();
         assert!(session.resume(&root_frame, &[0]));
-        assert!(session.is_complete(), "1/1 ledger chunks ⇒ complete pre-manifest");
+        assert!(
+            session.is_complete(),
+            "1/1 ledger chunks ⇒ complete pre-manifest"
+        );
         assert!(
             !session.snapshot_json().contains("\"entries\":[{"),
             "snapshot has no entry table before the manifest decodes"
@@ -667,9 +936,15 @@ mod tests {
                 break;
             }
         }
-        assert!(manifest_ready, "the recurring manifest interleave must deliver it");
+        assert!(
+            manifest_ready,
+            "the recurring manifest interleave must deliver it"
+        );
         // …completion persists across the wait, and staging is now possible.
-        assert!(session.is_complete(), "completion must survive the manifest wait");
+        assert!(
+            session.is_complete(),
+            "completion must survive the manifest wait"
+        );
         assert!(session.verify_chunk(0, &data));
         assert!(session.verify_final_stream(&data));
     }
@@ -723,7 +998,10 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
             .collect();
-        assert_eq!(decoded, root_frame, "canonical re-encode must be byte-identical");
+        assert_eq!(
+            decoded, root_frame,
+            "canonical re-encode must be byte-identical"
+        );
         let mut resumed = ReceiverSession::new();
         assert!(resumed.resume(&decoded, &[]));
     }

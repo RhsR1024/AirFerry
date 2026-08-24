@@ -17,8 +17,11 @@ export interface SyncHandleLike {
 
 export type ChunkStorage = "disk" | "memory"
 
+const MAX_MEMORY_FALLBACK_BYTES = 64 * 1024 * 1024
+
 export class ChunkStore {
   private memory = new Map<number, Uint8Array>()
+  private memoryBytes = 0
   private diskIndices = new Set<number>()
   private opfsDir: FileSystemDirectoryHandle | null = null
   private opfsFile: FileSystemFileHandle | null = null
@@ -56,6 +59,7 @@ export class ChunkStore {
     } else {
       this.closeSyncHandle()
       this.memory.clear()
+      this.memoryBytes = 0
       this.diskIndices.clear()
       this.completedIndices.clear()
       this.preserveReleasedBacking = false
@@ -91,6 +95,8 @@ export class ChunkStore {
         }
         this.syncHandle.flush()
         this.diskIndices.add(index)
+        const previous = this.memory.get(index)
+        if (previous) this.memoryBytes -= previous.byteLength
         this.memory.delete(index)
         this.completedIndices.add(index)
         return "disk"
@@ -100,7 +106,15 @@ export class ChunkStore {
       }
     }
 
+    const previous = this.memory.get(index)
+    const nextBytes = this.memoryBytes - (previous?.byteLength ?? 0) + bytes.byteLength
+    if (nextBytes > MAX_MEMORY_FALLBACK_BYTES) {
+      throw new Error(
+        `AF2_STORAGE_FATAL: 临时存储不可用，内存回退已达到 ${MAX_MEMORY_FALLBACK_BYTES / 1024 / 1024} MiB 上限`
+      )
+    }
     this.memory.set(index, bytes)
+    this.memoryBytes = nextBytes
     this.diskIndices.delete(index)
     this.completedIndices.add(index)
     return "memory"
@@ -259,6 +273,8 @@ export class ChunkStore {
   invalidate(index: number): void {
     this.completedIndices.delete(index)
     this.diskIndices.delete(index)
+    const previous = this.memory.get(index)
+    if (previous) this.memoryBytes -= previous.byteLength
     this.memory.delete(index)
   }
 
@@ -271,6 +287,7 @@ export class ChunkStore {
    */
   release(): void {
     this.memory.clear()
+    this.memoryBytes = 0
     this.diskIndices.clear()
     this.completedIndices.clear()
     this.closeSyncHandle()
@@ -280,6 +297,7 @@ export class ChunkStore {
   async discard(): Promise<void> {
     const preserveBacking = this.preserveReleasedBacking
     this.memory.clear()
+    this.memoryBytes = 0
     this.diskIndices.clear()
     this.completedIndices.clear()
     this.closeSyncHandle()

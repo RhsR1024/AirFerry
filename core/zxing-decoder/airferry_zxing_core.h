@@ -8,6 +8,8 @@
 
 namespace AirFerryZxing {
 
+inline constexpr size_t MaxTrackedCodes = 4;
+
 using Bbox = std::array<int32_t, 4>;
 
 struct DecodeResult {

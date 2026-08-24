@@ -22,6 +22,7 @@
  *
  * Usage:
  *   node scripts/version.mjs check
+ *   node scripts/version.mjs print
  */
 import { readFileSync } from "node:fs"
 import path from "node:path"
@@ -160,7 +161,10 @@ switch (cmd) {
   case "check":
     check()
     break
+  case "print":
+    console.log(cargoVersion())
+    break
   default:
-    console.error(`unknown command: ${cmd} (supported: check)`)
+    console.error(`unknown command: ${cmd} (supported: check, print)`)
     process.exit(2)
 }

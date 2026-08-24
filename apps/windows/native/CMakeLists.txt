@@ -10,24 +10,9 @@ if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
-set(ZXING_COMMIT "8dd1cf5c4fd6fb6211bb96713db926ac6f2cf825")
-include(FetchContent)
-FetchContent_Declare(
-    zxing
-    GIT_REPOSITORY https://github.com/zxing-cpp/zxing-cpp.git
-    GIT_TAG ${ZXING_COMMIT}
-    GIT_SHALLOW FALSE
-)
-set(ZXING_READERS ON CACHE BOOL "" FORCE)
-set(ZXING_WRITERS OFF CACHE STRING "" FORCE)
-set(ZXING_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(ZXING_BLACKBOX_TESTS OFF CACHE BOOL "" FORCE)
-set(ZXING_UNIT_TESTS OFF CACHE BOOL "" FORCE)
-set(ZXING_C_API OFF CACHE BOOL "" FORCE)
-set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(zxing)
-
 set(AIRFERRY_ZXING_CORE_DIR "${CMAKE_CURRENT_LIST_DIR}/../../../core/zxing-decoder")
+include("${AIRFERRY_ZXING_CORE_DIR}/zxing-source.cmake")
+airferry_add_zxing()
 add_library(airferry_zxing SHARED
     zxing_capi.cpp
     "${AIRFERRY_ZXING_CORE_DIR}/airferry_zxing_core.cpp"

@@ -69,11 +69,13 @@ export const AF2_MAX_ORIGINAL_BYTES = 4 * 1024 * 1024 * 1024 * 1024
  * Current Web sender host cap.
  *
  * The preparation path is fully streamed (§9.3 single pass, one chunk in
- * memory at a time, play-time `stage_chunk`), so the binding limit is the AF2
- * wire format itself: at the default 8 MiB chunk_raw_size the chunk table
- * addresses at most 131,072 chunks = 1 TiB.
+ * memory at a time, play-time `stage_chunk`). Nevertheless this sender is
+ * capped to the smallest bundled receiver budget (Web/WASM: 8 GiB): AF2 is a
+ * one-way protocol with no capability handshake, so advertising the 1 TiB
+ * chunk-table capacity would create valid broadcasts that a bundled receiver
+ * silently cannot accept.
  */
-export const MAX_ORIGINAL_BYTES = 1024 * 1024 * 1024 * 1024
+export const MAX_ORIGINAL_BYTES = 8 * 1024 * 1024 * 1024
 export const MAX_ORIGINAL_MIB = MAX_ORIGINAL_BYTES / (1024 * 1024)
 
 /**

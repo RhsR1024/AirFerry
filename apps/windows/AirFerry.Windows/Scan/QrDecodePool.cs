@@ -17,6 +17,8 @@ public sealed class QrDecodePool : IDisposable
 
     private const int IngestBatch = 4;
     private const int MultiFullDecodeEvery = 3;
+    private const int MultiPeriodicFullEvery = 30;
+    private const int TrackShrinkAfterFullScans = 3;
     private const float TrackMargin = 0.35F;
 
     private readonly BlockingCollection<GrayFrame> _queue;
@@ -31,8 +33,10 @@ public sealed class QrDecodePool : IDisposable
     private long _droppedFrames;
     private long _decodedSymbols;
     private long _multiMisses;
+    private long _multiFrames;
     private int[]? _multiTrackedBboxes;
     private int _multiLockedCount;
+    private int _lowerFullCountStreak;
 
     internal volatile bool IngestStopped;
     internal readonly object IngestLock = new();
@@ -252,7 +256,9 @@ public sealed class QrDecodePool : IDisposable
         // fast path exists to avoid. Only miss counts that are > 0 and land on
         // the boundary trigger the cold path (mirrors Android's fix).
         long misses = Interlocked.Read(ref _multiMisses);
+        long frameOrdinal = Interlocked.Increment(ref _multiFrames);
         bool dueFullLock = tracked is null || lockedCount == 0 ||
+            frameOrdinal % MultiPeriodicFullEvery == 0 ||
             (misses > 0 && misses % MultiFullDecodeEvery == 0);
         if (!dueFullLock && tracked is not null && lockedCount > 0)
         {
@@ -271,7 +277,7 @@ public sealed class QrDecodePool : IDisposable
         List<ZxingDecoder.MultiResult> fullResults = DecodeMultiFull(frame);
         if (fullResults.Count > 0)
         {
-            SeedTrackedSlots(fullResults);
+            MergeFullTrackedSlots(fullResults);
             Interlocked.Exchange(ref _multiMisses, 0);
         }
         else
@@ -301,6 +307,38 @@ public sealed class QrDecodePool : IDisposable
         {
             _multiTrackedBboxes = packed;
             _multiLockedCount = results.Count;
+            _lowerFullCountStreak = 0;
+        }
+    }
+
+    /// <summary>
+    /// Grow an initially partial lock when a periodic full scan sees more
+    /// codes, but never shrink known slots on a transient partial full scan.
+    /// </summary>
+    private void MergeFullTrackedSlots(IReadOnlyList<ZxingDecoder.MultiResult> results)
+    {
+        lock (_trackingGate)
+        {
+            int known = _multiLockedCount;
+            if (known == 0 || results.Count > known)
+            {
+                SeedTrackedSlots(results);
+                return;
+            }
+            if (results.Count < known)
+            {
+                _lowerFullCountStreak++;
+                if (_lowerFullCountStreak >= TrackShrinkAfterFullScans)
+                {
+                    SeedTrackedSlots(results);
+                    return;
+                }
+            }
+            else
+            {
+                _lowerFullCountStreak = 0;
+            }
+            UpdateTrackedSlots(results);
         }
     }
 

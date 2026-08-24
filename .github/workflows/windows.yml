@@ -8,6 +8,8 @@ on:
       - 'apps/windows/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'scripts/build-windows.ps1'
+      - 'scripts/sign-windows.ps1'
       - '.github/workflows/windows.yml'
   pull_request:
     paths:
@@ -15,6 +17,8 @@ on:
       - 'apps/windows/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'scripts/build-windows.ps1'
+      - 'scripts/sign-windows.ps1'
       - '.github/workflows/windows.yml'
   workflow_dispatch:
     inputs:
@@ -190,7 +194,7 @@ jobs:
           Write-Host "Windows 接收端 -> $ZipName"
 
       - name: Upload Windows Receiver Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: airferry-windows-x64
           path: dist/airferry-receiver-windows-x64.zip
@@ -231,10 +235,28 @@ jobs:
           }
           $ver = $env:RELEASE_TAG.Substring(1)
           # 扩展 manifest 由 apps/web/scripts/build-ext.cjs 构建时从 package.json
-          # 版本生成（package.json 本身无 manifest 字段），这里只校验版本事实源。
+          # 版本生成（package.json 本身无 manifest 字段）；根 Cargo.toml 才是
+          # 版本事实源，因此 tag 与事实源、Web 镜像位点必须三者一致。
+          $cargo = Get-Content Cargo.toml -Raw
+          $workspace = [regex]::Match($cargo, '(?ms)^\[workspace\.package\]\s*$(.*?)(?=^\[|\z)')
+          if (-not $workspace.Success) { throw 'Cargo.toml missing [workspace.package]' }
+          $cargoVersion = [regex]::Match(
+            $workspace.Groups[1].Value,
+            '(?m)^version\s*=\s*"([^"]+)"\s*$'
+          )
+          if (-not $cargoVersion.Success -or $cargoVersion.Groups[1].Value -ne $ver) {
+            throw "Tag version $ver does not match Cargo.toml workspace version"
+          }
           $package = Get-Content apps/web/package.json -Raw | ConvertFrom-Json
           if ($package.version -ne $ver) {
             throw "Tag version $ver does not match apps/web/package.json version $($package.version)"
+          }
+          [xml]$project = Get-Content apps/windows/AirFerry.Windows/AirFerry.Windows.csproj -Raw
+          $projectVersion = @($project.Project.PropertyGroup.Version) |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            Select-Object -First 1
+          if ($projectVersion -ne $ver) {
+            throw "Tag version $ver does not match Windows csproj version $projectVersion"
           }
           $tagCommit = (git rev-list -n 1 $env:RELEASE_TAG).Trim()
           $headCommit = (git rev-parse HEAD).Trim()
@@ -304,6 +326,35 @@ jobs:
           -c Release -r win-x64
           -p:PublishSingleFile=true --self-contained false
 
+      - name: Authenticode sign and verify release binaries
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_PFX_B64: ${{ secrets.WINDOWS_SIGNING_PFX_B64 }}
+          AIRFERRY_WINDOWS_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PASSWORD }}
+          AIRFERRY_WINDOWS_CERT_THUMBPRINT: ${{ secrets.WINDOWS_SIGNING_CERT_THUMBPRINT }}
+        run: |
+          $publishDirs = Get-ChildItem apps/windows/AirFerry.Windows/bin -Recurse -Directory -Filter publish
+          if ($publishDirs.Count -eq 0) { throw "publish directory not found" }
+          $PublishDir = $publishDirs[-1].FullName
+          foreach ($required in @("transfer_engine.dll", "airferry_zxing.dll")) {
+            Copy-Item (Join-Path "apps/windows/AirFerry.Windows/runtime" $required) `
+              (Join-Path $PublishDir $required) -Force
+          }
+          $pfx = Join-Path $env:RUNNER_TEMP "airferry-release.pfx"
+          try {
+            if ([string]::IsNullOrWhiteSpace($env:WINDOWS_SIGNING_PFX_B64)) {
+              throw "Required Windows release-signing secret is missing: WINDOWS_SIGNING_PFX_B64"
+            }
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_SIGNING_PFX_B64))
+            # The PFX now exists only in the protected temp file; do not let
+            # signtool or any other child inherit the base64 private key.
+            Remove-Item Env:WINDOWS_SIGNING_PFX_B64 -ErrorAction SilentlyContinue
+            $env:AIRFERRY_WINDOWS_PFX = $pfx
+            & ./scripts/sign-windows.ps1 -PublishDir $PublishDir
+          } finally {
+            Remove-Item $pfx -Force -ErrorAction SilentlyContinue
+          }
+
       - name: Pack zip
         shell: pwsh
         run: |
@@ -323,13 +374,6 @@ jobs:
           $PublishDir = $publishDirs[-1].FullName
           Write-Host "=== publish 目录: $PublishDir ==="
           foreach ($required in @("transfer_engine.dll", "airferry_zxing.dll")) {
-            $runtimeDll = Join-Path "apps/windows/AirFerry.Windows/runtime" $required
-            if (-not (Test-Path $runtimeDll)) {
-              throw "runtime native dependency missing before packaging: $required"
-            }
-            # Keep packaging independent of SDK item-glob details and ensure
-            # P/Invoke dependencies sit beside the single-file executable.
-            Copy-Item $runtimeDll (Join-Path $PublishDir $required) -Force
             if (-not (Test-Path (Join-Path $PublishDir $required))) {
               throw "publish output missing native dependency: $required"
             }

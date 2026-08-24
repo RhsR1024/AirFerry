@@ -80,12 +80,7 @@ fn run_simulated_transfer(
     } else {
         (String::new(), 0)
     };
-    (
-        is_complete,
-        received_chunks,
-        tid_hex,
-        total_raw_size,
-    )
+    (is_complete, received_chunks, tid_hex, total_raw_size)
 }
 
 #[test]
@@ -110,7 +105,9 @@ fn boundary_suite_1_data_and_content_boundaries() {
     assert_eq!(chunks.get(&0).unwrap(), &single_byte);
 
     // 1.2 Boundary sizes around 26-64 bytes
-    for len in [29, 30, 31, 63, 64, 65, 127, 128, 511, 512, 513, 1023, 1024, 1025] {
+    for len in [
+        29, 30, 31, 63, 64, 65, 127, 128, 511, 512, 513, 1023, 1024, 1025,
+    ] {
         let data = vec![0xA5; len];
         let (complete, chunks, _, raw_size) = run_simulated_transfer(
             vec![(1, format!("size_{len}.bin"), data.clone())],
@@ -192,7 +189,9 @@ fn boundary_suite_1_data_and_content_boundaries() {
 #[test]
 fn boundary_suite_2_transmission_parameters_and_symbol_sizes() {
     println!("\n--- Suite 2: Transmission Parameters and Symbol Sizes ---");
-    let test_data = b"AirFerry Transmission Parameters Boundary Matrix Test Verification Data Payload!".to_vec();
+    let test_data =
+        b"AirFerry Transmission Parameters Boundary Matrix Test Verification Data Payload!"
+            .to_vec();
 
     // 2.1 All standard symbol sizes (256, 384, 512, 768, 1024, 1400)
     for sym_size in [256, 384, 512, 768, 1024, 1400] {
@@ -374,7 +373,7 @@ fn boundary_suite_6_cross_instance_isolation_no_poisoning() {
     let mut sender_t1024 = Af2Sender::new(
         vec![(1, "data.bin".into(), payload.clone())],
         SenderConfig {
-            symbol_size: 1024,
+            symbol_size: 2400,
             chunk_raw_size: 1 << 20,
             redundancy_pct: 30,
         },
@@ -401,7 +400,10 @@ fn boundary_suite_6_cross_instance_isolation_no_poisoning() {
             break;
         }
     }
-    assert!(chunk_recovered, "Target instance must recover cleanly despite interleaved foreign symbols");
+    assert!(
+        chunk_recovered,
+        "Target instance must recover cleanly despite interleaved foreign symbols"
+    );
 }
 
 #[test]
@@ -436,13 +438,18 @@ fn boundary_suite_7_late_joiner_linear_convergence() {
             break;
         }
     }
-    assert!(completed, "Late joiner must lock onto periodic control frames and decode");
+    assert!(
+        completed,
+        "Late joiner must lock onto periodic control frames and decode"
+    );
 }
 
 #[test]
 fn boundary_suite_8_manifest_post_verification_and_stream_gate() {
     println!("\n--- Suite 8: §17 f) Post-Verification & §13 ⑧⑨ Finalize Gate ---");
-    let text = "Hello AF2 full integrity chain verification!".as_bytes().to_vec();
+    let text = "Hello AF2 full integrity chain verification!"
+        .as_bytes()
+        .to_vec();
     let mut sender = Af2Sender::new(
         vec![(2, "msg.txt".into(), text.clone())],
         SenderConfig::default(),
@@ -468,6 +475,178 @@ fn boundary_suite_8_manifest_post_verification_and_stream_gate() {
     assert!(!rx.verify_chunk(0, &bad_raw));
 
     // Full stream finalization gate
-    rx.verify_final_stream(&raw).expect("Final stream gate must pass");
+    rx.verify_final_stream(&raw)
+        .expect("Final stream gate must pass");
     assert!(rx.verify_final_stream(&bad_raw).is_err());
+}
+
+/// Suite 9 — regression for the "received/total climbs past 100% forever"
+/// starvation: a receiver whose per-window capture ratio sits far below the
+/// window budget's K fraction used to lose every partially-collected chunk
+/// decoder at each window boundary (zero-cache §11 policy), so a multi-chunk
+/// RAW transfer under heavy loss could NEVER finish any chunk. The epoch≥2
+/// adaptive short recovery pass followed by a self-sufficient 4K+R robust
+/// window must complete every chunk when the receiver deterministically sees
+/// only one of four sequential QR payloads. No cross-chunk decoder retention
+/// is required; this models a partial multi-QR lane lock at protocol level.
+///
+/// The payload is PSEUDO-RANDOM (incompressible ⇒ every chunk ships RAW with
+/// a full K-symbol budget); constant test data would compress ~900:1 and turn
+/// each chunk into a single-symbol object that trivially completes in one
+/// frame, hiding the starvation entirely.
+#[test]
+fn boundary_suite_9_low_capture_multichunk_eventual_completion() {
+    println!("\n--- Suite 9: Low-Capture Multi-Chunk Starvation Recovery ---");
+    let chunk_raw = 1 << 20; // smallest protocol-legal chunk size (1 MiB)
+    let mut lcg: u64 = 0x9E37_79B9_7F4A_7C15;
+    let payload: Vec<u8> = (0..chunk_raw * 3)
+        .map(|_| {
+            lcg = lcg
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (lcg >> 33) as u8
+        })
+        .collect();
+    let config = SenderConfig {
+        symbol_size: 2400,
+        chunk_raw_size: chunk_raw as u32,
+        redundancy_pct: 5,
+    };
+    let mut sender = Af2Sender::new(vec![(1, "big.bin".into(), payload.clone())], config).unwrap();
+    let mut rx = Af2Receiver::new();
+
+    // Exact one-in-four capture: below the short K+R recovery threshold and
+    // just above the robust 4K+R fresh threshold ≈ 1/(4+R/K) ≈ 24.7%.
+    let mut received: HashMap<u32, Vec<u8>> = HashMap::new();
+    let mut complete = false;
+    for frame_index in 0..30_000 {
+        let frame = sender.next_frame().expect("frame generation failed");
+        if frame_index % 4 != 0 {
+            continue;
+        }
+        if let Ok(IngestEvent::ChunkReady { index, raw }) = rx.ingest(&frame) {
+            received.insert(index, raw);
+        }
+        if let Some(r) = rx.root() {
+            if r.chunk_count > 0 && received.len() >= r.chunk_count as usize {
+                complete = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        complete,
+        "3-chunk RAW transfer must complete at exact 25% capture"
+    );
+    for index in 0..3u32 {
+        let raw = received.get(&index).expect("chunk recovered");
+        assert_eq!(
+            raw.as_slice(),
+            &payload[index as usize * chunk_raw..(index as usize + 1) * chunk_raw],
+            "chunk {index} bytes must match"
+        );
+    }
+}
+
+/// Suite 10: zero-byte FILE entries in a hash-built (streamed) selection —
+/// the exact web compress-worker flow. `plan_chunks` emits no segment for a
+/// 0-byte entry, so the host must seed that entry's digest with H(empty)
+/// instead of waiting for the canonical walk (which never visits it); the
+/// core must accept the entry and the streamed transfer must complete with
+/// the §13 gate green. All-empty selections stay unrepresentable (F=0).
+#[test]
+fn boundary_suite_10_zero_byte_entries_in_streamed_selection() {
+    println!("\n--- Suite 10: Zero-Byte Entries (Streamed Web Flow) ---");
+    use af2::id::{empty_hash, hash, KIND_FILE};
+    use af2::manifest::build_manifest_from_hashes;
+    use af2::meta::CODEC_RAW;
+    use af2::sender::{plan_chunks, SenderError};
+
+    let text = b"non-empty payload spanning the canonical stream".to_vec();
+    let metas = vec![
+        (KIND_FILE, "empty.bin".to_string(), 0u64),
+        (KIND_FILE, "data.bin".to_string(), text.len() as u64),
+    ];
+    let plan = plan_chunks(&metas, 1 << 20).unwrap();
+    // The premise the worker's digest seeding relies on: a zero-byte entry
+    // never appears in any chunk's segment list.
+    for segs in &plan {
+        for seg in segs {
+            assert_ne!(seg.item, 0, "zero-byte entry must carry no segments");
+        }
+    }
+
+    let manifest = build_manifest_from_hashes(
+        vec![
+            (KIND_FILE, "empty.bin".to_string(), 0, empty_hash()),
+            (KIND_FILE, "data.bin".to_string(), text.len() as u64, hash(&text)),
+        ],
+        1 << 20,
+        vec![hash(&text)],
+    )
+    .unwrap();
+    let empty_entry = manifest
+        .entries
+        .iter()
+        .find(|e| e.path == "empty.bin")
+        .expect("empty entry kept in the manifest");
+    assert_eq!(empty_entry.content_size, 0);
+    assert_eq!(empty_entry.content_hash, empty_hash());
+
+    let config = SenderConfig {
+        symbol_size: 512,
+        chunk_raw_size: 1 << 20,
+        redundancy_pct: 10,
+    };
+    let mut sender = af2::sender::Af2Sender::from_manifest_streamed(manifest, config).unwrap();
+    sender
+        .stage_chunk(0, CODEC_RAW, text.clone())
+        .unwrap();
+    let mut rx = Af2Receiver::new();
+    let mut chunks: HashMap<u32, Vec<u8>> = HashMap::new();
+    let chunk_count = 1usize;
+    let mut complete = false;
+    for _ in 0..5000 {
+        let frame = loop {
+            match sender.next_frame() {
+                Ok(f) => break f,
+                Err(SenderError::ChunkNotStaged(i)) => {
+                    sender.stage_chunk(i, CODEC_RAW, text.clone()).unwrap()
+                }
+                Err(e) => panic!("unexpected sender error: {e}"),
+            }
+        };
+        if let Ok(IngestEvent::ChunkReady { index, raw }) = rx.ingest(&frame) {
+            chunks.insert(index, raw);
+            if chunks.len() >= chunk_count {
+                complete = true;
+                break;
+            }
+        }
+    }
+    assert!(complete, "selection containing a zero-byte file must transfer");
+    let m = rx.manifest().expect("manifest decoded");
+    assert!(
+        m.entries
+            .iter()
+            .any(|e| e.path == "empty.bin" && e.content_size == 0),
+        "empty entry must survive on the receiver side"
+    );
+    // §13 ⑧⑨ gate: the empty entry's H(empty) verifies inside the walk.
+    let mut verifier = rx.final_stream_verifier().unwrap();
+    verifier.feed(chunks.get(&0).unwrap()).unwrap();
+    verifier.finish().unwrap();
+
+    // All-empty selections are unrepresentable — the core counterpart of the
+    // web sender's friendly gate.
+    assert!(matches!(
+        plan_chunks(&[(KIND_FILE, "only.bin".to_string(), 0)], 1 << 20),
+        Err(SenderError::EmptyContent)
+    ));
+    assert!(build_manifest_from_hashes(
+        vec![(KIND_FILE, "only.bin".to_string(), 0, empty_hash())],
+        1 << 20,
+        vec![],
+    )
+    .is_err());
 }

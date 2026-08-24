@@ -76,7 +76,7 @@ impl Af2Sender {
         config: SenderConfig,               // symbol_size (256..=2400, %8==0), chunk_raw_size, redundancy_pct
     ) -> Result<Self, SenderError>;
     // 自动 playlist：ROOT×4 → META×4 → Manifest symbols → 逐 Chunk (ROOT×1 + META×2 + symbols)
-    // 跨 epoch 循环，持续产生新鲜修复符号（ESI 单调递增永不重复，触 2^24 停止）
+    // 跨 epoch 循环；新鲜 Repair ESI 单调递增不回绕，触界后显式循环重放合法 Repair
     pub fn next_frame(&mut self) -> Result<Vec<u8>, SenderError>;
     pub fn transfer_id(&self) -> [u8; 16];
     pub fn content_id(&self) -> [u8; 32];

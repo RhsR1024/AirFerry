@@ -6,7 +6,8 @@ plugins {
 }
 
 // Load the release signing config from apps/scanner/keystore.properties.
-// That file is git-ignored; it points at the release keystore under dist/.
+// That file is git-ignored; it points outside dist/ (normally at the repo's
+// .airferry-signing/ directory).
 val keystoreProperties = Properties().apply {
     val f = rootProject.file("keystore.properties")
     if (f.exists()) {
@@ -44,8 +45,8 @@ android {
     signingConfigs {
         create("release") {
             // Read the keystore location + credentials from keystore.properties
-            // (git-ignored). The keystore ships under dist/ so it stays out of
-            // git while remaining alongside release artifacts. Release tasks
+            // (git-ignored). The keystore lives in .airferry-signing/, isolated
+            // from uploadable artifacts. Release tasks
             // fail closed below when any credential or the keystore is absent.
             if (releaseSigningReady) {
                 // Resolve the storeFile path relative to the Gradle rootProject

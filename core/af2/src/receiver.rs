@@ -25,9 +25,11 @@
 use crate::chunk::decode_chunk;
 use crate::frame::{Af2Frame, FrameType};
 use crate::id::hash;
+use crate::id::{
+    content_id, EntryIdInput, KIND_DIRECTORY, KIND_UTF8_TEXT, ROLE_CHUNK, ROLE_MANIFEST,
+};
 use crate::manifest::Manifest;
 use crate::meta::{ObjectMetaRecord, CODEC_RAW};
-use crate::id::{content_id, EntryIdInput, KIND_DIRECTORY, KIND_UTF8_TEXT, ROLE_CHUNK, ROLE_MANIFEST};
 use crate::root::RootRecord;
 use raptorq::ObjectTransmissionInformation;
 use raptorq_core::{Decoder, ObjectMeta, SourceBlockMeta, Symbol};
@@ -54,6 +56,10 @@ pub enum IngestEvent {
     MetaRejected,
     /// A symbol entered a live decoder.
     SymbolAccepted,
+    /// The symbol addressed a live decoder but its `(sbn, esi)` was already
+    /// seen (or its source block was already complete). It contributed no new
+    /// decoding rank and must not advance throughput/progress counters.
+    SymbolDuplicate,
     /// The manifest object decoded and passed every verification.
     ManifestReady,
     /// A chunk decoded, verified (encoded_hash + chunk chain) and its RAW
@@ -90,6 +96,8 @@ pub enum FinalizeError {
     NotUtf8 { index: usize },
     #[error("finalize: recomputed content id != ROOT content id")]
     ContentId,
+    #[error("finalize: ROOT fields do not match the verified Manifest")]
+    ManifestGeometry,
 }
 
 /// Incremental form of the §13 ⑧⑨ finalization gate.
@@ -188,8 +196,8 @@ impl FinalStreamVerifier {
 
     pub fn finish(mut self) -> Result<(), FinalizeError> {
         self.advance_zero_sized_entries()?;
-        if self.position != self.root.total_raw_size ||
-            self.entry_index != self.manifest.entries.len()
+        if self.position != self.root.total_raw_size
+            || self.entry_index != self.manifest.entries.len()
         {
             return Err(FinalizeError::Length {
                 want: self.root.total_raw_size,
@@ -316,9 +324,8 @@ pub fn object_meta_from_oti(
         return Err(Af2ReceiverError::OtiGate(format!("source blocks {z}")));
     }
     // RFC 6330 §4.4.1.2: Kt = ceil(F/T); (KL, KS, ZL, ZS) = partition(Kt, Z).
-    let kt = u32::try_from(f.div_ceil(t)).map_err(|_| {
-        Af2ReceiverError::OtiGate(format!("Kt overflow for transfer length {f}"))
-    })?;
+    let kt = u32::try_from(f.div_ceil(t))
+        .map_err(|_| Af2ReceiverError::OtiGate(format!("Kt overflow for transfer length {f}")))?;
     let (kl, ks, zl, zs) = raptorq::partition(kt, z);
     let _ = zs;
     let mut blocks = Vec::with_capacity(z as usize);
@@ -343,8 +350,21 @@ pub fn object_meta_from_oti(
     Ok(meta)
 }
 
+/// The single live chunk decoder plus its routing identity. `expected_id` is
+/// the frame-carried object id already validated at META bind time — cached
+/// here so per-symbol routing is a 16-byte compare instead of a BLAKE3
+/// recomputation on the hottest receive path.
+struct ChunkDecoderSlot {
+    index: u32,
+    decoder: Decoder,
+    meta: ObjectMetaRecord,
+    expected_id: [u8; 16],
+}
+
 /// The AF2 receiver state machine. Owns at most one Manifest decoder and one
-/// active chunk decoder; all other symbols are dropped with zero caching.
+/// active chunk decoder; all other symbols are dropped with zero caching. The
+/// sender's robust recovery window is self-sufficient at the documented
+/// capture floor, so liveness does not require O(number-of-chunks) decoders.
 pub struct Af2Receiver {
     root: Option<RootRecord>,
     mismatch_streak: u32,
@@ -352,11 +372,17 @@ pub struct Af2Receiver {
     /// different foreign transfer resets the debounce (alternating streams
     /// must never evict the lock — "3 *consistent* foreign ROOTs").
     mismatch_transfer: Option<[u8; 16]>,
-    manifest_decoder: Option<Decoder>,
+    /// Debounce a conflicting ROOT that carries the *same* Transfer ID. Without
+    /// this independent candidate, one poisoned first ROOT permanently causes
+    /// every genuine repeat to be dropped as an inconsistency.
+    same_transfer_conflict: Option<(RootRecord, usize, u32)>,
+    /// Manifest decoder + the expected object id (validated at bind time; see
+    /// [`ChunkDecoderSlot::expected_id`]).
+    manifest_decoder: Option<(Decoder, [u8; 16])>,
     manifest_meta: Option<ObjectMetaRecord>,
     manifest: Option<Manifest>,
     manifest_done: bool,
-    chunk_decoder: Option<(u32, Decoder, ObjectMetaRecord)>,
+    chunk_decoder: Option<ChunkDecoderSlot>,
     chunk_done: std::collections::HashSet<u32>,
     t: usize,
     /// Frames carrying the v1 wire magic (`ET`) seen so far — an AF2 receiver
@@ -377,6 +403,7 @@ impl Af2Receiver {
             root: None,
             mismatch_streak: 0,
             mismatch_transfer: None,
+            same_transfer_conflict: None,
             manifest_decoder: None,
             manifest_meta: None,
             manifest: None,
@@ -477,6 +504,14 @@ impl Af2Receiver {
     /// transfer. Unfinished decoders are NOT restored (chunk-level resume
     /// only, per §1.2 non-goals); the sender's next epoch re-supplies symbols.
     ///
+    /// Late-resume merge: when the receiver is ALREADY locked to the same
+    /// Transfer (live frames beat the host's resume task — an ordering race
+    /// the host cannot resolve on its own), the ledger's completed indices
+    /// are merged into `chunk_done` instead of erroring. The host cannot
+    /// distinguish an "already locked" error from an invalid ROOT and would
+    /// otherwise discard valid breakpoint data. A different or semantically
+    /// inconsistent ROOT remains an error.
+    ///
     /// Returns the number of completed indices actually applied (out-of-range
     /// indices are ignored) so the caller's ledger cannot over-count.
     pub fn resume(
@@ -484,15 +519,37 @@ impl Af2Receiver {
         root_frame_bytes: &[u8],
         completed: &[u32],
     ) -> Result<usize, Af2ReceiverError> {
-        if self.root.is_some() {
-            return Err(Af2ReceiverError::Resume(
-                "receiver already locked; resume before ingesting".into(),
-            ));
-        }
         let frame = Af2Frame::from_bytes(root_frame_bytes)
             .map_err(|e| Af2ReceiverError::Resume(e.to_string()))?;
         if frame.frame_type != FrameType::Root {
-            return Err(Af2ReceiverError::Resume("stored frame is not a ROOT".into()));
+            return Err(Af2ReceiverError::Resume(
+                "stored frame is not a ROOT".into(),
+            ));
+        }
+        if let Some(current) = &self.root {
+            let record = RootRecord::parse(&frame.body)
+                .map_err(|e| Af2ReceiverError::Resume(e.to_string()))?;
+            let transfer = record.transfer();
+            let same_transfer = transfer == current.transfer()
+                && frame.object_id == transfer
+                && current.content_id == record.content_id
+                && current.manifest_hash == record.manifest_hash
+                && current.total_raw_size == record.total_raw_size
+                && current.entry_count == record.entry_count
+                && current.chunk_count == record.chunk_count
+                && current.chunk_raw_size == record.chunk_raw_size;
+            if !same_transfer {
+                return Err(Af2ReceiverError::Resume(
+                    "receiver already locked; resume before ingesting".into(),
+                ));
+            }
+            let mut applied = 0usize;
+            for &index in completed {
+                if index < current.chunk_count && self.chunk_done.insert(index) {
+                    applied += 1;
+                }
+            }
+            return Ok(applied);
         }
         let ev = self.on_root(frame)?;
         if !matches!(ev, IngestEvent::RootLocked) {
@@ -541,9 +598,45 @@ impl Af2Receiver {
                         && current.chunk_count == record.chunk_count
                         && current.chunk_raw_size == record.chunk_raw_size;
                     if !consistent {
-                        // Conflicting frame for the SAME transfer id: drop.
-                        return Ok(IngestEvent::Dropped);
+                        let candidate_matches = self
+                            .same_transfer_conflict
+                            .as_ref()
+                            .is_some_and(|(candidate, candidate_t, _)| {
+                                candidate == &record && *candidate_t == frame.t
+                            });
+                        if candidate_matches {
+                            if let Some((_, _, streak)) = &mut self.same_transfer_conflict {
+                                *streak = streak.saturating_add(1);
+                            }
+                        } else {
+                            self.same_transfer_conflict = Some((record.clone(), frame.t, 1));
+                        }
+                        let streak = self
+                            .same_transfer_conflict
+                            .as_ref()
+                            .map(|(_, _, streak)| *streak)
+                            .unwrap_or(0);
+                        if streak >= MISMATCH_RELOCK_THRESHOLD {
+                            // Treat three byte-consistent repeats as a corrected
+                            // lock even though the Transfer ID is unchanged.
+                            // Clear every ledger: the old ROOT geometry may have
+                            // changed chunk boundaries or the final chunk length.
+                            self.root = Some(record);
+                            self.t = frame.t;
+                            self.manifest_decoder = None;
+                            self.manifest_meta = None;
+                            self.manifest = None;
+                            self.manifest_done = false;
+                            self.chunk_decoder = None;
+                            self.chunk_done.clear();
+                            self.same_transfer_conflict = None;
+                            self.mismatch_streak = 0;
+                            self.mismatch_transfer = None;
+                            return Ok(IngestEvent::Relocked);
+                        }
+                        return Ok(IngestEvent::RootMismatch { streak });
                     }
+                    self.same_transfer_conflict = None;
                     if current.manifest_object_id != record.manifest_object_id {
                         // New Broadcast Instance of the SAME transfer (sender
                         // restarted with a new T / new encoding). Keep the
@@ -558,6 +651,7 @@ impl Af2Receiver {
                         self.manifest_meta = None;
                         self.chunk_decoder = None;
                         self.mismatch_streak = 0;
+                        self.same_transfer_conflict = None;
                         return Ok(IngestEvent::InstanceSwitched);
                     }
                     Ok(IngestEvent::Dropped) // duplicate ROOT
@@ -582,6 +676,7 @@ impl Af2Receiver {
                         self.chunk_done.clear();
                         self.mismatch_streak = 0;
                         self.mismatch_transfer = None;
+                        self.same_transfer_conflict = None;
                         self.t = 0;
                         // Re-ingest this ROOT on the next frame (state now Idle).
                         Ok(IngestEvent::Relocked)
@@ -623,6 +718,11 @@ impl Af2Receiver {
                 if self.manifest_done {
                     return Ok(IngestEvent::Dropped);
                 }
+                // ROOT binds the exact Manifest Broadcast Instance (OTI and
+                // encoded bytes), not merely the Manifest's raw hash.
+                if frame.object_id != root.manifest_object_id {
+                    return Ok(IngestEvent::MetaRejected);
+                }
                 if let Some(prev) = &self.manifest_meta {
                     // First valid META froze the layout; later ones must match byte-for-byte.
                     if prev.encode().ok().as_ref() != record.encode().ok().as_ref() {
@@ -646,7 +746,7 @@ impl Af2Receiver {
                 }
                 let decoder =
                     Decoder::new(meta).map_err(|e| Af2ReceiverError::Decoder(e.to_string()))?;
-                self.manifest_decoder = Some(decoder);
+                self.manifest_decoder = Some((decoder, frame.object_id));
                 self.manifest_meta = Some(record);
                 Ok(IngestEvent::MetaBound {
                     role: ROLE_MANIFEST,
@@ -659,15 +759,26 @@ impl Af2Receiver {
                 {
                     return Ok(IngestEvent::Dropped);
                 }
-                match &self.chunk_decoder {
-                    Some((index, _, prev)) if *index == record.object_index => {
-                        // Duplicate META for the live chunk: must be identical.
-                        if prev.encode().ok().as_ref() != record.encode().ok().as_ref() {
-                            return Ok(IngestEvent::Dropped);
-                        }
-                        return Ok(IngestEvent::Dropped);
+                // Once the verified Manifest is available, reject a contradicting
+                // chunk descriptor before it can allocate or replace a decoder.
+                if let Some(manifest) = &self.manifest {
+                    if manifest.chunk_hashes.get(record.object_index as usize)
+                        != Some(&record.raw_hash)
+                    {
+                        return Ok(IngestEvent::MetaRejected);
                     }
-                    _ => {}
+                }
+                let record_bytes = record.encode().ok();
+                let active_identical = self.chunk_decoder.as_ref().is_some_and(|slot| {
+                    slot.index == record.object_index && slot.meta.encode().ok() == record_bytes
+                });
+                // Byte-identical repeats preserve the equations already
+                // collected. A DIFFERENT, self-consistent META for the same
+                // index is a legal same-T re-encoding of this Transfer and
+                // must replace the stale decoder; otherwise its new object_id
+                // can never route and a one/two-chunk session wedges forever.
+                if active_identical {
+                    return Ok(IngestEvent::Dropped);
                 }
                 // ③ OTI gate (encoded chunk ≤ 32 MiB wire ceiling).
                 let meta = object_meta_from_oti(&record.oti, 32 << 20)?;
@@ -681,11 +792,12 @@ impl Af2Receiver {
                     role: ROLE_CHUNK,
                     object_index: record.object_index,
                 };
-                self.chunk_decoder = Some((
-                    record.object_index,
+                self.chunk_decoder = Some(ChunkDecoderSlot {
+                    index: record.object_index,
                     decoder,
-                    record,
-                ));
+                    meta: record,
+                    expected_id: frame.object_id,
+                });
                 Ok(event)
             }
             _ => Ok(IngestEvent::Dropped),
@@ -697,112 +809,87 @@ impl Af2Receiver {
             return Ok(IngestEvent::Dropped);
         }
         // Unknown-object symbols: drop, zero cache (§11 resource policy).
-        // Take the live slots out so `self` is free for the finish* paths.
+        // The live slots are taken out so `self` is free for the finish* paths;
+        // a slot is restored unless its object finished (Ready/Rejected — the
+        // finished decoder is dropped) or errored ( unusable, rebuilt by the
+        // next META).
         let mut chunk_slot = self.chunk_decoder.take();
-        if let Some((index, decoder, meta)) = &mut chunk_slot {
-            let expected = crate::id::object_id(
-                &meta.transfer_id,
-                ROLE_CHUNK,
-                *index,
-                meta.codec_id,
-                meta.fec_id,
-                &meta.oti,
-                &meta.encoded_hash,
-            );
-            if frame.object_id == expected {
-                let idx = *index;
-                let ev = self.feed_symbol(decoder, meta.clone(), frame, false, idx)?;
-                let finished = matches!(
-                    ev,
-                    IngestEvent::ChunkReady { .. } | IngestEvent::ChunkRejected
-                );
-                if !finished {
+        if let Some(slot) = chunk_slot.as_mut() {
+            if frame.object_id == slot.expected_id {
+                let symbol = Symbol::new(frame.sbn as u32, frame.esi, frame.body);
+                let (complete, novel) = match slot.decoder.add_symbol_with_novelty(&symbol) {
+                    Ok(status) => status,
+                    Err(e) => {
+                        // Slot stays dropped (symbol-budget exhaustion etc.);
+                        // the next META for this index rebuilds it from zero.
+                        return Err(Af2ReceiverError::Decoder(e.to_string()));
+                    }
+                };
+                if !novel {
                     self.chunk_decoder = chunk_slot;
+                    return Ok(IngestEvent::SymbolDuplicate);
                 }
-                return Ok(ev);
+                if !complete {
+                    self.chunk_decoder = chunk_slot;
+                    return Ok(IngestEvent::SymbolAccepted);
+                }
+                let Some(encoded) = slot.decoder.assemble() else {
+                    self.chunk_decoder = chunk_slot;
+                    return Ok(IngestEvent::SymbolAccepted);
+                };
+                // Completion clones nothing: `slot` is a local, disjoint from
+                // the &mut self borrow inside finish_chunk.
+                return self.finish_chunk(slot.index, encoded, &slot.meta);
             }
         }
         self.chunk_decoder = chunk_slot;
 
         let mut manifest_decoder = self.manifest_decoder.take();
-        if let (Some(decoder), Some(expected)) = (&mut manifest_decoder, self.manifest_object_id()) {
-            if frame.object_id == expected {
-                let meta = match &self.manifest_meta {
-                    Some(m) => m.clone(),
-                    None => {
-                        self.manifest_decoder = manifest_decoder;
-                        return Ok(IngestEvent::Dropped);
+        if let Some((decoder, expected_id)) = manifest_decoder.as_mut() {
+            if frame.object_id == *expected_id {
+                if self.manifest_meta.is_none() {
+                    self.manifest_decoder = manifest_decoder;
+                    return Ok(IngestEvent::Dropped);
+                }
+                let symbol = Symbol::new(frame.sbn as u32, frame.esi, frame.body);
+                let (complete, novel) = match decoder.add_symbol_with_novelty(&symbol) {
+                    Ok(status) => status,
+                    Err(e) => {
+                        // Unfreeze the bound META: the decoder was consumed,
+                        // so keeping the freeze would drop all future META
+                        // frames as duplicates with no decoder to feed
+                        // (session deadlock).
+                        self.manifest_meta = None;
+                        return Err(Af2ReceiverError::Decoder(e.to_string()));
                     }
                 };
-                let ev = self.feed_symbol(decoder, meta, frame, true, 0)?;
-                let finished = matches!(
-                    ev,
-                    IngestEvent::ManifestReady | IngestEvent::ChunkRejected
-                );
-                if !finished {
+                if !novel {
                     self.manifest_decoder = manifest_decoder;
+                    return Ok(IngestEvent::SymbolDuplicate);
                 }
-                return Ok(ev);
+                if !complete {
+                    self.manifest_decoder = manifest_decoder;
+                    return Ok(IngestEvent::SymbolAccepted);
+                }
+                let Some(encoded) = decoder.assemble() else {
+                    self.manifest_decoder = manifest_decoder;
+                    return Ok(IngestEvent::SymbolAccepted);
+                };
+                // The frozen META is cloned exactly once per completed
+                // object (finish_manifest needs &mut self, so a borrow of
+                // self.manifest_meta cannot cross the call).
+                let meta = self.manifest_meta.clone().expect("checked above");
+                return self.finish_manifest(encoded, &meta);
             }
         }
         self.manifest_decoder = manifest_decoder;
         Ok(IngestEvent::Dropped)
     }
 
-    fn feed_symbol(
-        &mut self,
-        decoder: &mut Decoder,
-        meta: ObjectMetaRecord,
-        frame: Af2Frame,
-        is_manifest: bool,
-        chunk_index: u32,
-    ) -> Result<IngestEvent, Af2ReceiverError> {
-        let symbol = Symbol::new(frame.sbn as u32, frame.esi, frame.body);
-        let complete = match decoder.add_symbol(&symbol) {
-            Ok(c) => c,
-            Err(e) => {
-                // The caller already took this decoder slot away. If it is
-                // the manifest, also unfreeze the bound META — otherwise the
-                // frozen `manifest_meta` would drop every later META as a
-                // duplicate while no decoder exists (session deadlock).
-                if is_manifest {
-                    self.manifest_meta = None;
-                }
-                return Err(Af2ReceiverError::Decoder(e.to_string()));
-            }
-        };
-        if !complete {
-            return Ok(IngestEvent::SymbolAccepted);
-        }
-        let encoded = match decoder.assemble() {
-            Some(v) => v,
-            None => return Ok(IngestEvent::SymbolAccepted),
-        };
-        if is_manifest {
-            self.finish_manifest(encoded, meta)
-        } else {
-            self.finish_chunk(chunk_index, encoded, meta)
-        }
-    }
-
-    fn manifest_object_id(&self) -> Option<[u8; 16]> {
-        let root = self.root.as_ref()?;
-        let meta = self.manifest_meta.as_ref()?;
-        Some(crate::id::object_id(
-            &root.transfer(),
-            ROLE_MANIFEST,
-            0,
-            meta.codec_id,
-            meta.fec_id,
-            &meta.oti,
-            &meta.encoded_hash,
-        ))
-    }
-
     fn finish_manifest(
         &mut self,
         encoded: Vec<u8>,
-        meta: ObjectMetaRecord,
+        meta: &ObjectMetaRecord,
     ) -> Result<IngestEvent, Af2ReceiverError> {
         let root = match &self.root {
             Some(r) => r.clone(),
@@ -828,6 +915,10 @@ impl Af2Receiver {
                 // the ROOT's (manifest_hash already bound the bytes to ROOT;
                 // this binds the announced identity as well).
                 if manifest_cid != root.content_id {
+                    self.manifest_meta = None;
+                    return Ok(IngestEvent::ChunkRejected);
+                }
+                if !manifest_matches_root(&root, &m) {
                     self.manifest_meta = None;
                     return Ok(IngestEvent::ChunkRejected);
                 }
@@ -868,15 +959,17 @@ impl Af2Receiver {
         &mut self,
         index: u32,
         encoded: Vec<u8>,
-        meta: ObjectMetaRecord,
+        meta: &ObjectMetaRecord,
     ) -> Result<IngestEvent, Af2ReceiverError> {
         let root = match &self.root {
             Some(r) => r.clone(),
             None => return Ok(IngestEvent::Dropped),
         };
         // ④ Byte-time binding: encoded_hash from META.
+        // The fed slot is dropped by the caller when this returns
+        // ChunkReady/ChunkRejected; finish_chunk itself does not mutate the
+        // outer receiver slot while it is temporarily borrowed.
         if hash(&encoded) != meta.encoded_hash {
-            self.chunk_decoder = None;
             return Ok(IngestEvent::ChunkRejected);
         }
         // ⑤ Bounded decompression to the canonical chunk length.
@@ -888,18 +981,15 @@ impl Af2Receiver {
             .total_raw_size
             .saturating_sub(chunk_start)
             .min(u64::from(root.chunk_raw_size)) as usize;
-        let raw = match decode_chunk(meta.codec_id, &encoded, canonical_len, root.chunk_raw_size)
-        {
+        let raw = match decode_chunk(meta.codec_id, &encoded, canonical_len, root.chunk_raw_size) {
             Ok(v) => v,
             Err(_) => {
-                self.chunk_decoder = None;
                 return Ok(IngestEvent::ChunkRejected);
             }
         };
         // ⑥ Chunk hash (against META.raw_hash; when the Manifest arrives after
         // this chunk the host re-verifies via `verify_chunk`).
         if hash(&raw) != meta.raw_hash {
-            self.chunk_decoder = None;
             return Ok(IngestEvent::ChunkRejected);
         }
         // ⑥b Chunk hash against the ROOT-bound Manifest table (when it is
@@ -909,12 +999,10 @@ impl Af2Receiver {
         // the Manifest it announced.
         if let Some(m) = &self.manifest {
             if m.chunk_hashes.get(index as usize) != Some(&hash(&raw)) {
-                self.chunk_decoder = None;
                 return Ok(IngestEvent::ChunkRejected);
             }
         }
         self.chunk_done.insert(index);
-        self.chunk_decoder = None;
         Ok(IngestEvent::ChunkReady { index, raw })
     }
 }
@@ -943,15 +1031,17 @@ pub fn verify_stream(
             want: root.total_raw_size,
             got: stream.len() as u64,
         })?;
-        let end = start.checked_add(usize::try_from(e.content_size).map_err(|_| {
-            FinalizeError::Length {
+        let end = start
+            .checked_add(
+                usize::try_from(e.content_size).map_err(|_| FinalizeError::Length {
+                    want: root.total_raw_size,
+                    got: stream.len() as u64,
+                })?,
+            )
+            .ok_or(FinalizeError::Length {
                 want: root.total_raw_size,
                 got: stream.len() as u64,
-            }
-        })?).ok_or(FinalizeError::Length {
-            want: root.total_raw_size,
-            got: stream.len() as u64,
-        })?;
+            })?;
         if end > stream.len() || hash(&stream[start..end]) != e.content_hash {
             return Err(FinalizeError::EntryHash { index });
         }
@@ -962,10 +1052,10 @@ pub fn verify_stream(
     verify_manifest_identity(root, manifest)
 }
 
-fn verify_manifest_identity(
-    root: &RootRecord,
-    manifest: &Manifest,
-) -> Result<(), FinalizeError> {
+fn verify_manifest_identity(root: &RootRecord, manifest: &Manifest) -> Result<(), FinalizeError> {
+    if !manifest_matches_root(root, manifest) {
+        return Err(FinalizeError::ManifestGeometry);
+    }
     let recomputed = content_id(
         &manifest
             .entries
@@ -973,7 +1063,11 @@ fn verify_manifest_identity(
             .map(|e| EntryIdInput {
                 kind: e.kind,
                 path: &e.path,
-                size: if e.kind == KIND_DIRECTORY { 0 } else { e.content_size },
+                size: if e.kind == KIND_DIRECTORY {
+                    0
+                } else {
+                    e.content_size
+                },
                 entry_hash: e.content_hash,
             })
             .collect::<Vec<_>>(),
@@ -982,6 +1076,13 @@ fn verify_manifest_identity(
         return Err(FinalizeError::ContentId);
     }
     Ok(())
+}
+
+fn manifest_matches_root(root: &RootRecord, manifest: &Manifest) -> bool {
+    manifest.total_raw_size == root.total_raw_size
+        && manifest.entries.len() == root.entry_count as usize
+        && manifest.chunk_count == root.chunk_count
+        && manifest.chunk_raw_size == root.chunk_raw_size
 }
 
 #[cfg(test)]
@@ -1016,7 +1117,8 @@ mod tests {
         let oti = enc.get_config().serialize();
         let meta = object_meta_from_oti(&oti, 32 << 20).expect("valid oti");
         let mut symbols = Vec::new();
-        for pkt in enc.get_encoded_packets(8) { // 8 repair packets to survive drops
+        for pkt in enc.get_encoded_packets(8) {
+            // 8 repair packets to survive drops
             symbols.push((
                 pkt.payload_id().source_block_number(),
                 pkt.payload_id().encoding_symbol_id(),
@@ -1027,11 +1129,8 @@ mod tests {
     }
 
     fn build_broadcast(data: &[u8], chunk_raw_size: u32, t: usize) -> Broadcast {
-        let manifest = build_manifest(
-            [(crate::id::KIND_FILE, "hello.bin", data)],
-            chunk_raw_size,
-        )
-        .unwrap();
+        let manifest =
+            build_manifest([(crate::id::KIND_FILE, "hello.bin", data)], chunk_raw_size).unwrap();
         let manifest_bytes = manifest.encode().unwrap();
         let manifest_hash = hash(&manifest_bytes);
 
@@ -1207,7 +1306,10 @@ mod tests {
 
         assert_eq!(
             rx.ingest(&bc.manifest_meta_frame).unwrap(),
-            IngestEvent::MetaBound { role: ROLE_MANIFEST, object_index: 0 }
+            IngestEvent::MetaBound {
+                role: ROLE_MANIFEST,
+                object_index: 0
+            }
         );
 
         // Feed manifest symbols in reverse order, duplicating some, dropping 1 in 5.
@@ -1229,7 +1331,10 @@ mod tests {
         // Chunk.
         assert_eq!(
             rx.ingest(&bc.chunk_meta_frames[0]).unwrap(),
-            IngestEvent::MetaBound { role: ROLE_CHUNK, object_index: 0 }
+            IngestEvent::MetaBound {
+                role: ROLE_CHUNK,
+                object_index: 0
+            }
         );
         let mut chunk_ready = None;
         for f in &bc.chunk_symbol_frames {
@@ -1284,7 +1389,61 @@ mod tests {
         );
         assert_eq!(rx.ingest(&other.root_frame).unwrap(), IngestEvent::Relocked);
         // After the re-lock the new transfer's ROOT binds again.
-        assert_eq!(rx.ingest(&other.root_frame).unwrap(), IngestEvent::RootLocked);
+        assert_eq!(
+            rx.ingest(&other.root_frame).unwrap(),
+            IngestEvent::RootLocked
+        );
+    }
+
+    #[test]
+    fn repeated_genuine_root_recovers_from_same_transfer_poison() {
+        let data = vec![1u8; 1000];
+        let bc = build_broadcast(&data, 1 << 20, 1024);
+        let frame = Af2Frame::from_bytes(&bc.root_frame).unwrap();
+        let mut poisoned = RootRecord::parse(&frame.body).unwrap();
+        // Transfer ID does not include total_raw_size directly, so this models
+        // a validly encoded first ROOT with the right ID but poisoned geometry.
+        poisoned.total_raw_size = 999;
+        let poisoned_frame = Af2Frame {
+            body: poisoned.encode().unwrap(),
+            ..frame
+        }
+        .to_bytes()
+        .unwrap();
+
+        let mut rx = Af2Receiver::new();
+        assert_eq!(rx.ingest(&poisoned_frame).unwrap(), IngestEvent::RootLocked);
+        assert_eq!(
+            rx.ingest(&bc.manifest_meta_frame).unwrap(),
+            IngestEvent::MetaBound { role: ROLE_MANIFEST, object_index: 0 }
+        );
+        let mut geometry_rejected = false;
+        for symbol in &bc.manifest_symbol_frames {
+            if rx.ingest(symbol).unwrap() == IngestEvent::ChunkRejected {
+                geometry_rejected = true;
+                break;
+            }
+        }
+        assert!(geometry_rejected, "ROOT/Manifest geometry mismatch must fail");
+
+        assert_eq!(rx.ingest(&bc.root_frame).unwrap(), IngestEvent::RootMismatch { streak: 1 });
+        assert_eq!(rx.ingest(&bc.root_frame).unwrap(), IngestEvent::RootMismatch { streak: 2 });
+        assert_eq!(rx.ingest(&bc.root_frame).unwrap(), IngestEvent::Relocked);
+        assert_eq!(rx.root().unwrap().total_raw_size, data.len() as u64);
+    }
+
+    #[test]
+    fn manifest_meta_must_match_root_object_id() {
+        let bc = build_broadcast(&vec![3u8; 1000], 1 << 20, 1024);
+        let frame = Af2Frame::from_bytes(&bc.root_frame).unwrap();
+        let mut root = RootRecord::parse(&frame.body).unwrap();
+        root.manifest_object_id = [0xA5; 16];
+        let root_frame = Af2Frame { body: root.encode().unwrap(), ..frame }
+            .to_bytes()
+            .unwrap();
+        let mut rx = Af2Receiver::new();
+        assert_eq!(rx.ingest(&root_frame).unwrap(), IngestEvent::RootLocked);
+        assert_eq!(rx.ingest(&bc.manifest_meta_frame).unwrap(), IngestEvent::MetaRejected);
     }
 
     #[test]
@@ -1355,16 +1514,25 @@ mod tests {
         let _ = rx.ingest(&bc.root_frame).unwrap();
         assert_eq!(
             rx.ingest(&bc.manifest_meta_frame).unwrap(),
-            IngestEvent::MetaBound { role: ROLE_MANIFEST, object_index: 0 }
+            IngestEvent::MetaBound {
+                role: ROLE_MANIFEST,
+                object_index: 0
+            }
         );
         for f in &bad_frames {
             let _ = rx.ingest(f).unwrap();
         }
-        assert!(rx.manifest().is_none(), "corrupted manifest must not verify");
+        assert!(
+            rx.manifest().is_none(),
+            "corrupted manifest must not verify"
+        );
         // Before the unfreeze fix this META was dropped forever (deadlock).
         assert_eq!(
             rx.ingest(&bc.manifest_meta_frame).unwrap(),
-            IngestEvent::MetaBound { role: ROLE_MANIFEST, object_index: 0 }
+            IngestEvent::MetaBound {
+                role: ROLE_MANIFEST,
+                object_index: 0
+            }
         );
         let mut ready = false;
         for f in &bc.manifest_symbol_frames {
@@ -1430,7 +1598,10 @@ mod tests {
             "same manifest + chunk size ⇒ same transfer id"
         );
         let mut rx = Af2Receiver::new();
-        assert_eq!(rx.ingest(&bc_t1024.root_frame).unwrap(), IngestEvent::RootLocked);
+        assert_eq!(
+            rx.ingest(&bc_t1024.root_frame).unwrap(),
+            IngestEvent::RootLocked
+        );
         assert_eq!(rx.symbol_size(), 1024);
         // Old-instance META binds first and freezes.
         assert!(matches!(
@@ -1462,6 +1633,80 @@ mod tests {
     }
 
     #[test]
+    fn same_t_chunk_reencoding_replaces_stale_decoder() {
+        // Changing only the chunk codec/encoded bytes leaves the Manifest and
+        // its object id unchanged. The chunk's new META must therefore replace
+        // a stale same-index decoder without waiting for a ROOT instance switch.
+        let data = vec![0x41u8; 64 << 10];
+        let t = 1024;
+        let bc = build_broadcast(&data, 1 << 20, t);
+        let new_meta_frame = &bc.chunk_meta_frames[0];
+        let new_meta_parsed = Af2Frame::from_bytes(new_meta_frame).unwrap();
+        let new_record = ObjectMetaRecord::parse(&new_meta_parsed.body).unwrap();
+        assert_ne!(new_record.codec_id, CODEC_RAW, "fixture must compress");
+
+        // Old instance of chunk 0: same Transfer/T/raw bytes, but RAW encoding.
+        let (old_meta_obj, _old_symbols) = raptorq_encode_object(&data, t);
+        let old_encoded_hash = hash(&data);
+        let old_oid = crate::id::object_id(
+            &bc.tid,
+            ROLE_CHUNK,
+            0,
+            CODEC_RAW,
+            FEC_ID_RAPTORQ,
+            &old_meta_obj.oti_bytes,
+            &old_encoded_hash,
+        );
+        let old_record = ObjectMetaRecord {
+            role: ROLE_CHUNK,
+            transfer_id: bc.tid,
+            object_index: 0,
+            codec_id: CODEC_RAW,
+            fec_id: FEC_ID_RAPTORQ,
+            oti: old_meta_obj.oti_bytes,
+            raw_hash: hash(&data),
+            encoded_hash: old_encoded_hash,
+            extensions: vec![],
+        };
+        let old_meta_frame = Af2Frame {
+            frame_type: FrameType::ObjectMeta,
+            object_id: old_oid,
+            sbn: 0,
+            esi: 0,
+            body: old_record.encode().unwrap(),
+            t,
+        }
+        .to_bytes()
+        .unwrap();
+
+        let mut rx = Af2Receiver::new();
+        assert_eq!(rx.ingest(&bc.root_frame).unwrap(), IngestEvent::RootLocked);
+        assert!(matches!(
+            rx.ingest(&old_meta_frame).unwrap(),
+            IngestEvent::MetaBound {
+                role: ROLE_CHUNK,
+                object_index: 0
+            }
+        ));
+        assert!(matches!(
+            rx.ingest(new_meta_frame).unwrap(),
+            IngestEvent::MetaBound {
+                role: ROLE_CHUNK,
+                object_index: 0
+            }
+        ));
+
+        let mut recovered = None;
+        for frame in &bc.chunk_symbol_frames {
+            if let IngestEvent::ChunkReady { raw, .. } = rx.ingest(frame).unwrap() {
+                recovered = Some(raw);
+                break;
+            }
+        }
+        assert_eq!(recovered.as_deref(), Some(data.as_slice()));
+    }
+
+    #[test]
     fn foreign_root_with_different_t_can_relock() {
         // A receiver locked at T=1024 must still be able to re-lock onto a
         // foreign transfer broadcasting at another T (e.g. the adjacent
@@ -1479,7 +1724,10 @@ mod tests {
             IngestEvent::RootMismatch { .. }
         ));
         assert_eq!(rx.ingest(&other.root_frame).unwrap(), IngestEvent::Relocked);
-        assert_eq!(rx.ingest(&other.root_frame).unwrap(), IngestEvent::RootLocked);
+        assert_eq!(
+            rx.ingest(&other.root_frame).unwrap(),
+            IngestEvent::RootLocked
+        );
         assert_eq!(rx.symbol_size(), 2048, "T re-binds at the new lock");
     }
 
@@ -1504,7 +1752,11 @@ mod tests {
         let data: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
         let bc = build_broadcast(&data, 1 << 20, 1024);
         let mut rx = Af2Receiver::new();
-        assert_eq!(rx.resume(&bc.root_frame, &[0, 7]).expect("resume"), 1, "out-of-range index ignored");
+        assert_eq!(
+            rx.resume(&bc.root_frame, &[0, 7]).expect("resume"),
+            1,
+            "out-of-range index ignored"
+        );
         assert_eq!(rx.symbol_size(), 1024, "T bound from the stored ROOT");
         // The ledger's completed chunk is ignored cheaply on replay.
         assert_eq!(
@@ -1523,8 +1775,10 @@ mod tests {
             }
         }
         assert!(ready);
-        // Resuming into a live session is refused.
-        assert!(rx.resume(&bc.root_frame, &[0]).is_err());
+        // Late resume into a live session: the SAME transfer's ledger merges
+        // (index 0 was already applied above → zero novel bits); a foreign
+        // transfer stays refused (covered by late_resume_merges… below).
+        assert_eq!(rx.resume(&bc.root_frame, &[0]).unwrap(), 0);
         // Resuming with a non-ROOT stored frame is refused.
         let mut rx2 = Af2Receiver::new();
         assert!(rx2.resume(&bc.manifest_meta_frame, &[]).is_err());
@@ -1537,7 +1791,9 @@ mod tests {
         // wrong. On recovery the host re-verifies every resumed bit against
         // the manifest; a mismatch must fail verify_chunk, be invalidated,
         // and be re-supplied by a later epoch — never left as "done".
-        let data: Vec<u8> = (0..((1 << 20) + 4000u32)).map(|i| (i % 251) as u8).collect();
+        let data: Vec<u8> = (0..((1 << 20) + 4000u32))
+            .map(|i| (i % 251) as u8)
+            .collect();
         let bc = build_broadcast(&data, 1 << 20, 1024);
 
         // Phase 1 ("before the crash"): chunk 0 completes cleanly.
@@ -1614,7 +1870,8 @@ mod tests {
             rx.ingest(f).unwrap();
         }
         // verify_final_stream needs root+manifest only; pass the exact stream.
-        rx.verify_final_stream(&data).expect("clean stream must verify");
+        rx.verify_final_stream(&data)
+            .expect("clean stream must verify");
         let mut tampered = data.clone();
         tampered[0] ^= 0xFF;
         assert_eq!(
@@ -1762,7 +2019,10 @@ mod tests {
         assert_eq!(rx.ingest(&bc.root_frame).unwrap(), IngestEvent::RootLocked);
         assert_eq!(
             rx.ingest(&bc.manifest_meta_frame).unwrap(),
-            IngestEvent::MetaBound { role: ROLE_MANIFEST, object_index: 0 }
+            IngestEvent::MetaBound {
+                role: ROLE_MANIFEST,
+                object_index: 0
+            }
         );
         for f in &bc.manifest_symbol_frames {
             let _ = rx.ingest(f).unwrap();
@@ -1772,17 +2032,17 @@ mod tests {
         // differ from what the manifest's chunk-hash table declares.
         let evil = vec![2u8; 4000];
         let (meta_f, sym_f, evil_raw) = build_chunk_object(bc.tid, 0, &evil, 1024);
-        assert_eq!(
-            rx.ingest(&meta_f).unwrap(),
-            IngestEvent::MetaBound { role: ROLE_CHUNK, object_index: 0 }
-        );
-        let mut rejected = false;
+        assert_eq!(rx.ingest(&meta_f).unwrap(), IngestEvent::MetaRejected);
+        let mut accepted = false;
         for f in &sym_f {
-            if rx.ingest(f).unwrap() == IngestEvent::ChunkRejected {
-                rejected = true;
+            if rx.ingest(f).unwrap() == IngestEvent::SymbolAccepted {
+                accepted = true;
             }
         }
-        assert!(rejected, "chunk contradicting the manifest must be rejected");
+        assert!(
+            !accepted,
+            "chunk contradicting the manifest must be rejected before decoder allocation"
+        );
         assert!(!rx.verify_chunk(0, &evil_raw));
         assert!(rx.verify_chunk(0, &good_data));
     }
@@ -1799,7 +2059,10 @@ mod tests {
         let (meta_f, sym_f, evil_raw) = build_chunk_object(bc.tid, 0, &evil, 1024);
         assert_eq!(
             rx.ingest(&meta_f).unwrap(),
-            IngestEvent::MetaBound { role: ROLE_CHUNK, object_index: 0 }
+            IngestEvent::MetaBound {
+                role: ROLE_CHUNK,
+                object_index: 0
+            }
         );
         let mut staged = false;
         for f in &sym_f {
@@ -1815,7 +2078,10 @@ mod tests {
         // Manifest arrives: the host can now decide with the ROOT-bound table.
         assert_eq!(
             rx.ingest(&bc.manifest_meta_frame).unwrap(),
-            IngestEvent::MetaBound { role: ROLE_MANIFEST, object_index: 0 }
+            IngestEvent::MetaBound {
+                role: ROLE_MANIFEST,
+                object_index: 0
+            }
         );
         for f in &bc.manifest_symbol_frames {
             let _ = rx.ingest(f).unwrap();
@@ -1836,7 +2102,7 @@ mod tests {
         use crate::sender::{Af2Sender, SenderConfig};
 
         let chunk_raw_size: u32 = 1 << 20; // minimum legal chunk size
-        // "é" (0xC3 0xA9) must straddle the first 1 MiB chunk boundary.
+                                           // "é" (0xC3 0xA9) must straddle the first 1 MiB chunk boundary.
         let mut note = vec![b'x'; (chunk_raw_size - 1) as usize];
         note.extend_from_slice("é跨块边界 tail".as_bytes());
         note.extend_from_slice(b";");
@@ -1847,7 +2113,11 @@ mod tests {
             (crate::id::KIND_DIRECTORY, "a".to_string(), Vec::new()),
             (crate::id::KIND_FILE, "a/empty.dat".to_string(), Vec::new()),
             (crate::id::KIND_DIRECTORY, "a/sub".to_string(), Vec::new()),
-            (crate::id::KIND_UTF8_TEXT, "a/sub/note.txt".to_string(), note),
+            (
+                crate::id::KIND_UTF8_TEXT,
+                "a/sub/note.txt".to_string(),
+                note,
+            ),
             (crate::id::KIND_FILE, "b/data.bin".to_string(), bin),
         ];
         let config = SenderConfig {
@@ -1907,5 +2177,31 @@ mod tests {
             rejected || verifier.finish().is_err(),
             "corrupt bundle must fail"
         );
+    }
+
+    #[test]
+    fn late_resume_merges_same_transfer_ledger() {
+        // §12 ordering race: live frames lock the receiver BEFORE the host's
+        // resume task runs (both serialized on the ingest lock — order still
+        // decides). The host cannot distinguish the resulting "already
+        // locked" error from an invalid ROOT and would delete valid
+        // breakpoint data; the core must therefore MERGE a same-transfer
+        // ledger instead of erroring.
+        let data: Vec<u8> = (0..((1 << 20) + 4000u32))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let bc = build_broadcast(&data, 1 << 20, 1024);
+        let mut rx = Af2Receiver::new();
+        assert_eq!(rx.ingest(&bc.root_frame).unwrap(), IngestEvent::RootLocked);
+        assert_eq!(rx.resume(&bc.root_frame, &[0]).unwrap(), 1);
+        // The merged bit is honored: chunk 0's META is a cheap duplicate.
+        assert_eq!(
+            rx.ingest(&bc.chunk_meta_frames[0]).unwrap(),
+            IngestEvent::Dropped
+        );
+        // A ledger for a DIFFERENT transfer stays an error (no cross-transfer
+        // poisoning through the resume path).
+        let other = build_broadcast(&vec![9u8; 1000], 1 << 20, 1024);
+        assert!(rx.resume(&other.root_frame, &[]).is_err());
     }
 }

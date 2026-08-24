@@ -12,7 +12,12 @@
 namespace AirFerryZxing {
 namespace {
 
-constexpr size_t kMaxTrackedCodes = 64;
+template <typename Bytes>
+bool IsAf2Payload(const Bytes& bytes)
+{
+    return bytes.size() >= 30 && bytes[0] == 'A' && bytes[1] == 'F' &&
+        bytes[2] == 2 && bytes[3] >= 1 && bytes[3] <= 3;
+}
 
 ZXing::ReaderOptions ReaderOptions(bool try_invert = true)
 {
@@ -52,7 +57,7 @@ std::optional<DecodeResult> ToResult(
         return std::nullopt;
     }
     const auto& bytes = barcode.bytes();
-    if (bytes.empty()) {
+    if (!IsAf2Payload(bytes)) {
         return std::nullopt;
     }
     return DecodeResult{
@@ -126,9 +131,12 @@ std::optional<DecodeResult> DecodeOneRegion(
     }
     const ZXing::ImageView full(pixels, width, height, ZXing::ImageFormat::Lum, row_stride);
     const ZXing::ImageView region = full.cropped(x, y, side, side);
-    // Keep the v1.1.3 behavior across Android and Windows: region scans retain
-    // TryInvert as well as TryHarder.
-    return ToResult(ZXing::ReadBarcode(region, ReaderOptions()), x, y);
+    // Region windows are re-decodes of an already-locked code at its
+    // last-known position: polarity is known (screen-projected QR is always
+    // black-on-white, and a code first found non-inverted stays that way), so
+    // the inverted retry only doubles the miss cost. Full-frame scans keep
+    // TryInvert as the safety net for a first lock.
+    return ToResult(ZXing::ReadBarcode(region, ReaderOptions(false)), x, y);
 }
 
 std::vector<DecodeResult> DecodeMultiFull(
@@ -146,7 +154,7 @@ std::vector<DecodeResult> DecodeMultiFull(
     for (const auto& barcode : ZXing::ReadBarcodes(view, ReaderOptions())) {
         if (auto result = ToResult(barcode)) {
             decoded.push_back(std::move(*result));
-            if (decoded.size() == kMaxTrackedCodes) {
+            if (decoded.size() == MaxTrackedCodes) {
                 break;
             }
         }
@@ -166,15 +174,17 @@ std::vector<DecodeResult> DecodeMultiRegions(
 {
     std::vector<DecodeResult> decoded;
     if (!ValidLuminanceGeometry(pixels, pixel_len, width, height, row_stride) ||
-        hints == nullptr || hint_count == 0 || hint_count > kMaxTrackedCodes ||
+        hints == nullptr || hint_count == 0 || hint_count > MaxTrackedCodes ||
         !std::isfinite(margin_fraction)) {
         return decoded;
     }
 
     margin_fraction = std::clamp(margin_fraction, 0.0F, 2.0F);
     const ZXing::ImageView full(pixels, width, height, ZXing::ImageFormat::Lum, row_stride);
-    // Match Android's v1.1.3 JNI options for every tracked region.
-    const ZXing::ReaderOptions options = ReaderOptions();
+    // Tracked regions re-decode known codes at known positions — skip the
+    // inverted retry (see DecodeOneRegion); the periodic full-frame re-lock
+    // keeps TryInvert for anything exotic.
+    const ZXing::ReaderOptions options = ReaderOptions(false);
     decoded.reserve(hint_count);
 
     for (size_t i = 0; i < hint_count; ++i) {

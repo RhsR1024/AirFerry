@@ -162,6 +162,16 @@ test("ChunkStore treats a short OPFS write as non-durable", async () => {
   assert.deepEqual(Array.from(store.readRange(0, 4, 4, 4)), [9, 8, 7, 6])
 })
 
+test("ChunkStore fails closed when memory fallback exceeds 64 MiB", async () => {
+  const store = new ChunkStore()
+  await store.init(null, "memory-cap")
+  assert.equal(store.writeChunk(0, 64 * 1024 * 1024, new Uint8Array(64 * 1024 * 1024)), "memory")
+  assert.throws(
+    () => store.writeChunk(1, 64 * 1024 * 1024, new Uint8Array(1)),
+    /AF2_STORAGE_FATAL/
+  )
+})
+
 test("ChunkStore resume does not create a missing partial file", async () => {
   const dir = new FakeDirectoryHandle()
   const store = new ChunkStore()

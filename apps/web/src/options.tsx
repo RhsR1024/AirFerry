@@ -21,7 +21,11 @@ import {
   SenderBuilderWasm,
   type SenderSessionWasm,
 } from "@/wasm/loader"
-import { getCachedManifest, putCachedManifest } from "@/lib/sender-cache"
+import {
+  deleteCachedManifest,
+  getCachedManifest,
+  putCachedManifest,
+} from "@/lib/sender-cache"
 import { createChunkStager, type ChunkStager } from "@/lib/chunk-stager"
 import { SettingsIcon } from "@/components/icons"
 import type { PreparedEntry } from "@/workers/compress.worker"
@@ -151,6 +155,12 @@ export default function App() {
     }
   }, [])
 
+  // The worker-error handler lives in a mount-time effect closure (empty
+  // deps), so it must call through this ref to release a live playback
+  // session instead of capturing the callback.
+  const releaseOwnedSessionRef = useRef(releaseOwnedSession)
+  releaseOwnedSessionRef.current = releaseOwnedSession
+
   useEffect(() => {
     mountedRef.current = true
     return () => {
@@ -257,11 +267,29 @@ export default function App() {
 
     const failWorker = (message: string) => {
       if (disposed) return
-      setState((s) => ({
-        ...s,
-        compressPhase: null,
-        error: `文件处理线程错误: ${message}，正在重启…`,
-      }))
+      // A crashed worker orphans any LIVE streamed playback: the stager keeps
+      // posting stage requests into a terminated worker and the render loop
+      // spins on AF2_CHUNK_NOT_STAGED forever — a frozen QR stream the
+      // receiver can never complete, with no send-side error surfaced. Tear
+      // the session down with an actionable message; the restart below
+      // re-arms the worker for the next prepare pass.
+      if (ownedSessionRef.current != null) {
+        releaseOwnedSessionRef.current()
+        setState((s) => ({
+          ...s,
+          session: null,
+          stager: null,
+          page: "select",
+          compressPhase: null,
+          error: `文件处理线程崩溃，播放已停止: ${message}。请重新发送。`,
+        }))
+      } else {
+        setState((s) => ({
+          ...s,
+          compressPhase: null,
+          error: `文件处理线程错误: ${message}，正在重启…`,
+        }))
+      }
       startWorker()
     }
 
@@ -324,6 +352,55 @@ export default function App() {
 
   const startPlaybackWithPayload = useCallback(async (p: PreparedPayload, startEpoch: number) => {
     const cfg = state.config
+    const chunkRawSize = 8 * 1024 * 1024
+    const retryPrepareWithoutCache = (): boolean => {
+      const worker = workerRef.current
+      const items = state.items
+      if (!worker || items.length === 0) return false
+      epoch.current += 1
+      const retryEpoch = epoch.current
+      issuedEpoch.current = retryEpoch
+      forceCacheMissJobRef.current = retryEpoch
+      cachedManifestRef.current = null
+      releaseOwnedSession()
+      setState((s) => ({
+        ...s,
+        prepared: null,
+        session: null,
+        stager: null,
+        page: "select",
+        initializing: false,
+        compressPhase: "reading",
+        error: null,
+      }))
+      const channelBps = Math.round(
+        cfg.symbolSize * (cfg.fps || 60) * Math.max(1, cfg.multiQr || 1)
+      )
+      const forceFull = items.reduce(
+        (sum, it) =>
+          sum +
+          (it.kind === "file"
+            ? it.file.size
+            : new TextEncoder().encode(it.content).length),
+        0
+      ) <= chunkRawSize
+      const encodeParams = { channelBps, forceFull }
+      if (items.length === 1 && items[0].kind === "text") {
+        worker.postMessage({
+          jobId: retryEpoch,
+          text: items[0].content,
+          name: items[0].name,
+          encodeParams,
+        })
+      } else {
+        worker.postMessage({
+          jobId: retryEpoch,
+          files: itemsToFiles(items),
+          encodeParams,
+        })
+      }
+      return true
+    }
     setState((s) => ({ ...s, initializing: true, error: null }))
     try {
       await ensureWasm()
@@ -333,7 +410,6 @@ export default function App() {
         }
         return
       }
-      const chunkRawSize = 8 * 1024 * 1024
       // Streamed build: only kind/path/size + BLAKE3 digests cross into the
       // core — the canonical stream never materializes (bounded memory).
       // Content reaches the sender per chunk at play time via stage_chunk.
@@ -367,50 +443,7 @@ export default function App() {
           // used for a metadata rebuild here. Start one fresh prepare job and
           // bypass the cache exactly once; that job will read/hash/encode the
           // sources and overwrite the bad cache entry with a valid manifest.
-          const worker = workerRef.current
-          const items = state.items
-          if (!worker || items.length === 0) throw e
-          epoch.current += 1
-          const retryEpoch = epoch.current
-          issuedEpoch.current = retryEpoch
-          forceCacheMissJobRef.current = retryEpoch
-          cachedManifestRef.current = null
-          releaseOwnedSession()
-          setState((s) => ({
-            ...s,
-            prepared: null,
-            session: null,
-            stager: null,
-            initializing: false,
-            compressPhase: "reading",
-            error: null,
-          }))
-          const channelBps = Math.round(
-            cfg.symbolSize * (cfg.fps || 60) * Math.max(1, cfg.multiQr || 1)
-          )
-          const forceFull = items.reduce(
-            (sum, it) =>
-              sum +
-              (it.kind === "file"
-                ? it.file.size
-                : new TextEncoder().encode(it.content).length),
-            0
-          ) <= 8 * 1024 * 1024
-          const encodeParams = { channelBps, forceFull }
-          if (items.length === 1 && items[0].kind === "text") {
-            worker.postMessage({
-              jobId: retryEpoch,
-              text: items[0].content,
-              name: items[0].name,
-              encodeParams,
-            })
-          } else {
-            worker.postMessage({
-              jobId: retryEpoch,
-              files: itemsToFiles(items),
-              encodeParams,
-            })
-          }
+          if (!retryPrepareWithoutCache()) throw e
           return
         }
       }
@@ -463,6 +496,32 @@ export default function App() {
                 // of an endless stage-retry loop.
                 const changed =
                   /hash mismatch|disagree with the manifest/i.test(message)
+                if (changed && p.cachedManifestHex) {
+                  // Metadata cache fingerprints can be stale when content was
+                  // rewritten without changing size/mtime. Evict the poisoned
+                  // entry and transparently perform one real read/hash pass.
+                  releaseOwnedSession()
+                  setState((s) => ({
+                    ...s,
+                    session: null,
+                    stager: null,
+                    page: "select",
+                    initializing: true,
+                    error: null,
+                  }))
+                  void (async () => {
+                    await deleteCachedManifest(p.entries, chunkRawSize)
+                    if (epoch.current !== startEpoch) return
+                    if (!retryPrepareWithoutCache()) {
+                      setState((s) => ({
+                        ...s,
+                        initializing: false,
+                        error: "缓存校验失败，且文件处理线程不可用，请重新发送",
+                      }))
+                    }
+                  })()
+                  return
+                }
                 const userMessage = changed
                   ? "源文件内容与准备传输时不一致（可能已被修改），请重新选择并发送"
                   : `分块读取失败（源文件可能已被移动或修改），请重新发送。${message}`

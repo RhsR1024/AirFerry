@@ -1,10 +1,14 @@
 use crate::{ObjectMeta, Result, Symbol};
 use raptorq::{EncodingPacket, PayloadId, SourceBlockDecoder};
+use std::collections::HashSet;
 
 /// Per-source-block reconstruction state.
 struct BlockState {
     decoder: SourceBlockDecoder,
     decoded: Option<Vec<u8>>,
+    /// Mirror the upstream decoder's private ESI set so callers can distinguish
+    /// a genuinely new equation from a camera re-reading the same displayed QR.
+    seen_esi: HashSet<u32>,
 }
 
 /// RaptorQ decoder for a single object.
@@ -20,6 +24,14 @@ pub struct Decoder {
 }
 
 impl Decoder {
+    /// Bound hostile/non-decodable repair streams. A conforming RaptorQ object
+    /// normally finishes at K plus only a handful of repair symbols; 25% or 64
+    /// symbols (whichever is larger) leaves generous channel overhead while
+    /// preventing the 24-bit ESI space from becoming a memory/CPU budget.
+    fn symbol_budget(k: u32) -> u32 {
+        k.saturating_add((k / 4).max(64))
+    }
+
     /// Create a decoder from object metadata (typically received out-of-band
     /// via the first QR frame's header, or reconstructed from a resume file).
     pub fn new(meta: ObjectMeta) -> Result<Self> {
@@ -31,6 +43,7 @@ impl Decoder {
             .map(|b| BlockState {
                 decoder: SourceBlockDecoder::new(b.sbn as u8, &oti, b.block_length),
                 decoded: None,
+                seen_esi: HashSet::new(),
             })
             .collect();
         Ok(Self { meta, blocks })
@@ -63,6 +76,15 @@ impl Decoder {
     /// Returns `Ok(true)` if this symbol caused the whole object to become
     /// decodable, `Ok(false)` otherwise.
     pub fn add_symbol(&mut self, symbol: &Symbol) -> Result<bool> {
+        self.add_symbol_with_novelty(symbol)
+            .map(|(complete, _novel)| complete)
+    }
+
+    /// Feed a symbol and also report whether it contributed a previously
+    /// unseen ESI to an unfinished source block. The second result is false for
+    /// duplicates, malformed symbols, and symbols targeting an already-decoded
+    /// block; those frames must not inflate progress or throughput counters.
+    pub fn add_symbol_with_novelty(&mut self, symbol: &Symbol) -> Result<(bool, bool)> {
         let sbn = symbol.id.sbn as usize;
         if sbn >= self.blocks.len() {
             return Err(crate::Error::BlockOutOfRange {
@@ -77,13 +99,25 @@ impl Decoder {
         // silently ignoring a malformed one is safe. This guards both the live
         // path and the cache-replay path (which also calls add_symbol).
         if symbol.id.esi >= (1 << 24) || symbol.data.len() != self.meta.symbol_size as usize {
-            return Ok(self.is_complete());
+            return Ok((self.is_complete(), false));
         }
         let block = &mut self.blocks[sbn];
         if block.decoded.is_some() {
             // Already reconstructed; ignore further symbols for this block.
-            return Ok(self.is_complete());
+            return Ok((self.is_complete(), false));
         }
+        if block.seen_esi.contains(&symbol.id.esi) {
+            return Ok((self.is_complete(), false));
+        }
+        let k = self.meta.blocks[sbn].num_source_symbols;
+        let limit = Self::symbol_budget(k);
+        if block.seen_esi.len() >= limit as usize {
+            return Err(crate::Error::SymbolBudgetExceeded {
+                sbn: symbol.id.sbn,
+                limit,
+            });
+        }
+        block.seen_esi.insert(symbol.id.esi);
         // `SourceBlockDecoder::decode` both ingests the packet and attempts
         // reconstruction in one call (it is safe to call repeatedly; it keeps
         // all previously-seen symbols internally and re-runs the solver).
@@ -94,7 +128,7 @@ impl Decoder {
         if let Some(result) = block.decoder.decode(std::iter::once(pkt)) {
             block.decoded = Some(result);
         }
-        Ok(self.is_complete())
+        Ok((self.is_complete(), true))
     }
 
     /// True once every source block has been reconstructed.
@@ -191,6 +225,37 @@ mod tests {
         let data = random_data(35_000);
         let got = encode_decode(&data, 0, true, true).unwrap();
         assert_eq!(got, data);
+    }
+
+    #[test]
+    fn reports_duplicate_esi_without_progress() {
+        let data = random_data(8_000);
+        let enc = Encoder::new(&data, Config::default()).unwrap();
+        let symbol = enc.source_symbols(0).unwrap().remove(0);
+        let mut dec = Decoder::new(enc.meta().clone()).unwrap();
+        let (_complete, novel) = dec.add_symbol_with_novelty(&symbol).unwrap();
+        assert!(novel);
+        let (_complete, novel) = dec.add_symbol_with_novelty(&symbol).unwrap();
+        assert!(!novel, "same (sbn, esi) must not inflate progress");
+    }
+
+    #[test]
+    fn rejects_unbounded_unique_repair_stream() {
+        let data = random_data(4_096);
+        let enc = Encoder::new(&data, Config::default()).unwrap();
+        let meta = enc.meta().clone();
+        let k = meta.blocks[0].num_source_symbols;
+        let limit = Decoder::symbol_budget(k);
+        let mut dec = Decoder::new(meta).unwrap();
+        // Seed only the wrapper's hostile-input ledger: this models an upstream
+        // decoder that has retained the maximum allowed non-decodable equations
+        // without relying on a particular RaptorQ rank outcome in the test.
+        dec.blocks[0].seen_esi.extend(0..limit);
+        let extra = Symbol::new(0, k + limit, vec![0; 1024]);
+        assert!(matches!(
+            dec.add_symbol_with_novelty(&extra),
+            Err(crate::Error::SymbolBudgetExceeded { .. })
+        ));
     }
 
     #[test]

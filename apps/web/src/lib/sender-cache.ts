@@ -111,6 +111,23 @@ export async function putCachedManifest(
   }
 }
 
+/** Remove a cache entry that failed a protocol/hash validation gate. */
+export async function deleteCachedManifest(
+  items: readonly PreparedEntry[],
+  chunkRawSize: number
+): Promise<void> {
+  const key = await cacheKey(items, chunkRawSize)
+  if (!key) return
+  try {
+    const database = await db()
+    const tx = database.transaction(STORE, "readwrite")
+    tx.objectStore(STORE).delete(key)
+    await txDone(tx)
+  } catch {
+    // Advisory cache: the caller still forces a one-shot cache bypass.
+  }
+}
+
 /** Drop oldest entries past MAX_ENTRIES / MAX_AGE_MS. */
 async function prune(database: IDBDatabase): Promise<void> {
   try {

@@ -150,7 +150,7 @@ export PATH="$NDK_HOME/toolchains/llvm/prebuilt/$(uname -m)-linux-android/bin:$P
 
 ### ZXing-C++ 首次构建缓慢
 
-CMake 首次会从 GitHub 克隆 zxing-cpp 并编译（约 1–2 分钟）。后续构建使用缓存。
+CMake 首次会下载并校验固定 commit 的 zxing-cpp 源码归档后编译（约 1–2 分钟）。后续构建使用缓存，不执行 Git 更新。
 
 ### Release APK 签名：找不到 keystore / 签名配置
 

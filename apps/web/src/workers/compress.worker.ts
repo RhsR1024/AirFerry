@@ -12,7 +12,9 @@
  *
  * Memory profile (bounded-memory by design constants, NOT by transfer size):
  *   - one chunk's raw bytes + one encode in flight during the pass/stage;
- *   - ≤ ENCODING_CACHE_CAP of cached compressed chunks (RAW is never cached);
+ *   - ≤ ENCODING_CACHE_CAP compressed/mixed cache, with RAW retention capped
+ *     separately at RAW_ENCODING_CACHE_CAP; a RAW hit skips the per-epoch disk
+ *     read + BLAKE3 + codec probe without imposing a 256 MiB media-cache floor;
  *   - BLAKE3 hashers only for entries STRADDLING the current chunk boundary
  *     (each is digested + freed the moment its entry's last byte is fed);
  *   - per-transfer metadata (paths/sizes/32-byte digests, ≤ 4096 entries).
@@ -27,6 +29,11 @@
 /// <reference lib="webworker" />
 
 import { senderPathForFile, uniqueSenderPath, type SenderFileItem } from "@/lib/sender-path"
+import {
+  consumeEncodedChunk,
+  retainBytes,
+  uniqueTransferBuffers,
+} from "@/lib/transfer-ownership"
 import { ensureWasm, Blake3Wasm, encode_chunk_balanced, plan_chunks } from "@/wasm/loader"
 import { MAX_ORIGINAL_BYTES, MAX_ORIGINAL_MIB } from "@/types"
 
@@ -34,8 +41,14 @@ export const KIND_FILE = 1
 export const KIND_UTF8_TEXT = 2
 export const KIND_DIRECTORY = 3
 
-/** Hard cap on cached compressed chunk encodings (RAW is never cached). */
+/** Hard cap on cached chunk encodings. RAW chunks share the same budget:
+ * media payloads are (almost) always RAW and used to be re-read + re-hashed +
+ * re-probed from disk on EVERY epoch — the dominant stall of the streamed
+ * pipeline. Bounded by the cap, NOT by transfer size. */
 const ENCODING_CACHE_CAP = 256 * 1024 * 1024
+/** Incompressible media used to retain no encoding cache at all. Keep the new
+ * RAW fast path useful without adding a 256 MiB floor on low-memory browsers. */
+const RAW_ENCODING_CACHE_CAP = 64 * 1024 * 1024
 
 /** AF2 wire format: the Manifest carries at most 4096 entries. */
 const MAX_ENTRIES = 4096
@@ -99,6 +112,7 @@ let active: {
   /** codec != RAW encodings, capped at ENCODING_CACHE_CAP (FIFO eviction). */
   encodings: Map<number, { codec: number; data: Uint8Array; rawHash: Uint8Array }>
   encodingsBytes: number
+  rawEncodingsBytes: number
 } | null = null
 
 /** Latest prepare jobId RECEIVED (set synchronously, in receipt order). */
@@ -162,17 +176,14 @@ function encodeChunk(
     BigInt(Math.max(0, Math.round(a.params.channelBps))),
     a.params.forceFull
   )
-  try {
-    const codec = enc.codec_id
-    const data = enc.data
-    if (codec !== 0 && data.length > 0 && data.length < raw.length) {
-      return { codec, data }
-    }
-    // RAW marker (compression cannot win): stage as RAW with the raw bytes.
-    return { codec: 0, data: new Uint8Array(0) }
-  } finally {
-    enc.free()
+  // into_data() consumes and destroys the wasm-bindgen handle. Never call
+  // free() afterwards: the generated wrapper has already zeroed its pointer.
+  const { codec, data } = consumeEncodedChunk(enc)
+  if (codec !== 0 && data.length > 0 && data.length < raw.length) {
+    return { codec, data }
   }
+  // RAW marker (compression cannot win): stage as RAW with the raw bytes.
+  return { codec: 0, data: new Uint8Array(0) }
 }
 
 function cacheEncoding(
@@ -182,15 +193,57 @@ function cacheEncoding(
   data: Uint8Array,
   rawHash: Uint8Array
 ): void {
-  if (codec === 0) return
-  while (a.encodingsBytes + data.byteLength > ENCODING_CACHE_CAP && a.encodings.size > 0) {
+  // A duplicate/concurrent stage for the same index replaces the entry. Take
+  // the old accounting out first; otherwise repeated overwrites inflate the
+  // byte counters and evict unrelated hot chunks prematurely.
+  const previous = a.encodings.get(index)
+  if (previous) {
+    a.encodings.delete(index)
+    a.encodingsBytes -= previous.data.byteLength
+    if (previous.codec === 0) a.rawEncodingsBytes -= previous.data.byteLength
+  }
+  while (
+    (a.encodingsBytes + data.byteLength > ENCODING_CACHE_CAP ||
+      (codec === 0 && a.rawEncodingsBytes + data.byteLength > RAW_ENCODING_CACHE_CAP)) &&
+    a.encodings.size > 0
+  ) {
     const oldest = a.encodings.keys().next().value as number
     const evict = a.encodings.get(oldest)
     a.encodings.delete(oldest)
-    if (evict) a.encodingsBytes -= evict.data.byteLength
+    if (evict) {
+      a.encodingsBytes -= evict.data.byteLength
+      if (evict.codec === 0) a.rawEncodingsBytes -= evict.data.byteLength
+    }
   }
-  a.encodings.set(index, { codec, data, rawHash })
+  // `chunkHashes` are transferred to the main thread when prepare completes.
+  // Retain an independent 32-byte buffer for later stage requests.
+  a.encodings.set(index, { codec, data, rawHash: retainBytes(rawHash) })
   a.encodingsBytes += data.byteLength
+  if (codec === 0) a.rawEncodingsBytes += data.byteLength
+}
+
+/**
+ * Stage-reply helper: caches the (data, rawHash) pair and posts the `staged`
+ * message. The posted buffers are fresh `.slice()` copies TRANSFERRED to the
+ * main thread — without the transfer list the structured clone would copy
+ * them again on the receiving end, and posting the cached originals would
+ * detach the cache's own storage.
+ */
+function postStaged(
+  a: NonNullable<typeof active>,
+  jobId: number,
+  index: number,
+  codec: number,
+  data: Uint8Array,
+  rawHash: Uint8Array
+): void {
+  cacheEncoding(a, index, codec, data, rawHash)
+  const dataOut = data.slice()
+  const hashOut = rawHash.slice()
+  post(
+    { type: "staged", jobId, index, codec, data: dataOut, rawHash: hashOut },
+    [dataOut.buffer as ArrayBuffer, hashOut.buffer as ArrayBuffer]
+  )
 }
 
 async function runPrepare(
@@ -275,7 +328,7 @@ async function runPrepare(
       }
     }
 
-    // Structural gates BEFORE building any plan: a >1 TiB or >4096-entry
+    // Structural gates BEFORE building any plan: an over-host-cap or >4096-entry
     // selection must fail here, not after materializing a huge chunk layout
     // (or worse, mid-pass).
     if (metas.length > MAX_ENTRIES) {
@@ -284,6 +337,12 @@ async function runPrepare(
     const totalBytes = metas.reduce((s, m) => s + m.size, 0)
     if (totalBytes > MAX_ORIGINAL_BYTES) {
       throw new Error(`所选内容超过当前网页发送端 ${MAX_ORIGINAL_MIB} MiB 宿主上限`)
+    }
+    if (totalBytes === 0) {
+      // AF2 cannot encode a zero-byte canonical stream (receiver OTI gate
+      // rejects F=0). Fail with a user-readable message instead of the
+      // internal plan_chunks error after this gate.
+      throw new Error("所选内容全部为 0 字节（空文件/空文本），没有可传输的数据")
     }
 
     // Canonical chunk layout (NFC-path sorted inside plan_chunks — the same
@@ -319,6 +378,7 @@ async function runPrepare(
       params,
       encodings: new Map(),
       encodingsBytes: 0,
+      rawEncodingsBytes: 0,
     }
     const probeEntries: PreparedEntry[] = metas.map((m) => ({
       kind: m.kind,
@@ -379,10 +439,18 @@ async function runPrepare(
     const emptyHasher = new Blake3Wasm()
     const EMPTY_HASH = new Uint8Array(emptyHasher.digest())
     emptyHasher.free()
+    // plan_chunks emits no segment for a zero-byte entry, so its digest can
+    // never arrive through the canonical walk below — seed it up front with
+    // H(empty) (exactly what the core assigns to a size-0 entry) or the pass
+    // would end with "entry hash missing" after reading every other file.
     const entryDigests: (Uint8Array | null)[] = metas.map((m) =>
-      m.kind === KIND_DIRECTORY ? EMPTY_HASH : null
+      // Each transferable empty entry needs its own backing buffer. Reusing
+      // EMPTY_HASH would put one ArrayBuffer into the transfer list repeatedly.
+      m.kind === KIND_DIRECTORY || m.size === 0 ? retainBytes(EMPTY_HASH) : null
     )
-    entryHashers = metas.map((m) => (m.kind === KIND_DIRECTORY ? null : new Blake3Wasm()))
+    entryHashers = metas.map((m) =>
+      m.kind === KIND_DIRECTORY || m.size === 0 ? null : new Blake3Wasm()
+    )
     const hashedLen: number[] = metas.map(() => 0)
     const chunkHashes: Uint8Array[] = []
     for (let i = 0; i < chunks.length; i++) {
@@ -424,7 +492,9 @@ async function runPrepare(
         }
       }
       const { codec, data: encoded } = encodeChunk(staged, raw)
-      if (codec !== 0) cacheEncoding(staged, i, codec, encoded, chunkHashes[i])
+      // Cache every verdict (RAW included): play-time re-stages then hit the
+      // cache instead of re-reading + re-hashing + re-probing each epoch.
+      cacheEncoding(staged, i, codec, codec !== 0 ? encoded : raw, chunkHashes[i])
       if ((i + 1) % 8 === 0 || i === chunks.length - 1) {
         post({ phase: "progress", jobId, done: i + 1, total: chunks.length })
       }
@@ -449,9 +519,10 @@ async function runPrepare(
     // the newer job's staging state (rapid re-send race).
     if (latestPrepareJob !== jobId) return
     active = staged
-    const hashTransfers = [...chunkHashes, ...entries.map((en) => en.hash)].map(
-      (h) => h.buffer as ArrayBuffer
-    )
+    const hashTransfers = uniqueTransferBuffers([
+      ...chunkHashes,
+      ...entries.map((en) => en.hash),
+    ])
     post(
       {
         phase: "done",
@@ -510,26 +581,19 @@ self.addEventListener("message", (e: MessageEvent) => {
       try {
         const cached = a.encodings.get(index)
         if (cached) {
-          post({
-            type: "staged",
-            jobId,
-            index,
-            codec: cached.codec,
-            data: cached.data,
-            rawHash: cached.rawHash,
-          })
+          // cacheEncoding replaces + re-inserts at the back (Map insertion
+          // order), so this also performs the LRU touch in one place.
+          postStaged(a, jobId, index, cached.codec, cached.data, cached.rawHash)
           return
         }
         const hasher = new Blake3Wasm()
-        const raw = await assembleChunk(a, index, hasher)
-        const rawDigest = new Uint8Array(hasher.digest())
-        hasher.free()
-        const { codec, data: encoded } = encodeChunk(a, raw)
-        if (codec !== 0) {
-          cacheEncoding(a, index, codec, encoded, rawDigest)
-          post({ type: "staged", jobId, index, codec, data: encoded, rawHash: rawDigest })
-        } else {
-          post({ type: "staged", jobId, index, codec: 0, data: raw, rawHash: rawDigest })
+        try {
+          const raw = await assembleChunk(a, index, hasher)
+          const rawDigest = new Uint8Array(hasher.digest())
+          const { codec, data: encoded } = encodeChunk(a, raw)
+          postStaged(a, jobId, index, codec, codec !== 0 ? encoded : raw, rawDigest)
+        } finally {
+          hasher.free()
         }
       } catch (err: unknown) {
         post({

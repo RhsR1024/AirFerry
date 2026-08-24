@@ -33,9 +33,27 @@ function Info($msg) { Write-Host "[OK] $msg" -ForegroundColor Green }
 function Warn($msg) { Write-Host "[!] $msg" -ForegroundColor Yellow }
 function Fail($msg) { Write-Host "[X] $msg" -ForegroundColor Red; exit 1 }
 
-# 版本号取自 apps/web/package.json（与 build-all.sh 同源）。
+# 版本号直接取自根 Cargo.toml [workspace.package] 事实源。不要从某个
+# 平台镜像位点读取，否则漏跑 version gate 时可能给产物写入错误版本。
+$CargoToml = Get-Content "$Root/Cargo.toml" -Raw
+$WorkspacePackage = [regex]::Match(
+    $CargoToml,
+    '(?ms)^\[workspace\.package\]\s*$(.*?)(?=^\[|\z)'
+)
+if (-not $WorkspacePackage.Success) { Fail "Cargo.toml 缺少 [workspace.package]" }
+$VersionMatch = [regex]::Match(
+    $WorkspacePackage.Groups[1].Value,
+    '(?m)^version\s*=\s*"([^"]+)"\s*$'
+)
+if (-not $VersionMatch.Success) { Fail "Cargo.toml 缺少 workspace package version" }
+$Ver = $VersionMatch.Groups[1].Value
 $Pkg = Get-Content "$Root/apps/web/package.json" -Raw | ConvertFrom-Json
-$Ver = $Pkg.version
+if ($Pkg.version -ne $Ver) { Fail "apps/web/package.json version 与 Cargo.toml 不一致" }
+[xml]$WindowsProject = Get-Content "$Root/apps/windows/AirFerry.Windows/AirFerry.Windows.csproj" -Raw
+$WindowsVersion = @($WindowsProject.Project.PropertyGroup.Version) |
+    Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+    Select-Object -First 1
+if ($WindowsVersion -ne $Ver) { Fail "Windows csproj Version 与 Cargo.toml 不一致" }
 Info "AirFerry Windows 构建 (v$Ver)"
 
 # ── ① Rust C ABI DLL ────────────────────────────────────────────────────
@@ -105,6 +123,11 @@ if ($Pack) {
             Fail "发布目录缺少 native 依赖: $RequiredDll"
         }
     }
+
+    # A release-looking zip must never be emitted unsigned. The shared signing
+    # gate verifies the fixed certificate thumbprint and every final PE file.
+    & "$Root/scripts/sign-windows.ps1" -PublishDir $PublishDir
+    if ($LASTEXITCODE -ne 0) { Fail "Windows Authenticode 签名失败" }
 
     $DistDir = "$Root/dist"
     New-Item -ItemType Directory -Force -Path $DistDir | Out-Null

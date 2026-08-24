@@ -4,7 +4,7 @@
 #
 # Prereqs:
 #   - Emscripten installed & on PATH (e.g. `source ~/emsdk/emsdk_env.sh`)
-#   - Network for the first FetchContent clone of zxing-cpp (pinned commit)
+#   - Network for the first SHA-256-verified zxing-cpp source archive download
 #
 # Usage:
 #   ./scripts/build-fastzxing.sh
@@ -26,11 +26,17 @@ fi
 EXTRA_CMAKE=()
 if [[ "${1:-}" == "--use-cache" ]]; then
   CACHE_SRC="$HERE/apps/scanner/app/.cxx/Debug/3m4r2j6m/arm64-v8a/zxing-src"
-  if [[ -d "$CACHE_SRC" ]]; then
+  if [[ ! -f "$CACHE_SRC/CMakeLists.txt" ]]; then
+    CACHE_CMAKE="$(find "$HERE/apps/scanner/app/.cxx" -type f -path '*/zxing-src/CMakeLists.txt' -print -quit 2>/dev/null || true)"
+    if [[ -n "$CACHE_CMAKE" ]]; then
+      CACHE_SRC="$(dirname "$CACHE_CMAKE")"
+    fi
+  fi
+  if [[ -f "$CACHE_SRC/CMakeLists.txt" ]]; then
     EXTRA_CMAKE=("-DZXING_SRC_DIR=$CACHE_SRC")
     echo "using cached zxing-cpp source: $CACHE_SRC"
   else
-    echo "cache not found; will FetchContent download zxing-cpp" >&2
+    echo "cache not found; will FetchContent download the pinned zxing-cpp archive" >&2
   fi
 fi
 
@@ -52,13 +58,14 @@ emmake cmake --build "$BUILD" -j"$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 echo "== link =="
 mkdir -p "$OUT"
 "$SRC/link-wasm.sh" "$BUILD" "$OUT"
+node "$HERE/scripts/fastzxing-fingerprint.mjs" write "$OUT"
 
 # Post-build integrity gate: the web receiver is FAST-only (the zxing-wasm
 # fallback was removed), so a truncated/zero-byte artifact must fail HERE
 # instead of at page load. Check both files exist, are non-trivially sized,
 # and that the JS module really references the exported decoder entrypoint.
 echo "== verify =="
-for f in airferry_zxing.js airferry_zxing.wasm; do
+for f in airferry_zxing.js airferry_zxing.wasm SOURCE.sha256; do
   if [[ ! -s "$OUT/$f" ]]; then
     echo "error: $OUT/$f missing or empty" >&2
     exit 1

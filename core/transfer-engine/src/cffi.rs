@@ -373,11 +373,19 @@ pub unsafe extern "C" fn airferry_decompress_stream_to_file(
         cffi_log("decompress_stream_to_file: missing argument");
         return 0;
     };
+    // Apply the same hard ceiling as the in-memory C ABI. `max_output` comes
+    // from the host process and must not be able to turn this streaming helper
+    // into an unlimited disk-filling decompression oracle.
+    let cap = max_output.min(MAX_ORIGINAL_BYTES);
+    if expected_size > cap {
+        cffi_log("decompress_stream_to_file: expected size exceeds receiver budget");
+        return 0;
+    }
     let outcome = match qr_protocol::compress::decompress_stream_to_file(
         &input,
         &output,
         compression,
-        max_output,
+        cap,
     ) {
         Ok(o) => o,
         Err(e) => {
@@ -818,5 +826,28 @@ mod tests {
             assert_eq!(out_buf, 1usize as *mut u8);
             airferry_receiver_destroy(handle);
         }
+    }
+
+    #[test]
+    fn streaming_decompress_clamps_the_host_supplied_disk_budget() {
+        let input = std::ffi::CString::new("missing-input.af2").unwrap();
+        let output = std::ffi::CString::new("unused-output.af2").unwrap();
+        let sha = std::ffi::CString::new("").unwrap();
+        // The size gate must run before opening either path. This both proves
+        // the hard receiver ceiling is applied to the streaming C ABI and
+        // keeps the test independent of the filesystem.
+        let result = unsafe {
+            airferry_decompress_stream_to_file(
+                input.as_ptr(),
+                output.as_ptr(),
+                0,
+                u64::MAX,
+                MAX_ORIGINAL_BYTES + 1,
+                0,
+                false,
+                sha.as_ptr(),
+            )
+        };
+        assert_eq!(result, 0);
     }
 }
