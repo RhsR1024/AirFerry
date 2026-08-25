@@ -77,7 +77,17 @@ for (const candidate of ["dotnet", "/usr/local/share/dotnet/dotnet"]) {
   } catch {}
 }
 if (dotnetBin) {
-  run("Windows 单测", dotnetBin, ["test", "apps/windows/AirFerry.Windows.Tests"], { timeout: 600000 })
+  // A newer SDK can compile the net8.0 test project even when that machine no
+  // longer has the exact .NET 8 runtime installed.  Permit the test host to
+  // use a newer major runtime explicitly; without this, an SDK-only probe
+  // reports a false matrix failure before a single test starts.
+  run("Windows 单测", dotnetBin, ["test", "apps/windows/AirFerry.Windows.Tests"], {
+    timeout: 600000,
+    env: {
+      ...process.env,
+      DOTNET_ROLL_FORWARD: process.env.DOTNET_ROLL_FORWARD || "Major",
+    },
+  })
 } else {
   results.push({ name: "Windows 单测", ok: null, ms: 0, detail: ".NET SDK 不可用，跳过（CI windows-latest 覆盖）" })
 }

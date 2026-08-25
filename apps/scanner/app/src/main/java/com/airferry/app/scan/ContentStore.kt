@@ -133,35 +133,47 @@ object ContentStore {
         // Read and validate the index before touching blob storage. A corrupt
         // index must never be interpreted as an empty history and overwritten.
         val all = loadIndex(ctx).toMutableList()
+        val priorHashes = all.mapTo(HashSet()) { it.hash }
         val results = ArrayList<PutResult>(requests.size)
+        val createdBlobs = ArrayList<File>()
         val createdAt = System.currentTimeMillis()
-        for (request in requests) {
-            val hash = sha256Hex(request.bytes)
-            val blob = blobPath(ctx, hash)
-            val deduped = blob.exists() && blob.length() == request.bytes.size.toLong() &&
-                try { sha256Hex(blob) == hash } catch (_: Exception) { false }
-            if (!deduped) {
-                blob.parentFile?.mkdirs()
-                writeBytesAtomic(blob, request.bytes)
+        try {
+            for (request in requests) {
+                val hash = sha256Hex(request.bytes)
+                val blob = blobPath(ctx, hash)
+                val deduped = blob.exists() && blob.length() == request.bytes.size.toLong() &&
+                    try { sha256Hex(blob) == hash } catch (_: Exception) { false }
+                if (!deduped) {
+                    blob.parentFile?.mkdirs()
+                    writeBytesAtomic(blob, request.bytes)
+                    createdBlobs.add(blob)
+                }
+                val entry = Entry(
+                    id = UUID.randomUUID().toString(),
+                    name = if (request.bundleId != null)
+                        FileNameUtil.sanitizeRelativePath(request.displayName)
+                    else FileNameUtil.sanitize(request.displayName).ifBlank { "received_file" },
+                    hash = hash,
+                    size = request.bytes.size.toLong(),
+                    crcHex = request.crcHex,
+                    crcUnknown = request.crcUnknown,
+                    kind = request.kind,
+                    createdAt = createdAt,
+                    bundleId = request.bundleId,
+                    bundleTitle = request.bundleTitle,
+                )
+                all.add(entry)
+                results.add(PutResult(entry, blob, deduped))
             }
-            val entry = Entry(
-                id = UUID.randomUUID().toString(),
-                name = if (request.bundleId != null)
-                    FileNameUtil.sanitizeRelativePath(request.displayName)
-                else FileNameUtil.sanitize(request.displayName).ifBlank { "received_file" },
-                hash = hash,
-                size = request.bytes.size.toLong(),
-                crcHex = request.crcHex,
-                crcUnknown = request.crcUnknown,
-                kind = request.kind,
-                createdAt = createdAt,
-                bundleId = request.bundleId,
-                bundleTitle = request.bundleTitle,
-            )
-            all.add(entry)
-            results.add(PutResult(entry, blob, deduped))
+            saveIndex(ctx, all)
+        } catch (t: Throwable) {
+            for (blob in createdBlobs) {
+                if (blob.name !in priorHashes) {
+                    try { blob.delete() } catch (_: Exception) {}
+                }
+            }
+            throw t
         }
-        saveIndex(ctx, all)
         return results
     }
 

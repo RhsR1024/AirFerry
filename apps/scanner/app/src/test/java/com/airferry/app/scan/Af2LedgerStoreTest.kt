@@ -89,6 +89,37 @@ class Af2LedgerStoreTest {
     }
 
     @Test
+    fun invalidHexNewestJournalFallsBackToOlderValidOne() {
+        val old = Af2LedgerStore.create(tmp.root, "tid-old", 8192, root)
+        old.commit(1)
+        File(tmp.root, "af2-tid-old.ledger.jsonl").setLastModified(1_000L)
+        File(tmp.root, "af2-tid-new.ledger.jsonl").apply {
+            writeText("{\"v\":1,\"tid\":\"tid-new\",\"crs\":8192,\"root\":\"zz\"}\n")
+            setLastModified(2_000L)
+        }
+
+        val loaded = Af2LedgerStore.loadMostRecent(tmp.root)!!
+        assertEquals("tid-old", loaded.transferIdHex)
+    }
+
+    @Test
+    fun failedCommitDoesNotAdvanceInMemoryLedger() {
+        val store = Af2LedgerStore.create(tmp.root, "tid-fail", 8192, root)
+        val journal = File(tmp.root, "af2-tid-fail.ledger.jsonl")
+        assertTrue(journal.delete())
+        assertTrue(journal.mkdir()) // Appending a FileOutputStream to a directory must fail.
+
+        var failed = false
+        try {
+            store.commit(7)
+        } catch (_: Exception) {
+            failed = true
+        }
+        assertTrue("commit must propagate durable-write failure", failed)
+        assertArrayEquals(intArrayOf(), store.completedIndices)
+    }
+
+    @Test
     fun orphanSweepKeepsOnlyPartialsReferencedByValidLedgers() {
         Af2LedgerStore.create(tmp.root, "tid-live", 8192, root)
         val live = File(tmp.root, "af2-tid-live.partial").apply { writeBytes(byteArrayOf(1)) }

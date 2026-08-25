@@ -106,7 +106,8 @@ public sealed class Af2LedgerStore
     /// <summary>Append one commit event (after the chunk was spilled + flushed).</summary>
     public void Commit(int index)
     {
-        if (!_headerDurable) return; // headerless journal would never reload
+        if (!_headerDurable)
+            throw new IOException("AF2 ledger header is not durable");
         AppendLine($"{{\"c\":{index}}}");
         Completed.Add(index);
     }
@@ -114,31 +115,35 @@ public sealed class Af2LedgerStore
     /// <summary>Append one invalidate event (after a re-verification failure).</summary>
     public void Invalidate(int index)
     {
-        if (!_headerDurable) return;
+        if (!_headerDurable)
+            throw new IOException("AF2 ledger header is not durable");
         AppendLine($"{{\"i\":{index}}}");
         Completed.Remove(index);
     }
 
     private void AppendLine(string json)
     {
-        try
-        {
-            using var fs = new FileStream(
-                _path, FileMode.Append, FileAccess.Write, FileShare.None);
-            byte[] bytes = Encoding.UTF8.GetBytes(json + "\n");
-            fs.Write(bytes, 0, bytes.Length);
-            fs.Flush(flushToDisk: true);
-        }
-        catch (Exception ex)
-        {
-            System.Diagnostics.Debug.WriteLine($"[Af2LedgerStore] append failed: {ex.Message}");
-        }
+        using var fs = new FileStream(
+            _path, FileMode.Append, FileAccess.Write, FileShare.None);
+        byte[] bytes = Encoding.UTF8.GetBytes(json + "\n");
+        fs.Write(bytes, 0, bytes.Length);
+        fs.Flush(flushToDisk: true);
     }
 
     /// <summary>Delete the journal (transfer finished / relocked away / abandoned).</summary>
     public void Discard()
     {
         try { File.Delete(_path); } catch (IOException) { }
+    }
+
+    /// <summary>Delete this journal and its same-transfer spill backing.</summary>
+    public void DiscardTransferFiles()
+    {
+        Discard();
+        const string suffix = ".ledger.jsonl";
+        if (!_path.EndsWith(suffix, StringComparison.Ordinal)) return;
+        string spill = _path[..^suffix.Length] + ".partial";
+        try { File.Delete(spill); } catch (IOException) { }
     }
 
     public record PendingTransfer(
@@ -210,8 +215,15 @@ public sealed class Af2LedgerStore
                          .EnumerateFiles("*.ledger.jsonl")
                          .OrderByDescending(f => f.LastWriteTimeUtc))
             {
-                var store = new Af2LedgerStore(candidate.FullName);
-                if (store.Reload()) return store;
+                try
+                {
+                    var store = new Af2LedgerStore(candidate.FullName);
+                    if (store.Reload()) return store;
+                }
+                catch
+                {
+                    // One malformed candidate must not hide older valid work.
+                }
             }
             return null;
         }
@@ -267,30 +279,29 @@ public sealed class Af2LedgerStore
             crs = chunkRawSize,
             root = BytesToHex(rootFrameBytes),
         });
-        bool headerDurable = false;
+        string tmp = path + ".tmp";
         try
         {
             Directory.CreateDirectory(dir);
-            string tmp = path + ".tmp";
-            File.WriteAllText(tmp, header + "\n");
+            byte[] bytes = Encoding.UTF8.GetBytes(header + "\n");
+            using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                fs.Write(bytes, 0, bytes.Length);
+                fs.Flush(flushToDisk: true);
+            }
             File.Move(tmp, path, overwrite: true);
-            headerDurable = true;
         }
         catch (Exception ex)
         {
-            // A journal whose header never became durable is permanently
-            // un-reloadable (Reload requires a header line) and the resume
-            // sweep would delete its spill as garbage. Keep the store for the
-            // in-memory completed-set, but refuse to append so we never write
-            // a headerless {"c":i} journal that silently breaks §12 resume.
-            System.Diagnostics.Debug.WriteLine($"[Af2LedgerStore] header write failed: {ex.Message}");
+            try { File.Delete(tmp); } catch { }
+            throw new IOException("AF2 ledger header write failed", ex);
         }
         return new Af2LedgerStore(path)
         {
             TransferIdHex = transferIdHex,
             ChunkRawSize = chunkRawSize,
             RootFrameBytes = rootFrameBytes,
-            _headerDurable = headerDurable,
+            _headerDurable = true,
         };
     }
 
@@ -310,11 +321,7 @@ public sealed class Af2LedgerStore
         {
             return Array.Empty<byte>();
         }
-        var outBytes = new byte[s.Length / 2];
-        for (int i = 0; i < outBytes.Length; i++)
-        {
-            outBytes[i] = Convert.ToByte(s.Substring(i * 2, 2), 16);
-        }
-        return outBytes;
+        try { return Convert.FromHexString(s); }
+        catch (FormatException) { return Array.Empty<byte>(); }
     }
 }

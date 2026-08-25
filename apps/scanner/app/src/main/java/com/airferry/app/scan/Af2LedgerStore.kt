@@ -2,6 +2,7 @@ package com.airferry.app.scan
 
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
 import org.json.JSONObject
 
 /**
@@ -57,8 +58,14 @@ class Af2LedgerStore private constructor(private val path: File) {
                 header = o
                 continue
             }
-            if (o.has("c")) completed.add(o.getInt("c"))
-            if (o.has("i")) completed.remove(o.getInt("i"))
+            // A syntactically valid but malformed/torn record must not abort
+            // the whole candidate scan and hide an older valid ledger.
+            try {
+                if (o.has("c")) o.optInt("c", -1).takeIf { it >= 0 }?.let(completed::add)
+                if (o.has("i")) o.optInt("i", -1).takeIf { it >= 0 }?.let(completed::remove)
+            } catch (_: Exception) {
+                continue
+            }
         }
         val h = header ?: return false
         transferIdHex = h.optString("tid", "")
@@ -68,25 +75,24 @@ class Af2LedgerStore private constructor(private val path: File) {
     }
 
     /** Append one commit event (after the chunk was spilled + fsync'd). */
+    @Throws(IOException::class)
     fun commit(index: Int) {
         appendLine(JSONObject().put("c", index))
         completed.add(index)
     }
 
     /** Append one invalidate event (after a spill re-verification failure). */
+    @Throws(IOException::class)
     fun invalidate(index: Int) {
         appendLine(JSONObject().put("i", index))
         completed.remove(index)
     }
 
+    @Throws(IOException::class)
     private fun appendLine(o: JSONObject) {
-        try {
-            FileOutputStream(path, true).use { fos ->
-                fos.write((o.toString() + "\n").toByteArray())
-                fos.fd.sync()
-            }
-        } catch (e: Exception) {
-            android.util.Log.w("Af2LedgerStore", "append failed", e)
+        FileOutputStream(path, true).use { fos ->
+            fos.write((o.toString() + "\n").toByteArray())
+            fos.fd.sync()
         }
     }
 
@@ -145,8 +151,12 @@ class Af2LedgerStore private constructor(private val path: File) {
             val candidates = dir.listFiles { f -> f.name.endsWith(".ledger.jsonl") }
                 ?: return null
             for (candidate in candidates.sortedByDescending { it.lastModified() }) {
-                val store = Af2LedgerStore(candidate)
-                if (store.reload()) return store
+                try {
+                    val store = Af2LedgerStore(candidate)
+                    if (store.reload()) return store
+                } catch (_: Exception) {
+                    // One corrupt candidate must not hide older valid work.
+                }
             }
             return null
         }
@@ -196,12 +206,16 @@ class Af2LedgerStore private constructor(private val path: File) {
                     // Cross-filesystem rename fallback (cache dirs are same-FS
                     // in practice; copy keeps the fsync-before-rename order).
                     tmp.copyTo(path, overwrite = true)
+                    // copyTo closes its stream but does not promise a physical
+                    // flush.  Re-open and fsync before declaring the header
+                    // durable.
+                    FileOutputStream(path, true).use { it.fd.sync() }
                     path.setLastModified(System.currentTimeMillis())
                     tmp.delete()
                 }
             } catch (e: Exception) {
-                android.util.Log.w("Af2LedgerStore", "header write failed", e)
                 tmp.delete()
+                throw IOException("AF2 ledger header write failed", e)
             }
             return Af2LedgerStore(path).apply {
                 this.transferIdHex = transferIdHex
@@ -221,8 +235,10 @@ class Af2LedgerStore private constructor(private val path: File) {
         private fun hexToBytes(s: String): ByteArray {
             if (s.length % 2 != 0) return ByteArray(0)
             return ByteArray(s.length / 2) { i ->
-                ((Character.digit(s[i * 2], 16) shl 4) +
-                    Character.digit(s[i * 2 + 1], 16)).toByte()
+                val hi = Character.digit(s[i * 2], 16)
+                val lo = Character.digit(s[i * 2 + 1], 16)
+                if (hi < 0 || lo < 0) return ByteArray(0)
+                ((hi shl 4) + lo).toByte()
             }
         }
     }

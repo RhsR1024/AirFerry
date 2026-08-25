@@ -331,8 +331,11 @@ impl ReceiverSession {
         match self.inner.resume(root_frame_bytes, completed) {
             Ok(accepted) => {
                 // Only indices actually inside the transfer count (af2 drops
-                // out-of-range entries silently — the ledger must not).
-                self.completed_count = accepted as u32;
+                // out-of-range entries silently — the ledger must not).  In a
+                // late-resume merge `accepted` is only the number NEWLY added
+                // to an already-live receiver, so replacing the total would
+                // erase chunks that beat the host's async resume task.
+                self.completed_count = self.completed_count.saturating_add(accepted as u32);
                 true
             }
             Err(_) => false,
@@ -971,6 +974,38 @@ mod tests {
         bad[n - 5] ^= 0xFF;
         let mut fresh = ReceiverSession::new();
         assert!(!fresh.resume(&bad, &[0]));
+    }
+
+    #[test]
+    fn late_resume_does_not_erase_live_completion_count() {
+        let data = vec![0x42u8; 2500];
+        let mut sender = Af2Sender::new(
+            vec![(KIND_FILE, "late.bin".to_string(), data.clone())],
+            SenderConfig::default(),
+        )
+        .unwrap();
+        let root_frame = sender.next_frame().unwrap();
+        let tid = sender.transfer_id();
+
+        let mut session = ReceiverSession::new();
+        let _ = session.ingest(&root_frame);
+        let (meta, symbols) = craft_foreign_chunk_frames(tid, 0, &data, 1024);
+        let _ = session.ingest(&meta);
+        for symbol in symbols {
+            let _ = session.ingest(&symbol);
+            if session.is_complete() {
+                break;
+            }
+        }
+        assert!(session.is_complete(), "live ingest completed chunk 0 first");
+        assert_eq!(session.completed_count, 1);
+
+        // The persisted ledger contains the same index, so the inner late-
+        // merge applies zero new indices.  The wrapper must retain the live
+        // total instead of assigning that zero to completed_count.
+        assert!(session.resume(&root_frame, &[0]));
+        assert_eq!(session.completed_count, 1);
+        assert!(session.is_complete());
     }
 
     #[test]

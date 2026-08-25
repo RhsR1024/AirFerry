@@ -37,12 +37,26 @@ function read(rel) {
 /** Authoritative version from the workspace root Cargo.toml. */
 function cargoVersion() {
   const toml = read("Cargo.toml")
-  const m = toml.match(/^\s*version\s*=\s*"([^"]+)"\s*$/m)
-  if (!m) {
-    console.error("✗ Cargo.toml: no [workspace.package] version found")
+  const lines = toml.split(/\r?\n/)
+  let inWorkspacePackage = false
+  const versions = []
+  for (const line of lines) {
+    const section = /^\s*\[([^\]]+)]\s*$/.exec(line)
+    if (section) {
+      inWorkspacePackage = section[1] === "workspace.package"
+      continue
+    }
+    if (!inWorkspacePackage) continue
+    const match = /^\s*version\s*=\s*"([^"]+)"\s*$/.exec(line)
+    if (match) versions.push(match[1])
+  }
+  if (versions.length !== 1) {
+    console.error(
+      `✗ Cargo.toml: expected exactly one [workspace.package].version, found ${versions.length}`
+    )
     process.exit(1)
   }
-  return m[1]
+  return versions[0]
 }
 
 /**

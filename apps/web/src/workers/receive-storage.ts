@@ -18,6 +18,13 @@ export interface SyncHandleLike {
 export type ChunkStorage = "disk" | "memory"
 
 const MAX_MEMORY_FALLBACK_BYTES = 64 * 1024 * 1024
+/**
+ * In-process delivery timestamps for OPFS files backing lazy Blobs.  File
+ * lastModified is the last chunk-write time, which can be hours old for a
+ * resumed transfer that completed without writing anything new; the grace
+ * period must start when ownership is released to the UI instead.
+ */
+const releasedBackingAt = new Map<string, number>()
 
 export class ChunkStore {
   private memory = new Map<number, Uint8Array>()
@@ -71,6 +78,7 @@ export class ChunkStore {
     if (!dir || !transferIdHex) return
     try {
       const fileName = `af2-${transferIdHex}.partial`
+      if (create) releasedBackingAt.delete(fileName)
       this.opfsFile = create
         ? await dir.getFileHandle(fileName, { create: true })
         : await dir.getFileHandle(fileName)
@@ -243,6 +251,11 @@ export class ChunkStore {
     return this.completedIndices.has(index)
   }
 
+  /** True when this completion has a crash-resume journal-worthy OPFS copy. */
+  isDurable(index: number): boolean {
+    return this.diskIndices.has(index)
+  }
+
   get completedCount(): number {
     return this.completedIndices.size
   }
@@ -292,6 +305,9 @@ export class ChunkStore {
     this.completedIndices.clear()
     this.closeSyncHandle()
     this.preserveReleasedBacking = this.opfsFile !== null
+    if (this.preserveReleasedBacking && this.transferId) {
+      releasedBackingAt.set(`af2-${this.transferId}.partial`, Date.now())
+    }
   }
 
   async discard(): Promise<void> {
@@ -342,8 +358,9 @@ export class OpfsJournal {
       const w = await (this.journalFile as any).createWritable({ keepExistingData: false })
       await w.write(header)
       await w.close()
-    } catch {
+    } catch (err) {
       this.journalFile = null
+      throw new Error(`AF2_STORAGE_FATAL: 断点日志初始化失败: ${String(err)}`)
     }
   }
 
@@ -357,8 +374,9 @@ export class OpfsJournal {
     if (!dir || !transferIdHex) return
     try {
       this.journalFile = await dir.getFileHandle(`af2-${transferIdHex}.ledger.jsonl`)
-    } catch {
+    } catch (err) {
       this.journalFile = null
+      throw new Error(`AF2_STORAGE_FATAL: 无法打开断点日志: ${String(err)}`)
     }
   }
 
@@ -374,7 +392,14 @@ export class OpfsJournal {
     if (this.opfsDir && this.transferId) {
       try {
         await this.opfsDir.removeEntry(`af2-${this.transferId}.ledger.jsonl`)
-      } catch {}
+      } catch (err) {
+        // A missing file already satisfies discard.  Any other failure keeps
+        // ownership intact so reset/retry can attempt deletion again instead
+        // of leaving a valid ghost-resume journal behind.
+        if (!(err instanceof DOMException && err.name === "NotFoundError")) {
+          throw new Error(`AF2_STORAGE_FATAL: 删除断点日志失败: ${String(err)}`)
+        }
+      }
     }
     this.journalFile = null
     this.opfsDir = null
@@ -382,14 +407,20 @@ export class OpfsJournal {
   }
 
   private async append(record: { c: number } | { i: number }): Promise<void> {
-    if (!this.journalFile) return
+    if (!this.journalFile) {
+      throw new Error("AF2_STORAGE_FATAL: 断点日志尚未持久化")
+    }
+    let w: any = null
     try {
-      const w = await (this.journalFile as any).createWritable({ keepExistingData: true })
+      w = await (this.journalFile as any).createWritable({ keepExistingData: true })
       const size = (await this.journalFile.getFile()).size
       await w.seek(size)
       await w.write(JSON.stringify(record) + "\n")
       await w.close()
-    } catch {}
+    } catch (err) {
+      try { await w?.abort?.() } catch {}
+      throw new Error(`AF2_STORAGE_FATAL: 断点日志写入失败: ${String(err)}`)
+    }
   }
 
   static async loadMostRecent(dir: FileSystemDirectoryHandle | null): Promise<{
@@ -492,7 +523,7 @@ export async function sweepOrphanPartials(
     const ledgers = new Set<string>()
     const invalidLedgers: string[] = []
     const invalidLedgerTids = new Set<string>()
-    const partials: Array<{ name: string; mtime: number }> = []
+    const partials: Array<{ name: string; mtime: number; releasedAt?: number }> = []
     for await (const [name, handle] of (dir as any).entries()) {
       if (typeof name !== "string" || handle.kind !== "file") continue
       if (name.endsWith(".ledger.jsonl")) {
@@ -506,7 +537,7 @@ export async function sweepOrphanPartials(
       else if (name.startsWith("af2-") && name.endsWith(".partial")) {
         let mtime = 0
         try { mtime = (await handle.getFile()).lastModified || 0 } catch {}
-        partials.push({ name, mtime })
+        partials.push({ name, mtime, releasedAt: releasedBackingAt.get(name) })
       }
     }
     // Mutate the directory only after enumeration completes; browser OPFS
@@ -515,17 +546,19 @@ export async function sweepOrphanPartials(
       try { await dir.removeEntry(invalid) } catch {}
     }
     const now = Date.now()
-    for (const { name: partial, mtime } of partials) {
+    for (const { name: partial, mtime, releasedAt } of partials) {
       if (ledgers.has(partial.replace(/\.partial$/, ".ledger.jsonl"))) continue
       const tid = partial.replace(/^af2-/, "").replace(/\.partial$/, "")
       // A corrupt journal can never resume, so its backing spill is garbage
       // immediately. A ledger-less partial may instead back a just-delivered
       // lazy Blob; give browser downloads time to finish before unlinking it.
-      if (!invalidLedgerTids.has(tid) && orphanGraceMs > 0 && now - mtime < orphanGraceMs) {
+      const graceStartedAt = releasedAt ?? mtime
+      if (!invalidLedgerTids.has(tid) && orphanGraceMs > 0 && now - graceStartedAt < orphanGraceMs) {
         continue
       }
       try {
         await dir.removeEntry(partial)
+        releasedBackingAt.delete(partial)
       } catch {}
     }
   } catch {}

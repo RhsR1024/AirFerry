@@ -66,7 +66,11 @@ fn lzma2_dict_from_prop(bits: u8) -> u64 {
 /// deviates from that minimal legal layout is rejected — the decoder stack
 /// must never guess.
 pub fn xz_declared_dict_size(data: &[u8]) -> std::result::Result<u64, String> {
-    if data.len() < 12 || data[..6] != [0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00] {
+    // The first Block Header Size byte is at offset 12, immediately after the
+    // 12-byte Stream Header.  Requiring only 12 bytes and then indexing
+    // `data[12]` turns a CRC-valid hostile short chunk into a process-aborting
+    // panic in release builds (`panic = "abort"`).
+    if data.len() < 13 || data[..6] != [0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00] {
         return Err("xz: missing stream header magic".into());
     }
     let header_size = (usize::from(data[12]) + 1) * 4;
@@ -135,7 +139,7 @@ fn zstd_window_log_ok(data: &[u8]) -> bool {
     }
     let fhd = data[4];
     let single_segment = fhd & 0x20 != 0;
-    let mut pos = 5 + [0usize, 1, 2, 4][usize::from(fhd & 0x03)]; // dictID
+    let dict_id_size = [0usize, 1, 2, 4][usize::from(fhd & 0x03)];
     let fcs_size = match fhd >> 6 {
         1 => 2,
         2 => 4,
@@ -143,12 +147,35 @@ fn zstd_window_log_ok(data: &[u8]) -> bool {
         _ if single_segment => 1,
         _ => 0,
     };
-    pos += fcs_size;
+
+    // Zstandard frame-header order is FHD, optional Window Descriptor,
+    // optional Dictionary ID, then optional Frame Content Size.  In
+    // particular, the Window Descriptor is always byte 5 for non-single
+    // frames; skipping the later optional fields first checks an attacker-
+    // controlled dictionary/FCS byte instead and bypasses the window clamp.
+    let mut pos = 5;
+    let window_descriptor = if single_segment {
+        None
+    } else {
+        let wd = data.get(pos).copied();
+        pos += 1;
+        wd
+    };
+    let header_end = match pos
+        .checked_add(dict_id_size)
+        .and_then(|p| p.checked_add(fcs_size))
+    {
+        Some(p) if p <= data.len() => p,
+        _ => return false,
+    };
+    // The decoder validates optional field values; this preflight only needs
+    // to prove that the complete declared frame header is present.
+    debug_assert!(header_end <= data.len());
     if single_segment {
         return true;
     }
-    let wd = match data.get(pos) {
-        Some(&b) => b,
+    let wd = match window_descriptor {
+        Some(b) => b,
         None => return false,
     };
     let exp = u32::from(wd >> 3);
@@ -1026,6 +1053,14 @@ mod tests {
     }
 
     #[test]
+    fn xz_header_parser_rejects_exact_stream_header_without_panicking() {
+        let mut truncated = [0u8; 12];
+        truncated[..6].copy_from_slice(&[0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00]);
+        assert!(xz_declared_dict_size(&truncated).is_err());
+        assert!(decompress_with_limit(&truncated, COMPRESSION_XZ, 1024).is_err());
+    }
+
+    #[test]
     fn zstd_window_log_precheck_matches_clamp() {
         // The shared header pre-check (used by the wasm decoder) agrees with
         // the native clamp on both a hostile oversized window and a normal one.
@@ -1034,6 +1069,24 @@ mod tests {
         let ok: Vec<u8> = (0..20_000).map(|i| (i & 0xff) as u8).collect();
         let z = compress(&ok, DEFAULT_LEVEL).unwrap();
         assert!(zstd_window_log_ok(&z));
+
+        // Dictionary-ID flag with an encoded zero ID is legal and does not
+        // require an external dictionary.  The old parser skipped that byte
+        // before looking for the Window Descriptor and therefore accepted the
+        // hostile 2^27 window below because dict-id byte 0 looked harmless.
+        let hostile_with_optional_field = [
+            0x28, 0xB5, 0x2F, 0xFD, // magic
+            0x01, // FHD: non-single, one-byte Dictionary ID
+            0x88, // Window Descriptor: exponent 17 => windowLog 27
+            0x00, // Dictionary ID zero
+            0x21, 0x00, 0x00, // last raw block, four bytes
+            b'A', b'B', b'C', b'D',
+        ];
+        assert!(!zstd_window_log_ok(&hostile_with_optional_field));
+        assert_eq!(
+            zstd::decode_all(&hostile_with_optional_field[..]).unwrap(),
+            b"ABCD"
+        );
     }
 
     /// Verify that the pure-Rust wasm32 compression codecs (zrip and lzma-rust2)

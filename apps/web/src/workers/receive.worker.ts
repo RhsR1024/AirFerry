@@ -212,9 +212,10 @@ async function reverifyResumedChunks(meta: MetaInfo): Promise<void> {
     const chunkBytes = chunkStore.readChunk(idx, meta.chunkRawSize, meta.totalRawSize)
     pendingReverify.delete(idx)
     if (!chunkBytes || !session.verify_chunk(idx, chunkBytes)) {
+      const durable = chunkStore.isDurable(idx)
       session.invalidate_chunk(idx)
       chunkStore.invalidate(idx)
-      await journal.invalidate(idx)
+      if (durable) await journal.invalidate(idx)
     }
   }
   if (pendingReverify.size === 0) pendingReverify = null
@@ -233,9 +234,10 @@ async function reverifyPreManifestChunks(meta: MetaInfo): Promise<void> {
     if (!chunkStore.has(idx)) continue
     const chunkBytes = chunkStore.readChunk(idx, meta.chunkRawSize, meta.totalRawSize)
     if (chunkBytes && session.verify_chunk(idx, chunkBytes)) continue
+    const durable = chunkStore.isDurable(idx)
     session.invalidate_chunk(idx)
     chunkStore.invalidate(idx)
-    await journal.invalidate(idx)
+    if (durable) await journal.invalidate(idx)
   }
   if (preManifestChunks.size === 0) preManifestChunks = null
 }
@@ -571,9 +573,10 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
           // three completion ledgers and resume scanning so the sender can
           // re-supply only the affected chunks. Do not tear down OPFS or the
           // good chunks already received.
+          const durable = chunkStore.isDurable(i)
           session.invalidate_chunk(i)
           chunkStore.invalidate(i)
-          await journal.invalidate(i)
+          if (durable) await journal.invalidate(i)
           badChunks.push(i)
           finalVerifyUsable = false
           continue

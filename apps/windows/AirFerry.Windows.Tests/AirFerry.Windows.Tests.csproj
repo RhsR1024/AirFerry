@@ -30,6 +30,7 @@
     <Compile Include="..\AirFerry.Windows\Scan\Crc32.cs" Link="Scan\Crc32.cs" />
     <Compile Include="..\AirFerry.Windows\Scan\ReceiverSession.cs" Link="Scan\ReceiverSession.cs" />
     <Compile Include="..\AirFerry.Windows\Scan\Af2LedgerStore.cs" Link="Scan\Af2LedgerStore.cs" />
+    <Compile Include="..\AirFerry.Windows\Scan\ChunkSpillStore.cs" Link="Scan\ChunkSpillStore.cs" />
     <Compile Include="..\AirFerry.Windows\Scan\ProgressSnapshot.cs" Link="Scan\ProgressSnapshot.cs" />
     <Compile Include="..\AirFerry.Windows\Scan\PreviewFrame.cs" Link="Scan\PreviewFrame.cs" />
     <Compile Include="..\AirFerry.Windows\Scan\ZxingDecoder.cs" Link="Scan\ZxingDecoder.cs" />

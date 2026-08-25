@@ -19,6 +19,7 @@ class FakeFileHandle {
     /** Simulates a stale/short getFile() snapshot (size guard must trip). */
     this.getFileSize = null
     this.getFileFailsWhileSyncOpen = false
+    this.failWritableWrite = false
   }
 
   async getFile() {
@@ -84,6 +85,7 @@ class FakeFileHandle {
         position = next
       },
       async write(value) {
+        if (file.failWritableWrite) throw new Error("simulated journal write failure")
         const source = typeof value === "string" ? encoder.encode(value) : new Uint8Array(value)
         const required = position + source.byteLength
         if (required > working.byteLength) {
@@ -105,6 +107,7 @@ class FakeFileHandle {
 class FakeDirectoryHandle {
   constructor() {
     this.files = new Map()
+    this.failRemoveNames = new Set()
   }
 
   async getFileHandle(name, options = {}) {
@@ -117,6 +120,7 @@ class FakeDirectoryHandle {
   }
 
   async removeEntry(name) {
+    if (this.failRemoveNames.has(name)) throw new Error("simulated remove failure")
     if (!this.files.delete(name)) throw new Error("not found")
   }
 
@@ -277,6 +281,19 @@ test("release + discard keep a delivered lazy Blob backing until orphan sweep gr
   assert.equal(dir.files.has("af2-keepalive.partial"), false)
 })
 
+test("released backing grace starts at release, not an old chunk-write mtime", async () => {
+  const dir = new FakeDirectoryHandle()
+  const store = new ChunkStore()
+  await store.init(dir, "old-resume")
+  assert.equal(store.writeChunk(0, 4, Uint8Array.from([1, 2, 3, 4])), "disk")
+  dir.files.get("af2-old-resume.partial").lastModified = Date.now() - 24 * 60 * 60 * 1000
+
+  store.release()
+  await store.discard()
+  await sweepOrphanPartials(dir, 60_000)
+  assert.equal(dir.files.has("af2-old-resume.partial"), true)
+})
+
 test("sweepOrphanPartials removes ledger-less partials and keeps journaled ones", async () => {
   const dir = new FakeDirectoryHandle()
   // A journaled (in-progress-or-resumable) transfer: partial + ledger.
@@ -361,6 +378,32 @@ test("OpfsJournal init is idempotent and keeps all committed chunk bits", async 
   assert.equal(loaded.transferIdHex, "cafe")
   assert.deepEqual(loaded.completed, [0, 1])
   assert.deepEqual(Array.from(loaded.rootFrameBytes), [1, 2, 3, 4])
+})
+
+test("OpfsJournal commit propagates failure without recording the bit", async () => {
+  const dir = new FakeDirectoryHandle()
+  const journal = new OpfsJournal()
+  await journal.init(dir, "writefail", 4, "01020304")
+  dir.files.get("af2-writefail.ledger.jsonl").failWritableWrite = true
+
+  await assert.rejects(() => journal.commit(7), /AF2_STORAGE_FATAL/)
+  dir.files.get("af2-writefail.ledger.jsonl").failWritableWrite = false
+  const loaded = await OpfsJournal.loadMostRecent(dir)
+  assert.deepEqual(loaded.completed, [])
+})
+
+test("OpfsJournal retains ownership and retries a failed discard", async () => {
+  const dir = new FakeDirectoryHandle()
+  const journal = new OpfsJournal()
+  const name = "af2-removefail.ledger.jsonl"
+  await journal.init(dir, "removefail", 4, "01020304")
+  dir.failRemoveNames.add(name)
+
+  await assert.rejects(() => journal.discard(), /AF2_STORAGE_FATAL/)
+  assert.equal(dir.files.has(name), true)
+  dir.failRemoveNames.delete(name)
+  await journal.discard()
+  assert.equal(dir.files.has(name), false)
 })
 
 test("OpfsJournal openExisting preserves root and prior commits across a second crash", async () => {

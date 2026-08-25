@@ -239,8 +239,9 @@ impl Af2Sender {
 
     /// [`Self::from_manifest`] plus host pre-encoded chunks. Validation is
     /// fail-closed on the §10.1 invariant: an `Encoded` chunk must carry a
-    /// Zstd/Xz tag and be strictly smaller than its canonical raw slice —
-    /// a host bug can never put an illegal wire object on the air.
+    /// Zstd/Xz tag, be strictly smaller, and bounded-decode byte-for-byte to
+    /// its canonical raw slice — a host bug cannot put an unusable object on
+    /// the air.
     pub fn from_manifest_with_preencoded(
         manifest: Manifest,
         items: Vec<(u8, String, Vec<u8>)>,
@@ -472,6 +473,33 @@ impl Af2Sender {
                     return Err(SenderError::Config(format!(
                         "preencoded chunk {index} violates strictly-smaller ({} >= {raw_len})",
                         bytes.len()
+                    )));
+                }
+                let start_usize = usize::try_from(start).map_err(|_| {
+                    SenderError::Config(format!(
+                        "preencoded chunk {index} offset does not fit this host"
+                    ))
+                })?;
+                let end = start_usize.checked_add(raw_len).ok_or_else(|| {
+                    SenderError::Config(format!(
+                        "preencoded chunk {index} canonical range overflow"
+                    ))
+                })?;
+                let raw = stream.get(start_usize..end).ok_or_else(|| {
+                    SenderError::Config(format!(
+                        "preencoded chunk {index} canonical range is unavailable"
+                    ))
+                })?;
+                let decoded =
+                    crate::chunk::decode_chunk(*codec, bytes, raw_len, manifest.chunk_raw_size)
+                        .map_err(|e| {
+                            SenderError::Config(format!(
+                                "preencoded chunk {index} failed bounded decode: {e}"
+                            ))
+                        })?;
+                if decoded.as_slice() != raw {
+                    return Err(SenderError::Config(format!(
+                        "preencoded chunk {index} does not decode to its canonical raw slice"
                     )));
                 }
             }
@@ -1314,9 +1342,18 @@ pub fn plan_chunks(
         .map(|(i, (_, path, size))| (path.nfc().collect::<String>(), i as u32, *size))
         .collect();
     ordered.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-    let total: u64 = ordered.iter().map(|(_, _, s)| s).sum();
+    let total = ordered
+        .iter()
+        .try_fold(0u64, |sum, (_, _, size)| sum.checked_add(*size))
+        .ok_or_else(|| SenderError::Config("canonical stream size overflow".into()))?;
     if total == 0 {
         return Err(SenderError::EmptyContent);
+    }
+    if total > crate::root::MAX_TOTAL_RAW_SIZE {
+        return Err(SenderError::Config(format!(
+            "canonical stream size {total} exceeds protocol limit {}",
+            crate::root::MAX_TOTAL_RAW_SIZE
+        )));
     }
     let chunk = u64::from(chunk_raw_size);
     let mut out: Vec<Vec<ChunkSegment>> = Vec::new();
@@ -2418,6 +2455,22 @@ mod tests {
             )],
         );
         assert!(err.err().unwrap().to_string().contains("strictly-smaller"));
+        // A valid, strictly-smaller encoding of DIFFERENT bytes must also be
+        // rejected at build time instead of producing a broadcast every
+        // receiver rejects at the Manifest-bound raw-hash gate.
+        let wrong_raw = vec![0x22u8; 4096];
+        let (wrong_codec, wrong_encoded) = crate::chunk::encode_chunk(&wrong_raw);
+        assert!(matches!(wrong_codec, CODEC_ZSTD | CODEC_XZ));
+        let err = Af2Sender::new_with_preencoded(
+            items.clone(),
+            config.clone(),
+            vec![(0, PreencodedChunk::Encoded(wrong_codec, wrong_encoded))],
+        );
+        assert!(err
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("canonical raw slice"));
         // RAW bytes must use the marker, not carried bytes.
         let err = Af2Sender::new_with_preencoded(
             items.clone(),
@@ -2491,5 +2544,27 @@ mod tests {
             ),
             Err(SenderError::EmptyContent)
         ));
+    }
+
+    #[test]
+    fn plan_chunks_rejects_aggregate_overflow_and_protocol_oversize() {
+        let overflow = vec![
+            (KIND_FILE, "a".to_string(), u64::MAX),
+            (KIND_FILE, "b".to_string(), 1),
+        ];
+        assert!(plan_chunks(&overflow, 1 << 20)
+            .unwrap_err()
+            .to_string()
+            .contains("overflow"));
+
+        let oversized = vec![(
+            KIND_FILE,
+            "large".to_string(),
+            crate::root::MAX_TOTAL_RAW_SIZE + 1,
+        )];
+        assert!(plan_chunks(&oversized, 1 << 20)
+            .unwrap_err()
+            .to_string()
+            .contains("protocol limit"));
     }
 }

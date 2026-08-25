@@ -199,6 +199,17 @@ public sealed class ChunkSpillStore : IDisposable
     }
 
     /// <summary>
+    /// Close this process's handle while preserving the durable backing for a
+    /// later §12 resume (user pause, device loss, or application shutdown).
+    /// </summary>
+    public void ClosePreservingBacking()
+    {
+        try { _stream?.Dispose(); } catch (IOException) { }
+        _stream = null;
+        _knownChunks.Clear();
+    }
+
+    /// <summary>
     /// Read one canonical-stream range (§12 reopen re-verification reads
     /// individual chunks back). Returns null when the spill is shorter than
     /// the requested range end.

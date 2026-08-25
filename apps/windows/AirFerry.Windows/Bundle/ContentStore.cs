@@ -104,35 +104,52 @@ public static class ContentStore
             // empty history would make the next receive overwrite every logical
             // entry and orphan otherwise-valid content-addressed blobs.
             var all = LoadIndex();
+            var priorHashes = all.Select(e => e.Hash).ToHashSet(StringComparer.Ordinal);
             Directory.CreateDirectory(RootDir);
             long createdAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             var results = new List<PutResult>(requests.Count);
-            foreach (PutBytesRequest request in requests)
+            var createdBlobs = new List<string>();
+            try
             {
-                string hash = Sha256Hex(request.Bytes);
-                string path = BlobPath(hash);
-                bool deduped = FileMatchesHash(path, hash, request.Bytes.LongLength);
-                if (!deduped)
+                foreach (PutBytesRequest request in requests)
                 {
-                    WriteAllBytesAtomic(path, request.Bytes);
+                    string hash = Sha256Hex(request.Bytes);
+                    string path = BlobPath(hash);
+                    bool deduped = FileMatchesHash(path, hash, request.Bytes.LongLength);
+                    if (!deduped)
+                    {
+                        WriteAllBytesAtomic(path, request.Bytes);
+                        createdBlobs.Add(path);
+                    }
+                    var entry = new Entry(
+                        Id: Guid.NewGuid().ToString("N"),
+                        Name: request.BundleId is not null
+                            ? FileNameUtil.SanitizeRelativePath(request.DisplayName)
+                            : FileNameUtil.Sanitize(request.DisplayName),
+                        Hash: hash,
+                        Size: request.Bytes.LongLength,
+                        CrcHex: request.CrcHex,
+                        CrcUnknown: request.CrcUnknown,
+                        Kind: request.Kind,
+                        CreatedAt: createdAt,
+                        BundleId: request.BundleId,
+                        BundleTitle: request.BundleTitle);
+                    all.Add(entry);
+                    results.Add(new PutResult(entry, path, deduped));
                 }
-                var entry = new Entry(
-                    Id: Guid.NewGuid().ToString("N"),
-                    Name: request.BundleId is not null
-                        ? FileNameUtil.SanitizeRelativePath(request.DisplayName)
-                        : FileNameUtil.Sanitize(request.DisplayName),
-                    Hash: hash,
-                    Size: request.Bytes.LongLength,
-                    CrcHex: request.CrcHex,
-                    CrcUnknown: request.CrcUnknown,
-                    Kind: request.Kind,
-                    CreatedAt: createdAt,
-                    BundleId: request.BundleId,
-                    BundleTitle: request.BundleTitle);
-                all.Add(entry);
-                results.Add(new PutResult(entry, path, deduped));
+                SaveIndex(all);
             }
-            SaveIndex(all);
+            catch
+            {
+                foreach (string blob in createdBlobs)
+                {
+                    if (!priorHashes.Contains(Path.GetFileName(blob)))
+                    {
+                        try { File.Delete(blob); } catch { }
+                    }
+                }
+                throw;
+            }
             return results;
         }
     }

@@ -319,7 +319,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     [RelayCommand]
     public void StopScan()
     {
-        StopScanCore(expectedEpoch: null);
+        StopScanCore(expectedEpoch: null, preserveResume: true);
     }
 
     /// <param name="expectedEpoch">
@@ -329,13 +329,14 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     /// would silently kill the fresh pipeline. <see langword="null"/> = stop
     /// unconditionally (user-initiated). Returns true when the stop ran.
     /// </param>
-    private bool StopScanCore(long? expectedEpoch)
+    private bool StopScanCore(long? expectedEpoch, bool preserveResume)
     {
         Thread? producer;
         QrDecodePool? pool;
         IFrameSource? capture;
         ReceiverSession? session;
         ChunkSpillStore? spill;
+        Af2LedgerStore? ledgerToDiscard;
         Task<RecoveryOutcome>? recoveryTask;
         Task cleanup;
         lock (_lifecycleGate)
@@ -353,6 +354,23 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             if (_capture is null && _pool is null && _session is null &&
                 !_deferredCleanupTask.IsCompleted)
             {
+                if (!preserveResume)
+                {
+                    // Reset can arrive while a slow camera teardown still owns
+                    // the detached spill. Delete the resume pair only after
+                    // that teardown has closed its handle.
+                    Af2LedgerStore? delayedLedger = _af2Ledger;
+                    _af2Ledger = null;
+                    _pendingReverify = null;
+                    Task delayedCleanup = _deferredCleanupTask;
+                    _ = delayedCleanup.ContinueWith(_ =>
+                    {
+                        delayedLedger?.DiscardTransferFiles();
+                        Af2LedgerStore.SweepOrphanPartials(TempDir);
+                    }, CancellationToken.None,
+                        TaskContinuationOptions.ExecuteSynchronously,
+                        TaskScheduler.Default);
+                }
                 StatusText = "摄像头响应缓慢，正在后台安全释放…";
                 return true;
             }
@@ -366,9 +384,12 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             _session = null;
             spill = _chunkSpill;
             _chunkSpill = null;
+            ledgerToDiscard = preserveResume ? null : _af2Ledger;
+            if (!preserveResume) _af2Ledger = null;
             recoveryTask = _recoveryCoreTask;
             if (producer is null && pool is null && capture is null &&
-                session is null && recoveryTask is null)
+                session is null && spill is null && ledgerToDiscard is null &&
+                recoveryTask is null)
             {
                 cleanup = Task.CompletedTask;
             }
@@ -378,7 +399,8 @@ public partial class ScanViewModel : ObservableObject, IDisposable
                 // gate. A simultaneous StopScan then observes it and cannot
                 // detach/dispose a second copy of this pipeline.
                 cleanup = Task.Run(() => CleanupDetachedPipeline(
-                    producer, pool, capture, session, spill, recoveryTask));
+                    producer, pool, capture, session, spill, ledgerToDiscard,
+                    preserveResume, recoveryTask));
                 _deferredCleanupTask = cleanup;
             }
         }
@@ -442,6 +464,8 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         IFrameSource? capture,
         ReceiverSession? session,
         ChunkSpillStore? spill,
+        Af2LedgerStore? ledgerToDiscard,
+        bool preserveResume,
         Task<RecoveryOutcome>? recoveryTask)
     {
         // Producer owns ReadGray/SnapshotBgr. It must exit before capture.Dispose.
@@ -476,7 +500,13 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         {
             try
             {
-                spill?.Discard();
+                if (preserveResume)
+                    spill?.ClosePreservingBacking();
+                else
+                {
+                    spill?.Discard();
+                    ledgerToDiscard?.DiscardTransferFiles();
+                }
             }
             finally
             {
@@ -510,7 +540,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     [RelayCommand]
     public void ResetSession()
     {
-        StopScan();
+        StopScanCore(expectedEpoch: null, preserveResume: false);
         IsComplete = false;
         Progress = 0;
         ReceivedSymbolsText = "0";
@@ -643,7 +673,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             bool ran = false;
             try
             {
-                ran = StopScanCore(epochAtLoss);
+                ran = StopScanCore(epochAtLoss, preserveResume: true);
             }
             catch
             {
@@ -807,21 +837,16 @@ public partial class ScanViewModel : ObservableObject, IDisposable
                 ReceiverSession.Snapshot snap = session.GetSnapshot();
                 ChunkSpillStore spill = _chunkSpill ??= new ChunkSpillStore(
                     TempDir, snap.TransferIdHex);
-                int completedIndex = -1;
                 session.DrainLastChunk((index, chunkRawSize, bytes) =>
                 {
                     spill.Write(index, chunkRawSize, bytes);
-                    completedIndex = index;
-                });
-                // §12 commit order: the chunk bytes were pwritten + flushed
-                // into the spill inside DrainLastChunk; only now may the
-                // ledger journal record the bit.
-                if (completedIndex >= 0)
-                {
+                    // Commit while the native chunk is still resident.
+                    // DrainLastChunk evicts only after this callback returns,
+                    // so a journal failure leaves a retryable in-memory copy.
                     Af2LedgerStore ledger = _af2Ledger ??= Af2LedgerStore.Create(
                         TempDir, snap.TransferIdHex, (int)snap.ChunkRawSize, snap.RootFrameBytes);
-                    ledger.Commit(completedIndex);
-                }
+                    ledger.Commit(index);
+                });
             }
             catch (Exception ex)
             {

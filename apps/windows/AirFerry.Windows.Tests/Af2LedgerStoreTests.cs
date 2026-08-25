@@ -171,6 +171,73 @@ public class Af2LedgerStoreTests
     }
 
     [Fact]
+    public void InvalidHexNewestJournalFallsBackToOlderValidOne()
+    {
+        string dir = TempRoot();
+        try
+        {
+            var old = Af2LedgerStore.Create(dir, "tid-old", 8192, RootFrame);
+            old.Commit(1);
+            File.SetLastWriteTimeUtc(Path.Combine(dir, "af2-tid-old.ledger.jsonl"),
+                DateTime.UtcNow.AddMinutes(-2));
+            string invalid = Path.Combine(dir, "af2-tid-new.ledger.jsonl");
+            File.WriteAllText(invalid,
+                "{\"v\":1,\"tid\":\"tid-new\",\"crs\":8192,\"root\":\"zz\"}\n");
+            File.SetLastWriteTimeUtc(invalid, DateTime.UtcNow);
+
+            var loaded = Af2LedgerStore.LoadMostRecent(dir);
+            Assert.NotNull(loaded);
+            Assert.Equal("tid-old", loaded!.TransferIdHex);
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void FailedCommitDoesNotAdvanceInMemoryLedger()
+    {
+        string dir = TempRoot();
+        try
+        {
+            var store = Af2LedgerStore.Create(dir, "tid-fail", 8192, RootFrame);
+            string journal = Path.Combine(dir, "af2-tid-fail.ledger.jsonl");
+            File.Delete(journal);
+            Directory.CreateDirectory(journal);
+
+            Assert.NotNull(Record.Exception(() => store.Commit(7)));
+            Assert.Empty(store.CompletedIndices);
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void DiscardTransferFilesRemovesJournalAndSpillTogether()
+    {
+        string dir = TempRoot();
+        try
+        {
+            var store = Af2LedgerStore.Create(dir, "tid-reset", 8192, RootFrame);
+            string journal = Path.Combine(dir, "af2-tid-reset.ledger.jsonl");
+            string spill = Path.Combine(dir, "af2-tid-reset.partial");
+            File.WriteAllBytes(spill, [1, 2, 3]);
+
+            store.DiscardTransferFiles();
+
+            Assert.False(File.Exists(journal));
+            Assert.False(File.Exists(spill));
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
     public void SweepOrphanPartialsKeepsOnlyValidJournalBackings()
     {
         string dir = TempRoot();
