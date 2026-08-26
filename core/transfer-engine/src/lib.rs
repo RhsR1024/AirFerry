@@ -11,10 +11,13 @@
 pub mod ingest_status;
 pub mod progress;
 pub mod receiver;
+pub mod sender_host;
 pub mod time;
 
 #[cfg(all(feature = "jni", target_os = "android"))]
 pub mod jni;
+#[cfg(all(feature = "jni", target_os = "android"))]
+pub mod jni_sender;
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
 pub mod wasm;
 #[cfg(feature = "cffi")]

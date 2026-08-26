@@ -94,3 +94,6 @@ release/
 # Local HTTPS self-signed certs (contain private keys; used by serve-https.mjs
 # for LAN receiver testing — never commit)
 apps/web/.cert/
+
+# mimosa 安全扫描插件的本地状态目录
+.mimosa/

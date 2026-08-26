@@ -2,9 +2,11 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- Receive needs a camera, but the sender mode must stay installable on
+         camera-less devices; ScanActivity still requests CAMERA at runtime. -->
     <uses-feature
         android:name="android.hardware.camera.any"
-        android:required="true" />
+        android:required="false" />
 
     <application
         android:name=".AirFerryApp"
@@ -28,6 +30,13 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <activity
+            android:name=".ui.SendActivity"
+            android:exported="false"
+            android:parentActivityName=".ui.ScanActivity"
+            android:screenOrientation="portrait"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
 
         <activity
             android:name=".ui.ReceiveDetailActivity"

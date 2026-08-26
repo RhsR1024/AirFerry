@@ -35,12 +35,15 @@ use jni::JNIEnv;
 ///      `receiverSnapshotJson` (`ReceiverSnapshotV2`); old hosts calling the
 ///      removed symbols get an `UnsatisfiedLinkError` instead of silent zeros.
 /// - 3: bounded-memory incremental §13 final verification was added.
+/// - 4: sender-side bindings added (`senderBuildStreamed` / `senderNextQr` /
+///      `senderStageChunk` + prep helpers in `jni_sender.rs`); receiver API
+///      unchanged.
 ///
 /// The host (`NativeBridge.nativeAbiVersion`) handshakes on startup: if the
 /// loaded `.so` predates this symbol (`UnsatisfiedLinkError`) or reports a
 /// lower version, the app refuses to run as a receiver instead of silently
 /// "staying synchronising" on >32 MiB transfers with a stale library.
-pub const AIRFERRY_NATIVE_ABI_VERSION: jint = 3;
+pub const AIRFERRY_NATIVE_ABI_VERSION: jint = 4;
 
 /// Report the native ABI / protocol capability version. Returns
 /// [`AIRFERRY_NATIVE_ABI_VERSION`].

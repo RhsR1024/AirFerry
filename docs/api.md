@@ -205,7 +205,7 @@ class ReceiverSessionWasm {
 
 ```kotlin
 object NativeBridge {
-    const val NATIVE_ABI_VERSION = 3   // 3: 增量式 §13 终验（receiverFinalVerify*）；2: 快照化 FFI
+    const val NATIVE_ABI_VERSION = 4   // 4: 发送端绑定（sender*/blake3*/encodeChunkBalanced）；3: 增量式 §13 终验；2: 快照化 FFI
 
     /** 启动期握手：断言 nativeAbiVersion() >= NATIVE_ABI_VERSION，否则进入 ErrorScreen。 */
     external fun nativeAbiVersion(): Int
@@ -238,6 +238,40 @@ object NativeBridge {
     external fun receiverInvalidateChunk(handle: Long, index: Int): Boolean
 
     external fun receiverDestroy(handle: Long)
+
+    // ===== 发送端（ABI 4；镜像 SenderSessionWasm，宿主逻辑在 sender_host.rs） =====
+
+    /** 分块规划（不读内容）：并行数组描述条目；返回 {"chunks":[[item,start,len,...],...]} */
+    external fun senderPlanChunks(
+        kinds: ByteArray, paths: Array<String>, sizes: LongArray, chunkRawSize: Int
+    ): String
+
+    /** 流式构建（有界内存）：contentHashes/chunkHashes 为 32×N 拼接的 BLAKE3 表 */
+    external fun senderBuildStreamed(
+        kinds: ByteArray, paths: Array<String>, sizes: LongArray,
+        contentHashes: ByteArray, chunkHashes: ByteArray,
+        symbolSize: Int, chunkRawSize: Int, redundancyPct: Int
+    ): Long
+
+    /** 拉下一批 QR：packed `u32le count` + 每 tile `u32le side` + side² 0/1 字节；
+     *  未暂存时抛 IllegalStateException("AF2_CHUNK_NOT_STAGED:<index>")，暂存后重试（无副作用） */
+    external fun senderNextQr(handle: Long, count: Int): ByteArray
+
+    /** 暂存一个已编码 chunk（codec 0=RAW/1=Zstd/2=Xz；rawHash 为 RAW 的 BLAKE3，空数组=核内哈希） */
+    external fun senderStageChunk(handle: Long, index: Int, codecId: Int, bytes: ByteArray, rawHash: ByteArray): Boolean
+
+    external fun senderCurrentChunkIndex(handle: Long): Int  // 播放位置提示，bootstrap 期 -1
+    external fun senderEpoch(handle: Long): Int              // 1-based 广播轮次
+    external fun senderIsStaged(handle: Long, index: Int): Boolean
+    external fun senderStatsJson(handle: Long): String?      // frames/fps/throughput_bps/bytes/elapsed_ms
+    external fun senderTransferIdHex(handle: Long): String?
+    external fun senderDestroy(handle: Long)
+
+    /** 准备期辅助：流式 BLAKE3（digest 即销毁句柄）；均衡压缩（返回 1 字节 codec 前缀 + 数据） */
+    external fun blake3Create(): Long
+    external fun blake3Update(handle: Long, bytes: ByteArray)
+    external fun blake3Digest(handle: Long): ByteArray
+    external fun encodeChunkBalanced(raw: ByteArray, channelBps: Long, forceFull: Boolean): ByteArray
 }
 
 object ZxingDecoder {
@@ -247,7 +281,13 @@ object ZxingDecoder {
 }
 ```
 
-> **线程模型**：`receiverIngest`/`receiverAssembleBytes` 等操作同一原生句柄，**非线程安全**。Android 侧用一把 ingest 锁串行化所有调用，ZXing 解码则在多个 worker 上并行（见 [architecture.md](architecture.md#数据流)）。
+> **线程模型**：`receiverIngest`/`receiverAssembleBytes` 与发送端 `senderNextQr`/`senderStageChunk` 等操作同一原生句柄，**非线程安全**。Android 侧接收用一把 ingest 锁串行化，发送用 `SenderSessionManager` 的一把锁串行化渲染循环与预取协程；ZXing 解码在多个 worker 上并行（见 [architecture.md](architecture.md#数据流)）。
+
+> **发送端管线**（`apps/scanner/app/src/main/java/com/airferry/app/send/`）：
+> `prepare`（plan_chunks → 按 chunk 顺序单遍流式 BLAKE3）→ `senderBuildStreamed` →
+> 播放循环 `senderNextQr` + IO 协程 `prefetchNextChunk` 预取下一块（对标 web 的
+> `compress.worker.ts` + `chunk-stager.ts`）。发送 QR 的矩阵由 Rust 渲染，Kotlin 只收到
+> 0/1 模块位图并最近邻放大上屏——原始 AF2 帧字节不过 JNI 热路径。
 
 > **快照消费模式**：UI 以约 7Hz 拉取 `receiverSnapshotJson`（原子、单 JSON）；恢复期按
 > `entries` + `receiverAssembleChunk` 逐 chunk 落盘，不再解析字节级容器。

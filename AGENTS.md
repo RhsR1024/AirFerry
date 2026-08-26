@@ -40,7 +40,7 @@ AirFerry/
 │   └── testdata/               # 跨端 golden fixtures（线格式一致性断言）
 ├── apps/
 │   ├── web/                    # 前端（浏览器扩展 + Web 发送/接收端 + 单文件版，Vite + React + TS，单一 package）
-│   ├── scanner/                # Android 扫码端 (Kotlin + CameraX + ZXing-C++)
+│   ├── scanner/                # Android 端（接收扫码 + 发送 QR 播放，Kotlin + CameraX + ZXing-C++）
 │   └── windows/                # Windows 扫码端 (C# WPF + HandyControl + OpenCvSharp)
 ├── docs/                       # 契约与构建规范（唯一线协议源 docs/SPEC.md）
 ├── scripts/                    # 构建、门禁与发布辅助脚本

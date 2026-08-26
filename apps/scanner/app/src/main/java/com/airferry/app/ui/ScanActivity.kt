@@ -27,6 +27,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -351,6 +352,9 @@ class ScanActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceEvenly
                 ) {
+                    ActionButton(Icons.AutoMirrored.Filled.Send, "发送") {
+                        startActivity(Intent(this@ScanActivity, SendActivity::class.java))
+                    }
                     ActionButton(Icons.Default.Folder, "文件") {
                         startActivity(Intent(this@ScanActivity, FileListActivity::class.java))
                     }
