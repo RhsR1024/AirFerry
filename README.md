@@ -1,170 +1,175 @@
 # AirFerry
 
-> 完全离线的光学文件传输系统 · Fully Offline Optical File Transfer
+**English** | [简体中文](docs/README.zh-CN.md)
 
-通过**屏幕二维码视频流 + 手机摄像头扫描**完成文件传输，不依赖互联网、局域网、蓝牙、USB、NFC 等任何通信通道。适用于 Air-Gap（隔离网络）场景。
+> Fully Offline Optical File Transfer
 
-> 🤖 **AI 代理/新开发者**：先读 [AGENTS.md](AGENTS.md)（构建命令、代码导航、调试速查、文档与代码偏差清单）。跨端线格式的位级权威定义见 [docs/SPEC.md](docs/SPEC.md)。
+Transfer files through **screen-displayed QR video streams and camera scanning**—without the Internet, a local network, Bluetooth, USB, NFC, or any other communication channel. Built for air-gapped environments.
 
-- **发送端**：浏览器扩展（Chrome / Edge / Firefox，支持 MV2 与 MV3）· **网页端**（[在线版](#网页端-web-发送接收)）
-- **接收端**：Android 原生 App · Windows 桌面应用（WPF）· **网页接收端**（[在线版](#网页端-web-发送接收)）
-- **核心库**：Rust，同时编译为 **WebAssembly**（浏览器插件）、**Android Native Library**（JNI）、**Windows DLL**（C ABI，P/Invoke），保证三端编解码逻辑完全一致
+> 🤖 **AI agents / new developers**: Start with [AGENTS.md](AGENTS.md) for build commands, code navigation, debugging references, and known documentation/code discrepancies. The authoritative bit-level cross-platform wire-format specification is [docs/SPEC.md](docs/SPEC.md).
 
-## 数据流
+- **Senders**: Browser extensions for Chrome, Edge, and Firefox (MV2 and MV3) · **Web sender** ([online version](#web-sender--receiver))
+- **Receivers**: Native Android app · Windows desktop app (WPF) · **Web receiver** ([online version](#web-sender--receiver))
+- **Core library**: Rust, compiled to **WebAssembly** for browser clients, an **Android native library** via JNI, and a **Windows DLL** via C ABI/P/Invoke, ensuring identical codec behavior across platforms
 
+## Data Flow
+
+```text
+Sender                                           Receiver
+File                                             Camera video stream (locked at ~60 fps)
+  │ Best of Raw / Zstd / XZ compression            │
+  ├─ Chunking                                       │
+  ├─ RaptorQ encoding (RFC 6330)                    │
+  ├─ QR frame generation (one source pass → fresh repair) ── video stream ──► Parallel QR decoding (N×ZXing-C++)
+  └─ Continuous playback (15/20/30/45/60/90/120 fps or unlimited; default 60) ├─ Serial RaptorQ ingestion/recovery
+                                                    ├─ Decompression
+                                                    ├─ File reassembly
+                                                    └─ File saving
 ```
-发送端                                          接收端
-文件                                             摄像头视频流 (锁 ~60fps)
-  │ 三算法选优压缩 (Raw / Zstd / XZ)              │
-  ├─ 分块                                         │
-  ├─ RaptorQ 编码 (RFC 6330)                      │
-  ├─ QR 帧生成 (源一遍→持续新鲜修复) ── 视频流 ──► 并行 QR 解码 (N×ZXing-C++)
-  └─ 连续播放 (15/20/30/45/60/90/120fps或无限制, 默认 60) ├─ 串行 RaptorQ 摄入/恢复
-                                                   ├─ 解压缩
-                                                   ├─ 文件重组
-                                                   └─ 文件保存
-```
 
-## 特性
+## Features
 
-- ✅ 高可靠性、高容错率（支持高丢帧 / 乱序 / 重复帧 / 部分损坏）
-- ✅ 支持大文件分段传输（整段压缩后按 ~32 MiB 切压缩流段；文件/多文件包/文字均可）
-- ✅ 持续新鲜喷泉码：源符号发一遍后持续补充不重复修复符号，进度近似线性；到 RFC 24 位 ESI 上限时明确停止
-- ✅ 接收端并行解码池：多线程 ZXing + 串行原生摄入，吃满高帧率采集
-- ✅ 大文件断点恢复（历史页显示缺失段；已校验完成段跨重启保留）
-- ✅ 连续二维码视频流（15 / 20 / 30 / 45 / 60 / 90 / 120 fps 或无限制，默认 60）
-- ✅ Air-Gap 场景，零网络依赖
-- ✅ 单向信道，无需回传确认
-- ✅ 三算法选优压缩（Raw / Zstd Lv1 / Xz Lv9），自动选取最小结果
-- ✅ 多文件打包传输（≥2 项自动打包成单个 ETBUNDL1 容器，走同一条二维码流）
-- ✅ 文件与文字混发（统一选择列表；文件/文件夹支持全页拖放；单条纯文字仍为 ETTEXTv1，收端可复制）
-- ✅ 文本类文件（txt/md/json/源码等）收端可复制 / 分享 / 存盘
-- ✅ 4 码并行模式（同帧 tile 4 个不同符号，吞吐 ~4×，默认开启）
-- ✅ 速度预设（稳定 / 高速 / 极限 / 激进 / 极速 / 极限 2400B，默认激进 1400B@60fps）
-- ✅ 多浏览器支持（Chrome / Edge / Firefox，MV2 + MV3）
-- ✅ 多接收端：网页、Android App 与 Windows 应用复用同一 Rust 协议核心；Windows 支持摄像头 + USB/HDMI/SDI 采集卡 + 屏幕区域/独立窗口捕获（同机或虚拟机/远程桌面场景免摄像头）
+- ✅ High reliability and fault tolerance under heavy frame loss, reordering, duplicate frames, and partial corruption
+- ✅ Segmented large-file transfer: compress first, then split the compressed stream into ~32 MiB segments; supports files, multi-file bundles, and text
+- ✅ Continuously fresh fountain coding: source symbols are sent once, followed by non-repeating repair symbols; progress is approximately linear, and transmission stops explicitly at the RFC 24-bit ESI limit
+- ✅ Parallel receiver decode pool: multithreaded ZXing with serial native ingestion makes full use of high-frame-rate capture
+- ✅ Resumable large-file transfers: the history page identifies missing segments, while verified segments survive restarts
+- ✅ Continuous QR video streams at 15 / 20 / 30 / 45 / 60 / 90 / 120 fps or unlimited speed (default: 60 fps)
+- ✅ Zero network dependency for air-gapped environments
+- ✅ One-way channel with no acknowledgements required
+- ✅ Automatic compression selection among Raw, Zstd Lv1, and Xz Lv9, choosing the smallest result
+- ✅ Multi-file transfer: two or more items are automatically packed into one ETBUNDL1 container and sent through the same QR stream
+- ✅ Mixed file and text transfers: one unified selection list, full-page file/folder drag-and-drop, and ETTEXTv1 for a single plain-text item that receivers can copy
+- ✅ Receiver-side copy, share, and save support for text files such as txt, md, json, and source code
+- ✅ Four-code parallel mode: each frame tiles four different symbols for ~4× throughput; enabled by default
+- ✅ Speed presets: Stable / Fast / Extreme / Aggressive / Maximum / Extreme 2400B; default is Aggressive at 1400B@60fps
+- ✅ Chrome, Edge, and Firefox support across MV2 and MV3
+- ✅ Web, Android, and Windows receivers share the same Rust protocol core; Windows supports cameras, USB/HDMI/SDI capture cards, and screen-region or individual-window capture for camera-free same-machine, VM, and remote-desktop workflows
 
-## 网页端（Web 发送 / 接收）
+## Web Sender & Receiver
 
-无需安装，浏览器直接打开（GitHub Pages 自动构建部署）：
+No installation is required. Open either client directly in a browser; GitHub Pages builds and deploys them automatically.
 
-| 入口 | 地址 | 说明 |
-|------|------|------|
-| **网页发送端** | <https://UR-SillyB.github.io/AirFerry/> | 在浏览器里播放二维码视频流发送文件 |
-| **网页接收端** | <https://UR-SillyB.github.io/AirFerry/receiver/> | 用摄像头扫码恢复文件 |
+| Client | URL | Purpose |
+|--------|-----|---------|
+| **Web sender** | <https://UR-SillyB.github.io/AirFerry/> | Plays a QR video stream in the browser to send files |
+| **Web receiver** | <https://UR-SillyB.github.io/AirFerry/receiver/> | Scans QR codes with a camera to recover files |
 
-> ⚠️ **网页接收端**必须运行在 **HTTPS / localhost** 下才能访问摄像头（浏览器硬性安全限制）；GitHub Pages 天然是 HTTPS，直接可用。因浏览器摄像头管道 + JS/WASM 解码限制，**网页端速度低于原生端**，追求满速、稳定的大文件恢复请优先用 Android / Windows 原生接收端（见下方下载）。
+> ⚠️ The **web receiver** must run over **HTTPS or localhost** to access the camera due to browser security requirements. GitHub Pages uses HTTPS and works directly. Browser camera pipelines and JS/WASM decoding make the web receiver slower than native clients; for maximum speed and reliable large-file recovery, use the native Android or Windows receiver below.
 
-## 下载安装
+## Downloads
 
-最新版本发布在 [GitHub Release v1.2.8](https://github.com/UR-SillyB/AirFerry/releases/tag/v1.2.8)。
+The latest release is [GitHub Release v1.2.8](https://github.com/UR-SillyB/AirFerry/releases/tag/v1.2.8).
 
-| 文件 | 说明 |
-|------|------|
-| `airferry-sender-chrome-mv3-v1.2.8.crx` / `.zip` | Chrome / Edge MV3 现代标量版；CRX 使用固定发布密钥签名，受策略限制时改用 zip 解压加载 |
-| `airferry-sender-chrome-mv2-v1.2.8.crx` / `.zip` | Chrome / Edge MV2 旧版兼容标量版；CRX 使用同一固定发布密钥签名 |
-| `airferry-sender-firefox-mv3-v1.2.8.xpi` | Firefox 扩展，MV3（Firefox 116+） |
-| `airferry-sender-firefox-mv2-v1.2.8.xpi` | Firefox 91+ 的 MV2 兼容版 |
-| `airferry-sender-web-v1.2.8.zip` | 网页发送端静态站点，现代标量 WASM，部署到任意静态托管（官方在线版见[网页端](#网页端web-发送--接收)） |
-| `airferry-sender-web-standalone-v1.2.8.html` | 网页发送端单文件版（约 2MB，双击即用，无需服务器） |
-| `airferry-receiver-web-v1.2.8.zip` | **网页接收端**：需部署到 HTTPS / localhost 后使用摄像头（官方在线版见[网页端](#网页端web-发送--接收)） |
-| `airferry-receiver-android-arm64-v1.2.8.apk` | **Android 扫码端**：arm64-v8a，Android 10+，使用固定 release keystore 签名 |
-| `airferry-receiver-windows-x64-v1.2.8.zip` | **Windows 扫码端**：x64，Windows 10+，视频源支持摄像头 + USB/HDMI/SDI 采集卡 + 屏幕区域/窗口捕获 |
+| File | Description |
+|------|-------------|
+| `airferry-sender-chrome-mv3-v1.2.8.crx` / `.zip` | Modern scalar Chrome / Edge MV3 build; the CRX is signed with the fixed release key; use the zip if browser policy blocks the CRX |
+| `airferry-sender-chrome-mv2-v1.2.8.crx` / `.zip` | Legacy-compatible scalar Chrome / Edge MV2 build; the CRX uses the same fixed release key |
+| `airferry-sender-firefox-mv3-v1.2.8.xpi` | Firefox MV3 extension for Firefox 116+ |
+| `airferry-sender-firefox-mv2-v1.2.8.xpi` | MV2-compatible extension for Firefox 91+ |
+| `airferry-sender-web-v1.2.8.zip` | Static web sender with modern scalar WASM; deploy it to any static host (official [online version](#web-sender--receiver)) |
+| `airferry-sender-web-standalone-v1.2.8.html` | Standalone web sender, about 2 MB; double-click to use with no server required |
+| `airferry-receiver-web-v1.2.8.zip` | **Web receiver**; deploy to HTTPS or localhost before using the camera (official [online version](#web-sender--receiver)) |
+| `airferry-receiver-android-arm64-v1.2.8.apk` | **Android receiver** for arm64-v8a and Android 10+; signed with the fixed release keystore |
+| `airferry-receiver-windows-x64-v1.2.8.zip` | **Windows receiver** for x64 and Windows 10+; supports cameras, USB/HDMI/SDI capture cards, and screen-region/window capture |
 
-> 发送端/APK/web 由 `./scripts/build-all.sh release` 产出；版本号取自 `apps/sender/package.json`。Windows zip 默认由 GitHub Actions `windows` workflow（`workflow_dispatch`）上传到同一 Release。Chrome `.crx` 需本机有 Chrome 才能签名，否则仅产出 `.zip`。web 发送端/接收端由 GitHub Actions `pages` workflow 自动构建并部署到 GitHub Pages（推送 `main` 即触发）。
+> Sender, APK, and web artifacts are produced by `./scripts/build-all.sh release`; the version is read from `apps/sender/package.json`. The Windows zip is normally uploaded to the same release by the GitHub Actions `windows` workflow through `workflow_dispatch`. Chrome `.crx` signing requires Chrome on the build machine; otherwise only `.zip` is produced. The GitHub Actions `pages` workflow automatically builds and deploys both web clients to GitHub Pages on pushes to `main`.
 
-### Android 接收端
+### Android Receiver
 
-下载 APK，允许「未知来源」后安装到 Android 10+ 设备（已用 release keystore 签名）。
+Download the APK, allow installation from unknown sources, and install it on an Android 10+ device. The APK is signed with the release keystore.
 
-### Windows 接收端
+### Windows Receiver
 
-解压 `airferry-receiver-windows-x64-v1.2.8.zip`，安装 [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0) 后运行 `AirFerry.exe`。启动后在同一个「扫描来源」单选列表中选择摄像头、采集卡或屏幕捕获（彼此互斥，USB/HDMI/SDI 采集卡会被自动标注），再点统一的主按钮开始。选择「屏幕捕获」时会打开截图式选择器，可把**屏幕矩形区域**（拖动）或**某个窗口**（单击，悬停自动高亮）作为视频源；**右键= 快速选择整个屏幕**（全屏应用/游戏首选——无边框游戏会因焦点被抢而最小化、独占全屏无法按窗口捕获）——适合同机浏览器播放二维码做端到端测试、虚拟机/远程桌面窗口等无摄像头场景，Esc 取消。进入扫码页对准屏幕二维码即可。
+Extract `airferry-receiver-windows-x64-v1.2.8.zip`, install the [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0), and run `AirFerry.exe`. At startup, choose a camera, capture card, or screen capture from the unified, mutually exclusive scan-source list; USB/HDMI/SDI capture cards are labeled automatically. Then press the primary button to begin.
 
-### Chrome / Edge 扩展
+Choosing **Screen capture** opens a screenshot-style selector. Drag to select a **screen region**, click to select a **window** (hovering highlights it), or **right-click to select the entire screen**. Full-screen capture is preferred for full-screen apps and games: borderless games may minimize when focus changes, while exclusive full-screen windows cannot be captured as individual windows. This mode is useful for end-to-end tests with a browser playing QR codes on the same machine and for camera-free VM or remote-desktop windows. Press Esc to cancel. On the scan page, point the selected source at the on-screen QR codes.
 
-1. 优先下载对应 `.crx`（MV3 为现代标量版，MV2 供旧版浏览器兼容）；若浏览器策略阻止商店外 CRX 安装，则下载同名 `.zip` 并解压
-2. 使用 zip 时打开 `chrome://extensions`，右上角开启「开发者模式」
-3. 点击「加载已解压的扩展程序」，选择解压目录
+### Chrome / Edge Extensions
 
-> v1.2.8 CRX 复用了原固定私钥，MV2/MV3 扩展 ID 均保持为 `lgafjpalpcbiellnlbfdabdlbfooojjm`；zip 作为浏览器阻止商店外 CRX 安装时的回退。
+1. Prefer the matching `.crx`: MV3 is the modern scalar build, while MV2 supports older browsers. If browser policy blocks externally distributed CRX installation, download and extract the matching `.zip` instead.
+2. For a zip, open `chrome://extensions` and enable **Developer mode** in the upper-right corner.
+3. Click **Load unpacked** and select the extracted directory.
 
-### Firefox 扩展
+> The v1.2.8 CRX files reuse the original fixed private key, so both MV2 and MV3 retain the extension ID `lgafjpalpcbiellnlbfdabdlbfooojjm`. The zip is the fallback when the browser blocks an externally distributed CRX.
 
-> 注：发布的 `.xpi` **未经 Mozilla 签名**（Mozilla 不支持纯本地签名，需通过 AMO 服务签名）。因此普通 Firefox 正式版会拒绝安装。可行方案：
-> - **Developer / Nightly / ESR 版**：在 `about:config` 中将 `xpinstall.signatures.required` 设为 `false`，再按下方步骤安装；
-> - 或将 `.xpi` 解压后用 `about:debugging#/runtime/this-firefox` → 「Load Temporary Add-on」临时载入（重启后失效）；
-> - 或将 `.xpi` 上传至 [addons.mozilla.org](https://addons.mozilla.org/developers/) 由 AMO 服务端签名后分发（正式发布推荐）。
+### Firefox Extension
 
-1. 下载对应 `.xpi` 文件（MV3 为 Firefox 116+，MV2 为 Firefox 91+）
-2. 打开 `about:addons` → 齿轮图标 → 「Install Add-on From File」选择 `.xpi`
-3. 或在 `about:debugging#/runtime/this-firefox` 中「Load Temporary Add-on」临时载入
+> The published `.xpi` files are **not signed by Mozilla**. Mozilla does not support purely local signing; signing must go through AMO. Regular Firefox releases will therefore reject them. Available options:
+>
+> - On **Developer Edition, Nightly, or ESR**, set `xpinstall.signatures.required` to `false` in `about:config`, then follow the steps below.
+> - Extract the `.xpi`, then load it temporarily from `about:debugging#/runtime/this-firefox` → **Load Temporary Add-on**. It will be removed after a restart.
+> - Upload the `.xpi` to [addons.mozilla.org](https://addons.mozilla.org/developers/) for AMO server-side signing and distribution, which is recommended for formal releases.
 
-## 仓库结构
+1. Download the matching `.xpi` file: MV3 requires Firefox 116+, while MV2 requires Firefox 91+.
+2. Open `about:addons` → gear icon → **Install Add-on From File**, then select the `.xpi`.
+3. Alternatively, use **Load Temporary Add-on** in `about:debugging#/runtime/this-firefox`.
 
-```
+## Repository Structure
+
+```text
 AirFerry/
-├── core/                  # 跨端 Rust 协议核心 + Windows ZXing-C++ 相机解码核心
-│   ├── raptorq-core/      # RFC 6330 RaptorQ 编解码封装
-│   ├── qr-protocol/       # 帧格式 / 分块 / 压缩 / CRC / QR 矩阵
-│   ├── transfer-engine/   # 编排 / 状态机 / 进度 / 断点 + WASM/JNI/C ABI
-│   └── zxing-decoder/     # Windows 对 Android v1.1.3 模式的 ZXing-C++ 实现
+├── core/                  # Cross-platform Rust protocol core + Windows ZXing-C++ camera-decoding core
+│   ├── raptorq-core/      # RFC 6330 RaptorQ codec wrapper
+│   ├── qr-protocol/       # Frame format / chunking / compression / CRC / QR matrix
+│   ├── transfer-engine/   # Orchestration / state machine / progress / resume + WASM/JNI/C ABI
+│   └── zxing-decoder/     # Windows ZXing-C++ implementation matching the Android v1.1.3 mode
 ├── apps/
-│   ├── sender/            # Plasmo + React + TS + WASM 发送端（浏览器扩展）
-│   ├── scanner/           # Kotlin + CameraX + ZXing-C++ 接收端（Android App）
-│   └── windows/           # C# WPF + OpenCvSharp + ZXing-C++（Windows App）
+│   ├── sender/            # Plasmo + React + TS + WASM sender (browser extension)
+│   ├── scanner/           # Kotlin + CameraX + ZXing-C++ receiver (Android app)
+│   └── windows/           # C# WPF + OpenCvSharp + ZXing-C++ (Windows app)
 ├── scripts/
-│   ├── build-all.sh       # 一键构建 + 打包（含 crx/xpi 签名，windows 子命令）
-│   └── build-windows.ps1  # Windows 端原生 PowerShell 构建脚本（首选）
-├── docs/                  # 协议 / 架构 / API / 构建说明（中文）
-├── Cargo.toml             # Rust workspace 根配置
-└── .gitignore             # dist/ 产物不入库（走 GitHub Release）
+│   ├── build-all.sh       # One-command build and packaging, including crx/xpi signing and the windows subcommand
+│   └── build-windows.ps1  # Native Windows PowerShell build script (preferred)
+├── docs/                  # Protocol, architecture, API, and build documentation in Chinese
+├── Cargo.toml             # Rust workspace root configuration
+└── .gitignore             # dist/ artifacts are not committed; distribution uses GitHub Releases
 ```
 
-## 快速开始
+## Quick Start
 
-详见 [开发环境搭建](docs/dev-setup.md)。各端构建说明：
+See [Development Setup](docs/dev-setup.md). Build commands by component:
 
-| 组件 | 命令 | 说明 |
-|------|------|------|
-| 核心库 | `cargo build` / `cargo test` | Rust workspace |
-| 浏览器扩展 | `npm run build` | 构建全部 4 个目标 |
-| Android App | `./gradlew assembleDebug` | 需要 Android NDK |
-| Windows App | `./scripts/build-windows.ps1` | 须 Windows + .NET 8 SDK + CMake/VS C++（详见 [docs/build-windows.md](docs/build-windows.md)） |
+| Component | Command | Notes |
+|-----------|---------|-------|
+| Core library | `cargo build` / `cargo test` | Rust workspace |
+| Browser extensions | `npm run build` | Builds all four extension targets |
+| Android app | `./gradlew assembleDebug` | Requires the Android NDK |
+| Windows app | `./scripts/build-windows.ps1` | Requires Windows, the .NET 8 SDK, and CMake/Visual Studio C++; see the [Windows build guide](docs/build-windows.md) |
 
-## 技术架构
+## Technical Architecture
 
-- **编码层**：RaptorQ 喷泉码（RFC 6330）；发送端源符号发一遍后持续补充新鲜修复符号（ESI 单调递增、不重复；上限 2²⁴−1），接收端可随时加入
-- **打包层**：≥2 文件先打包成 ETBUNDL1 容器，整批走单条压缩 + 单条 RaptorQ 流
-- **压缩层**：三算法选优（Raw / Zstd Lv1 / Xz Lv9），70% Zstd early-exit 启发式跳过慢速 Xz
-- **传输层**：60 字节帧头 + symbol_size 负载（浏览器默认 1400）+ 4 字节 CRC，编码为**最小版本** EC-L 二维码（**1464B 帧 → V27 125×125**）；4 码模式同帧 tile 4 个符号、吞吐 ~4×
-- **协议层**：Descriptor 帧（每 17 帧，首帧即描述符）携带 OTI + 文件元数据（文件名、大小、CRC32、压缩标签）；17 与 2/4 多码布局互质，使描述符轮流经过所有屏幕码位
-- **接收层**：Android 用 CameraX，并固定采用 v1.1.3 的 Kotlin 调度器与 JNI ZXing-C++ 解码路径；Windows 用 OpenCvSharp DirectShow，并通过 `core/zxing-decoder/` 镜像同一套 v1.1.3 全帧/ROI 模式。两端均为 2–6 worker、4 符号批摄入和串行 Rust 摄入。Windows Gray 帧仅池化复制一次，UI 以约 7Hz 展示 3 秒窗口速率和有效吞吐
+- **Coding layer**: RaptorQ fountain codes (RFC 6330). After sending each source symbol once, the sender continuously emits fresh repair symbols with monotonically increasing, non-repeating ESIs up to 2²⁴−1. Receivers may join at any time.
+- **Bundling layer**: Two or more files are packed into an ETBUNDL1 container, then sent through one compression stream and one RaptorQ stream.
+- **Compression layer**: The smallest result is selected among Raw, Zstd Lv1, and Xz Lv9. A 70% Zstd early-exit heuristic skips the slower Xz pass.
+- **Transport layer**: A 60-byte frame header, a `symbol_size` payload (1400 bytes by default in the browser), and a 4-byte CRC are encoded into the **smallest possible** EC-L QR code. A **1464-byte frame fits QR version 27 at 125×125 modules**. Four-code mode tiles four symbols per frame for ~4× throughput.
+- **Protocol layer**: Descriptor frames appear every 17 frames, with the very first frame being a descriptor. They carry OTI and file metadata: filename, size, CRC32, and compression tag. Because 17 is coprime with the two- and four-code layouts, descriptors rotate through every on-screen code position.
+- **Receiver layer**: Android uses CameraX with the fixed v1.1.3 Kotlin scheduler and JNI ZXing-C++ decoding path. Windows uses OpenCvSharp DirectShow and mirrors the same v1.1.3 full-frame/ROI mode through `core/zxing-decoder/`. Both use 2–6 workers, four-symbol batch ingestion, and serial Rust ingestion. Windows copies grayscale frames only once through buffer pooling; its UI displays a three-second rolling rate and effective throughput at about 7 Hz.
 
-## 文档
+## Documentation
 
-- [AGENTS.md](AGENTS.md) — 🤖 AI 代理操作手册（构建命令、代码导航、调试速查、偏差清单）
-- [协议规范](docs/protocol.md) — 完整协议描述
-- [跨端契约规格](docs/SPEC.md) — 线格式/会话 ID/JNI 位布局等位级权威定义
-- [二维码帧格式](docs/qr-frame-format.md) — 帧头字段定义
-- [RaptorQ 参数](docs/raptorq-params.md) — 编解码参数说明
-- [架构设计](docs/architecture.md) — 系统架构与组件关系
-- [数据流](docs/data-flow.md) — 端到端数据流详解
-- [API 参考](docs/api.md) — 核心 API 文档
-- [构建指南 - 浏览器扩展](docs/build-browser.md)
-- [构建指南 - Android](docs/build-android.md)
-- [构建指南 - Windows](docs/build-windows.md)
-- [开发环境搭建](docs/dev-setup.md)
+- [AGENTS.md](AGENTS.md) — AI agent operations manual: build commands, code navigation, debugging references, and known discrepancies
+- [Protocol specification](docs/protocol.md) — complete protocol description
+- [Cross-platform contract specification](docs/SPEC.md) — authoritative bit-level wire format, session ID, and JNI layout
+- [QR frame format](docs/qr-frame-format.md) — frame-header field definitions
+- [RaptorQ parameters](docs/raptorq-params.md) — codec parameter details
+- [Architecture](docs/architecture.md) — system architecture and component relationships
+- [Data flow](docs/data-flow.md) — end-to-end data flow
+- [API reference](docs/api.md) — core API documentation
+- [Browser extension build guide](docs/build-browser.md)
+- [Android build guide](docs/build-android.md)
+- [Windows build guide](docs/build-windows.md)
+- [Development setup](docs/dev-setup.md)
 
-## 致谢
+## Acknowledgements
 
-- [RaptorQR](https://github.com/infrost/RaptorQR)（MIT，© 2026 Haixiang）— 同样基于 Rust→WASM RaptorQ 喷泉码管线与并行二维码播放的离线光学传输工具。AirFerry 在「Rust 核心编译到 WASM + 浏览器二维码视频流」这一架构方向上参考了它的先行探索。
-- [cberner/raptorq](https://github.com/cberner/raptorq) — 本项目核心依赖的 RFC 6330 RaptorQ Rust 实现。
+- [RaptorQR](https://github.com/infrost/RaptorQR) (MIT, © 2026 Haixiang) — an offline optical-transfer tool also built around a Rust-to-WASM RaptorQ fountain-code pipeline and parallel QR playback. AirFerry draws on its pioneering exploration of the “Rust core compiled to WASM + browser QR video stream” architecture.
+- [cberner/raptorq](https://github.com/cberner/raptorq) — the RFC 6330 RaptorQ implementation in Rust used as a core dependency.
 
-## 友情链接
+## Related Links
 
-- [linux.do](https://linux.do) — 真诚、友善、实用的开源技术社区
+- [linux.do](https://linux.do) — a sincere, friendly, and practical open-source technology community
 
-## 许可证
+## License
 
 MIT
