@@ -1,7 +1,5 @@
 # AirFerry
 
-**English** | [简体中文](docs/README.zh-CN.md)
-
 > Fully Offline Optical File Transfer
 
 Transfer files through **screen-displayed QR video streams and camera scanning**—without the Internet, a local network, Bluetooth, USB, NFC, or any other communication channel. Built for air-gapped environments.
@@ -59,29 +57,15 @@ No installation is required. Open either client directly in a browser; GitHub Pa
 
 ## Downloads
 
-The latest release is [GitHub Release v1.2.8](https://github.com/UR-SillyB/AirFerry/releases/tag/v1.2.8).
-
-| File | Description |
-|------|-------------|
-| `airferry-sender-chrome-mv3-v1.2.8.crx` / `.zip` | Modern scalar Chrome / Edge MV3 build; the CRX is signed with the fixed release key; use the zip if browser policy blocks the CRX |
-| `airferry-sender-chrome-mv2-v1.2.8.crx` / `.zip` | Legacy-compatible scalar Chrome / Edge MV2 build; the CRX uses the same fixed release key |
-| `airferry-sender-firefox-mv3-v1.2.8.xpi` | Firefox MV3 extension for Firefox 116+ |
-| `airferry-sender-firefox-mv2-v1.2.8.xpi` | MV2-compatible extension for Firefox 91+ |
-| `airferry-sender-web-v1.2.8.zip` | Static web sender with modern scalar WASM; deploy it to any static host (official [online version](#web-sender--receiver)) |
-| `airferry-sender-web-standalone-v1.2.8.html` | Standalone web sender, about 2 MB; double-click to use with no server required |
-| `airferry-receiver-web-v1.2.8.zip` | **Web receiver**; deploy to HTTPS or localhost before using the camera (official [online version](#web-sender--receiver)) |
-| `airferry-receiver-android-arm64-v1.2.8.apk` | **Android receiver** for arm64-v8a and Android 10+; signed with the fixed release keystore |
-| `airferry-receiver-windows-x64-v1.2.8.zip` | **Windows receiver** for x64 and Windows 10+; supports cameras, USB/HDMI/SDI capture cards, and screen-region/window capture |
-
-> Sender, APK, and web artifacts are produced by `./scripts/build-all.sh release`; the version is read from `apps/sender/package.json`. The Windows zip is normally uploaded to the same release by the GitHub Actions `windows` workflow through `workflow_dispatch`. Chrome `.crx` signing requires Chrome on the build machine; otherwise only `.zip` is produced. The GitHub Actions `pages` workflow automatically builds and deploys both web clients to GitHub Pages on pushes to `main`.
+This fork is retained as an archival snapshot and is not expected to track upstream releases. For current builds and release notes, visit the [upstream GitHub Releases page](https://github.com/UR-SillyB/AirFerry/releases).
 
 ### Android Receiver
 
-Download the APK, allow installation from unknown sources, and install it on an Android 10+ device. The APK is signed with the release keystore.
+Download the arm64 APK from the upstream Releases page, allow installation from unknown sources, and install it on an Android 10+ device. The APK is signed with the release keystore.
 
 ### Windows Receiver
 
-Extract `airferry-receiver-windows-x64-v1.2.8.zip`, install the [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0), and run `AirFerry.exe`. At startup, choose a camera, capture card, or screen capture from the unified, mutually exclusive scan-source list; USB/HDMI/SDI capture cards are labeled automatically. Then press the primary button to begin.
+Download and extract the Windows x64 receiver archive from the upstream Releases page, install the [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0), and run `AirFerry.exe`. At startup, choose a camera, capture card, or screen capture from the unified, mutually exclusive scan-source list; USB/HDMI/SDI capture cards are labeled automatically. Then press the primary button to begin.
 
 Choosing **Screen capture** opens a screenshot-style selector. Drag to select a **screen region**, click to select a **window** (hovering highlights it), or **right-click to select the entire screen**. Full-screen capture is preferred for full-screen apps and games: borderless games may minimize when focus changes, while exclusive full-screen windows cannot be captured as individual windows. This mode is useful for end-to-end tests with a browser playing QR codes on the same machine and for camera-free VM or remote-desktop windows. Press Esc to cancel. On the scan page, point the selected source at the on-screen QR codes.
 
@@ -91,7 +75,7 @@ Choosing **Screen capture** opens a screenshot-style selector. Drag to select a 
 2. For a zip, open `chrome://extensions` and enable **Developer mode** in the upper-right corner.
 3. Click **Load unpacked** and select the extracted directory.
 
-> The v1.2.8 CRX files reuse the original fixed private key, so both MV2 and MV3 retain the extension ID `lgafjpalpcbiellnlbfdabdlbfooojjm`. The zip is the fallback when the browser blocks an externally distributed CRX.
+> Published CRX files use the project's fixed private key, so both MV2 and MV3 retain the extension ID `lgafjpalpcbiellnlbfdabdlbfooojjm`. The zip is the fallback when the browser blocks an externally distributed CRX.
 
 ### Firefox Extension
 

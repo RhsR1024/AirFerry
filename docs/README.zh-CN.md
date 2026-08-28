@@ -1,7 +1,5 @@
 # AirFerry
 
-[English](../README.md) | **简体中文**
-
 > 完全离线的光学文件传输系统 · Fully Offline Optical File Transfer
 
 通过**屏幕二维码视频流 + 手机摄像头扫描**完成文件传输，不依赖互联网、局域网、蓝牙、USB、NFC 等任何通信通道。适用于 Air-Gap（隔离网络）场景。
@@ -59,29 +57,15 @@
 
 ## 下载安装
 
-最新版本发布在 [GitHub Release v1.2.8](https://github.com/UR-SillyB/AirFerry/releases/tag/v1.2.8)。
-
-| 文件 | 说明 |
-|------|------|
-| `airferry-sender-chrome-mv3-v1.2.8.crx` / `.zip` | Chrome / Edge MV3 现代标量版；CRX 使用固定发布密钥签名，受策略限制时改用 zip 解压加载 |
-| `airferry-sender-chrome-mv2-v1.2.8.crx` / `.zip` | Chrome / Edge MV2 旧版兼容标量版；CRX 使用同一固定发布密钥签名 |
-| `airferry-sender-firefox-mv3-v1.2.8.xpi` | Firefox 扩展，MV3（Firefox 116+） |
-| `airferry-sender-firefox-mv2-v1.2.8.xpi` | Firefox 91+ 的 MV2 兼容版 |
-| `airferry-sender-web-v1.2.8.zip` | 网页发送端静态站点，现代标量 WASM，部署到任意静态托管（官方在线版见[网页端](#网页端web-发送--接收)） |
-| `airferry-sender-web-standalone-v1.2.8.html` | 网页发送端单文件版（约 2MB，双击即用，无需服务器） |
-| `airferry-receiver-web-v1.2.8.zip` | **网页接收端**：需部署到 HTTPS / localhost 后使用摄像头（官方在线版见[网页端](#网页端web-发送--接收)） |
-| `airferry-receiver-android-arm64-v1.2.8.apk` | **Android 扫码端**：arm64-v8a，Android 10+，使用固定 release keystore 签名 |
-| `airferry-receiver-windows-x64-v1.2.8.zip` | **Windows 扫码端**：x64，Windows 10+，视频源支持摄像头 + USB/HDMI/SDI 采集卡 + 屏幕区域/窗口捕获 |
-
-> 发送端/APK/web 由 `./scripts/build-all.sh release` 产出；版本号取自 `apps/sender/package.json`。Windows zip 默认由 GitHub Actions `windows` workflow（`workflow_dispatch`）上传到同一 Release。Chrome `.crx` 需本机有 Chrome 才能签名，否则仅产出 `.zip`。web 发送端/接收端由 GitHub Actions `pages` workflow 自动构建并部署到 GitHub Pages（推送 `main` 即触发）。
+本 fork 仅作为存档留存，预计不会持续跟进上游版本。当前构建产物与发布说明请访问[上游项目的 GitHub Releases 页面](https://github.com/UR-SillyB/AirFerry/releases)。
 
 ### Android 接收端
 
-下载 APK，允许「未知来源」后安装到 Android 10+ 设备（已用 release keystore 签名）。
+从上游 Releases 页面下载 arm64 APK，允许「未知来源」后安装到 Android 10+ 设备（已用 release keystore 签名）。
 
 ### Windows 接收端
 
-解压 `airferry-receiver-windows-x64-v1.2.8.zip`，安装 [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0) 后运行 `AirFerry.exe`。启动后在同一个「扫描来源」单选列表中选择摄像头、采集卡或屏幕捕获（彼此互斥，USB/HDMI/SDI 采集卡会被自动标注），再点统一的主按钮开始。选择「屏幕捕获」时会打开截图式选择器，可把**屏幕矩形区域**（拖动）或**某个窗口**（单击，悬停自动高亮）作为视频源；**右键= 快速选择整个屏幕**（全屏应用/游戏首选——无边框游戏会因焦点被抢而最小化、独占全屏无法按窗口捕获）——适合同机浏览器播放二维码做端到端测试、虚拟机/远程桌面窗口等无摄像头场景，Esc 取消。进入扫码页对准屏幕二维码即可。
+从上游 Releases 页面下载并解压 Windows x64 接收端压缩包，安装 [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0) 后运行 `AirFerry.exe`。启动后在同一个「扫描来源」单选列表中选择摄像头、采集卡或屏幕捕获（彼此互斥，USB/HDMI/SDI 采集卡会被自动标注），再点统一的主按钮开始。选择「屏幕捕获」时会打开截图式选择器，可把**屏幕矩形区域**（拖动）或**某个窗口**（单击，悬停自动高亮）作为视频源；**右键= 快速选择整个屏幕**（全屏应用/游戏首选——无边框游戏会因焦点被抢而最小化、独占全屏无法按窗口捕获）——适合同机浏览器播放二维码做端到端测试、虚拟机/远程桌面窗口等无摄像头场景，Esc 取消。进入扫码页对准屏幕二维码即可。
 
 ### Chrome / Edge 扩展
 
@@ -89,7 +73,7 @@
 2. 使用 zip 时打开 `chrome://extensions`，右上角开启「开发者模式」
 3. 点击「加载已解压的扩展程序」，选择解压目录
 
-> v1.2.8 CRX 复用了原固定私钥，MV2/MV3 扩展 ID 均保持为 `lgafjpalpcbiellnlbfdabdlbfooojjm`；zip 作为浏览器阻止商店外 CRX 安装时的回退。
+> 发布的 CRX 使用项目固定私钥，MV2/MV3 扩展 ID 均保持为 `lgafjpalpcbiellnlbfdabdlbfooojjm`；zip 作为浏览器阻止商店外 CRX 安装时的回退。
 
 ### Firefox 扩展
 
